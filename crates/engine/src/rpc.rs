@@ -1551,6 +1551,66 @@ impl EngineRpc {
             .ok_or(VoiceRejection::Unsupported)
     }
 
+    async fn model_catalog(
+        &self,
+        harness_id: HarnessId,
+        force: bool,
+    ) -> Result<Vec<zeron_proto::Model>, RpcError> {
+        let lease = std::sync::Arc::new(self.registry.execution_lease(harness_id).await);
+        let harness = self
+            .registry
+            .resolve(harness_id)
+            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        crate::model_catalogs::list_with_lease(self.repos.data_dir(), harness, force, Some(lease))
+            .await
+            .map_err(|e| RpcError::Failed(e.to_string()))
+    }
+
+    fn create_orchestrator(&self, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        let p: crate::orchestration::rpc::CreateOrchestratorParams = parse_params(params)?;
+        let title = p.name.clone();
+        let spaces: Vec<String> = self
+            .workspace
+            .read_spaces()
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .into_iter()
+            .map(|space| space.id)
+            .collect();
+        let data_dir = self.repos.data_dir();
+        let config = crate::orchestration::rpc::create_orchestrator_entry(data_dir, p, &spaces)?;
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        let created = self
+            .mutate(MutateParams::CreateChat {
+                chat_id: chat_id.clone(),
+                space_id: None,
+                device_id: Some(self.doc_host.device_id().to_string()),
+                config: Some(crate::orchestration::rpc::chat_config(&config)),
+                branch: None,
+                cwd: None,
+                parent_chat_id: None,
+                cloud: false,
+            })
+            .and_then(|()| {
+                self.mutate(MutateParams::RenameChat {
+                    chat_id: chat_id.clone(),
+                    title,
+                })
+            });
+        if let Err(err) = created {
+            if let Err(cleanup) =
+                crate::orchestration::rpc::discard_orchestrator(data_dir, &config.id)
+            {
+                tracing::warn!(
+                    orchestrator = %config.id,
+                    %cleanup,
+                    "could not remove orchestrator after chat creation failed"
+                );
+            }
+            return Err(err);
+        }
+        RpcReply::value(&serde_json::json!({ "orchestratorId": config.id, "chatId": chat_id }))
+    }
+
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -1944,6 +2004,7 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_COMMIT_CREDIT
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
+            | methods::RESOLVE_ROLE_MODEL
             | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
@@ -2426,20 +2487,16 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
-                let lease = std::sync::Arc::new(self.registry.execution_lease(p.harness).await);
-                let harness = self
-                    .registry
-                    .resolve(p.harness)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = crate::model_catalogs::list_with_lease(
-                    self.repos.data_dir(),
-                    harness,
-                    p.force,
-                    Some(lease),
-                )
-                .await
-                .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&models)
+                RpcReply::value(&self.model_catalog(p.harness, p.force).await?)
+            }
+            methods::RESOLVE_ROLE_MODEL => {
+                let p: crate::orchestration::rpc::ResolveRoleModelParams = parse_params(params)?;
+                let catalog = self.model_catalog(p.harness, false).await?;
+                crate::orchestration::rpc::resolve_role_model(self.repos.data_dir(), &p, &catalog)
+            }
+            methods::CREATE_ORCHESTRATOR => self.create_orchestrator(params),
+            method if crate::orchestration::rpc::handles(method) => {
+                crate::orchestration::rpc::dispatch(self.repos.data_dir(), method, params)
             }
             methods::LIST_SKILLS => {
                 #[derive(Deserialize)]

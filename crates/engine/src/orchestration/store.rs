@@ -20,6 +20,7 @@ const PLAN_FILE: &str = "plano.md";
 const MAX_ID_LEN: usize = 80;
 const MAX_SLUG_LEN: usize = 48;
 const FALLBACK_SLUG: &str = "demanda";
+const ORCHESTRATOR_FALLBACK_SLUG: &str = "orquestrador";
 
 /// An orchestrator as stored in `orchestrator.toml`. `projects` are space ids.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,7 +93,7 @@ fn check_id(kind: &str, value: &str) -> io::Result<()> {
     }
 }
 
-fn slugify(title: &str) -> String {
+fn raw_slug(title: &str) -> String {
     let mut slug = String::new();
     for c in title.chars().map(|c| c.to_ascii_lowercase()) {
         if c.is_ascii_lowercase() || c.is_ascii_digit() {
@@ -102,11 +103,15 @@ fn slugify(title: &str) -> String {
         }
     }
     slug.truncate(MAX_SLUG_LEN);
-    let slug = slug.trim_end_matches('-');
+    slug.trim_end_matches('-').to_string()
+}
+
+fn slugify(title: &str) -> String {
+    let slug = raw_slug(title);
     if slug.is_empty() {
         FALLBACK_SLUG.to_string()
     } else {
-        slug.to_string()
+        slug
     }
 }
 
@@ -187,6 +192,29 @@ impl Store {
                 format!("demand {demand} not found"),
             ))
         }
+    }
+
+    /// The id for a new orchestrator named `name`: its slug, suffixed `-2`,
+    /// `-3`... while an orchestrator with that id exists.
+    pub fn available_id(&self, name: &str) -> String {
+        let slug = raw_slug(name);
+        let base = if slug.is_empty() {
+            ORCHESTRATOR_FALLBACK_SLUG.to_string()
+        } else {
+            slug
+        };
+        let mut candidate = base.clone();
+        let mut attempt = 1u32;
+        while self.root.join(&candidate).exists() {
+            attempt += 1;
+            candidate = format!("{base}-{attempt}");
+        }
+        candidate
+    }
+
+    /// Deletes an orchestrator's whole folder.
+    pub fn remove(&self, id: &str) -> io::Result<()> {
+        fs::remove_dir_all(self.existing_orchestrator_dir(id)?)
     }
 
     pub fn create(&self, cfg: &OrchestratorConfig) -> io::Result<()> {
@@ -407,6 +435,29 @@ mod tests {
             dir.path()
                 .join("orchestrators/loja/orchestrator.toml")
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn available_id_slugs_the_name_and_skips_taken_ids() {
+        let (_dir, store) = store_with("loja");
+        assert_eq!(store.available_id("Minha Loja!"), "minha-loja");
+        assert_eq!(store.available_id("Loja"), "loja-2");
+        assert_eq!(store.available_id("???"), "orquestrador");
+        let mut second = config("loja-2");
+        second.name = "Loja".into();
+        store.create(&second).unwrap();
+        assert_eq!(store.available_id("Loja"), "loja-3");
+    }
+
+    #[test]
+    fn remove_deletes_the_orchestrator_folder() {
+        let (dir, store) = store_with("loja");
+        store.remove("loja").unwrap();
+        assert!(!dir.path().join("orchestrators/loja").exists());
+        assert_eq!(
+            store.remove("loja").unwrap_err().kind(),
+            ErrorKind::NotFound
         );
     }
 

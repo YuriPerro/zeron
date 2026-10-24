@@ -356,6 +356,33 @@ pub mod methods {
     /// of `repo` (`owner/name`) can start from, through the user's GitHub
     /// connection (the vault calls GitHub), the default first.
     pub const LIST_CLOUD_BRANCHES: &str = "ListCloudBranches";
+    /// `{}` → `{roles: [{name, description, model, access}], errors: [string]}`;
+    /// seeds the default roles on first use.
+    pub const LIST_ROLES: &str = "ListRoles";
+    /// `{role, harness, effort?, targetDeviceId?}` → `{model, reasoning, sandbox}`:
+    /// the role's model alias resolved against the target device's catalog.
+    pub const RESOLVE_ROLE_MODEL: &str = "ResolveRoleModel";
+    /// `{name, avatar?, harness, model?, reasoning?, childHarness?, projects}` →
+    /// `{orchestratorId, chatId}`: the orchestrator's store entry and its chat.
+    pub const CREATE_ORCHESTRATOR: &str = "CreateOrchestrator";
+    /// `{orchestratorId}` → the orchestrator's config.
+    pub const GET_ORCHESTRATOR: &str = "GetOrchestrator";
+    /// `{}` → every orchestrator's config.
+    pub const LIST_ORCHESTRATORS: &str = "ListOrchestrators";
+    /// `{orchestratorId, title}` → `{demand}`.
+    pub const ORCH_CREATE_DEMAND: &str = "OrchCreateDemand";
+    /// `{orchestratorId, demand, text}` → `{}`.
+    pub const ORCH_WRITE_SPEC: &str = "OrchWriteSpec";
+    /// `{orchestratorId, demand, items}` → `{}`.
+    pub const ORCH_WRITE_PLAN: &str = "OrchWritePlan";
+    /// `{orchestratorId, demand}` → `{demand, spec, plan, reports}`.
+    pub const ORCH_READ_DEMAND: &str = "OrchReadDemand";
+    /// `{orchestratorId, demand, childId, text}` → `{}`.
+    pub const ORCH_SUBMIT_REPORT: &str = "OrchSubmitReport";
+    /// `{orchestratorId, demand, summary}` → `{}`.
+    pub const ORCH_CLOSE_DEMAND: &str = "OrchCloseDemand";
+    /// `{orchestratorId, note}` → `{}`.
+    pub const ORCH_REMEMBER: &str = "OrchRemember";
 }
 
 /// Stable capability error codes transported without provider stderr.
