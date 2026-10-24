@@ -1597,7 +1597,6 @@ impl EngineRpc {
 
     fn create_orchestrator(&self, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         let p: crate::orchestration::rpc::CreateOrchestratorParams = parse_params(params)?;
-        let title = p.name.clone();
         let spaces: Vec<String> = self
             .workspace
             .read_spaces()
@@ -1619,7 +1618,7 @@ impl EngineRpc {
             cloud: false,
         });
         let titled = created.and_then(|()| {
-            let renamed = self.workspace.rename_chat(&chat_id, &title);
+            let renamed = self.workspace.rename_chat(&chat_id, &config.name);
             let outcome = match renamed {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(RpcError::Failed(format!(
@@ -5070,6 +5069,7 @@ mod tests {
         assert!(!forwardable(methods::FOCUS_CHAT));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
+        assert!(!forwardable(methods::RESOLVE_ROLE_MODEL));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::SEARCH_GIT_HISTORY));

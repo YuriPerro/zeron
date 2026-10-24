@@ -265,6 +265,13 @@ async fn create_orchestrator_requires_a_name_and_dedupes_projects() {
         .unwrap();
     assert_eq!(stored["name"], "Loja");
     assert_eq!(stored["projects"], json!(["space-2", "space-1"]));
+    let chat = fx
+        .core
+        .workspace
+        .chat(created["chatId"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(chat.title.as_deref(), Some("Loja"));
     fx.core.shutdown().await;
 }
 
