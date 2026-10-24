@@ -38,6 +38,7 @@ fn harness() -> ClaudeHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        instructions: None,
         mcp: None,
         prompt: prompt.into(),
         harness: None,
@@ -762,12 +763,29 @@ async fn live_commands_discovery() {
 }
 
 #[tokio::test]
+async fn instructions_reach_claude_as_append_system_prompt() {
+    let (controls, _steer, _token) = controls("A");
+    let mut req = request("scenario:instructions-check");
+    req.instructions = Some("ORCH-RULES".into());
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn title_run_disables_tools_and_denies_unexpected_permissions() {
     let (controls, _steer, token) = controls("Yes");
-    let mut stream = harness()
-        .run_title(request("scenario:title"), controls)
-        .await
-        .unwrap();
+    let mut title_request = request("scenario:title");
+    title_request.instructions = Some("ORCH-RULES".into());
+    let mut stream = harness().run_title(title_request, controls).await.unwrap();
     let events = tokio::time::timeout(Duration::from_secs(10), async {
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {

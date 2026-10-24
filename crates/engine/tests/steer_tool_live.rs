@@ -135,6 +135,7 @@ async fn steering_never_aborts_a_running_tool() {
             SessionCommandPayload::Run {
                 message_id: "call".into(),
                 request: RunRequest {
+                    instructions: None,
                     mcp: Some(McpServer {
                         name: "slow".into(),
                         command: "python3".into(),

@@ -32,6 +32,7 @@ fn harness() -> AcpHarness {
 
 fn request(mode: &str) -> RunRequest {
     RunRequest {
+        instructions: None,
         mcp: None,
         prompt: "hello".into(),
         harness: None,

@@ -232,6 +232,7 @@ fn rig_full(adopts_config: bool, turn_boundary: bool) -> Rig {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        instructions: None,
         mcp: None,
         env: Default::default(),
         prompt: prompt.into(),

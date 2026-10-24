@@ -43,6 +43,7 @@ case "$first" in
       --tools) shift; [ "$1" = "" ] && tools_off=true ;;
       --system-prompt) shift; case "$1" in "You generate session titles."*) system_set=true ;; esac ;;
       --strict-mcp-config) mcp_off=true ;;
+      --append-system-prompt) exit 1 ;;
       --dangerously-skip-permissions) exit 1 ;;
     esac
     shift
@@ -396,6 +397,19 @@ case "$first" in
   emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}],\"output_style\":\"default\"}}}"
   # Stay alive until the driver tears us down, like the real CLI would.
   exec sleep 30
+  ;;
+
+*scenario:instructions-check*)
+  appended=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --append-system-prompt) shift; [ "$1" = "ORCH-RULES" ] && appended=true ;;
+    esac
+    shift
+  done
+  [ "$appended" = true ] || exit 1
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-instructions"}'
+  emit '{"type":"result","subtype":"success","result":"ok","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-instructions"}'
   ;;
 
 *scenario:resume-check*)

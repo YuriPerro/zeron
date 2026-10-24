@@ -52,6 +52,7 @@ async fn main() {
             .into()
     });
     let request = RunRequest {
+        instructions: None,
         mcp: None,
         prompt,
         harness: None,

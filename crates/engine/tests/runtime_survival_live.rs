@@ -99,6 +99,7 @@ fn run(
     cwd: &str,
 ) -> RunRequest {
     RunRequest {
+        instructions: None,
         mcp: None,
         env: Default::default(),
         prompt: prompt.into(),

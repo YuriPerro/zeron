@@ -336,6 +336,7 @@ async fn exercise_projectless(mode: Mode) {
                 CHAT,
                 SessionCommandPayload::Run {
                     request: RunRequest {
+                        instructions: None,
                         mcp: None,
                         prompt: "hello from no project".into(),
                         harness: None,

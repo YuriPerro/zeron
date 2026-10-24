@@ -340,6 +340,13 @@ pub struct RunRequest {
     /// no Zeron tools; title runs never carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpServer>,
+    /// Harness-neutral standing instructions for the whole chat. Each driver
+    /// delivers them in its own dialect (Claude `--append-system-prompt`,
+    /// Codex `developerInstructions`); harnesses without a system-prompt
+    /// channel get them prefixed to the first prompt by the engine. Title
+    /// runs ignore them. Additive + serde-defaulted for wire compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Host-resolved environment for the spawned agent process (credential
     /// broker secrets on a Cloud device: `CODEX_HOME`, `GH_TOKEN`,
     /// `ANTHROPIC_API_KEY`, …). Filled by the HOST right before the request
@@ -369,6 +376,7 @@ impl std::fmt::Debug for RunRequest {
             attachments,
             worktree,
             mcp,
+            instructions,
             env,
         } = self;
         f.debug_struct("RunRequest")
@@ -384,6 +392,7 @@ impl std::fmt::Debug for RunRequest {
             .field("attachments", attachments)
             .field("worktree", worktree)
             .field("mcp", mcp)
+            .field("instructions", instructions)
             .field("env", &env.keys().collect::<Vec<_>>())
             .finish()
     }

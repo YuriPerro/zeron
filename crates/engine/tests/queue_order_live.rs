@@ -119,6 +119,7 @@ impl Rig {
 
     fn request(&self, prompt: String) -> RunRequest {
         RunRequest {
+            instructions: None,
             mcp: None,
             prompt,
             harness: Some(self.id),

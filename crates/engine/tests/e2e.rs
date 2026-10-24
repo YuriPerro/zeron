@@ -27,6 +27,7 @@ const VIEWER: &str = "viewer-device";
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        instructions: None,
         mcp: None,
         prompt: prompt.into(),
         harness: None,
@@ -2462,6 +2463,7 @@ async fn real_claude_sees_uploaded_image_inline() {
          Attached images (local files — open them to view):\n- {path}"
     );
     let request = RunRequest {
+        instructions: None,
         mcp: None,
         prompt,
         harness: None,

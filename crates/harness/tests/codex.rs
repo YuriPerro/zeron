@@ -93,6 +93,7 @@ async fn execution_lease_outlives_dropped_run_and_title_streams_until_child_is_r
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        instructions: None,
         mcp: None,
         prompt: prompt.into(),
         harness: None,
@@ -1618,12 +1619,29 @@ async fn live_skills_discovery() {
 }
 
 #[tokio::test]
+async fn instructions_reach_codex_as_developer_instructions() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:instructions");
+    req.instructions = Some("ORCH-RULES".into());
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn title_run_preserves_read_only_and_replaces_coding_instructions() {
     let (controls, _steer, token) = controls("Yes");
-    let stream = harness()
-        .run_title(request("scenario:title"), controls)
-        .await
-        .unwrap();
+    let mut title_request = request("scenario:title");
+    title_request.instructions = Some("ORCH-RULES".into());
+    let stream = harness().run_title(title_request, controls).await.unwrap();
     let events = tokio::time::timeout(Duration::from_secs(10), async {
         let mut stream = stream;
         let mut events = Vec::new();

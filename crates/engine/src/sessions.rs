@@ -1743,6 +1743,7 @@ impl SessionsEngine {
             .or_else(|| {
                 let (_, cwd, _) = self.inner.journal_harness_session(chat_id)?;
                 Some(RunRequest {
+                    instructions: None,
                     mcp: None,
                     prompt: String::new(),
                     harness: None,
@@ -3533,6 +3534,17 @@ async fn drive_run(
                     wire_request.prompt =
                         zeron_proto::invocation::harness_prompt(&wire_request.prompt, harness_id);
                 }
+                if !matches!(harness_id, HarnessId::ClaudeCode | HarnessId::Codex)
+                    && wire_request.resume.is_none()
+                {
+                    if let Some(instructions) = &wire_request.instructions {
+                        wire_request.prompt =
+                            crate::orchestration::instructions::prefix_first_prompt(
+                                instructions,
+                                &wire_request.prompt,
+                            );
+                    }
+                }
                 // Host-resolved spawn env (a Cloud device's credential broker);
                 // `RunRequest::env` is serde-skipped, never persisted.
                 match inner
@@ -5215,6 +5227,7 @@ mod tests {
 
     fn request() -> RunRequest {
         RunRequest {
+            instructions: None,
             mcp: None,
             prompt: "first".into(),
             harness: None,

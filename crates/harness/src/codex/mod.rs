@@ -1306,6 +1306,12 @@ async fn run_session(session: Session) {
             );
         }
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
+        if let Some(instructions) = request.instructions.as_ref().filter(|_| !title_only) {
+            p.insert(
+                "developerInstructions".into(),
+                Value::String(instructions.clone()),
+            );
+        }
         if let Some(mcp) = request.mcp.as_ref().filter(|_| !title_only) {
             // Zeron's own MCP server as dotted config overrides on top of the
             // user's `mcp_servers` table (the same layer the title run uses

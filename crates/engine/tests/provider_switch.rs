@@ -157,6 +157,7 @@ fn rig_with(gated: Option<HarnessId>, codex_failures: usize) -> Rig {
 
 fn run_request(harness: HarnessId, prompt: &str) -> RunRequest {
     RunRequest {
+        instructions: None,
         mcp: None,
         prompt: prompt.into(),
         harness: Some(harness),

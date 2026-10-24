@@ -326,6 +326,9 @@ impl ClaudeHarness {
             args.push("--settings".into());
             args.push(Value::Object(settings).to_string());
         }
+        if let Some(instructions) = &request.instructions {
+            args.extend(["--append-system-prompt".into(), instructions.clone()]);
+        }
         args
     }
 
@@ -757,6 +760,7 @@ impl Harness for ClaudeHarness {
         request.worktree = None;
         request.attachments.clear();
         request.mcp = None;
+        request.instructions = None;
         request.model_options.clear();
         request.auto_approve = false;
         self.run_with_mode(request, controls, true).await
