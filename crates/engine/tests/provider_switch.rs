@@ -621,6 +621,8 @@ async fn provider_cannot_change_while_a_turn_is_running() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                role: None,
+                orchestrator: None,
             },
         )
         .unwrap();
@@ -653,6 +655,8 @@ async fn provider_cannot_change_while_a_turn_is_running() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                role: None,
+                orchestrator: None,
             },
         })
     };

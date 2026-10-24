@@ -436,6 +436,8 @@ pub(crate) fn seed(
                 reasoning: Some(demo.reasoning),
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                role: None,
+                orchestrator: None,
             }),
             last_message_preview: Some(demo.preview.into()),
             last_message_at: Some(ms(last)),

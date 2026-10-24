@@ -1372,7 +1372,15 @@ impl WorkspaceHost {
     /// composer's mid-session model/reasoning/options changes). Returns false
     /// when the chat doesn't exist.
     pub fn set_chat_config(&self, chat_id: &str, config: &ChatConfig) -> Result<bool, EngineError> {
-        Ok(self.mutate(|doc| doc.set_chat_config(chat_id, config))?)
+        Ok(self.mutate(|doc| {
+            let stored = doc.chat(chat_id)?.and_then(|chat| chat.config);
+            let mut merged = config.clone();
+            if let Some(stored) = stored {
+                merged.role = merged.role.or(stored.role);
+                merged.orchestrator = merged.orchestrator.or(stored.orchestrator);
+            }
+            doc.set_chat_config(chat_id, &merged)
+        })?)
     }
 
     /// Tombstone: removes the chats (and session-status) row; the per-chat session
@@ -1984,6 +1992,58 @@ mod tests {
             assert!(message.contains("injected DNS lookup failure"), "{message}");
             assert!(!message.contains("token-secret"), "{message}");
         }
+    }
+
+    #[tokio::test]
+    async fn set_chat_config_keeps_role_and_orchestrator() {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(),
+                device_name: "Test device".into(),
+                platform: "macos".into(),
+                org_id: "test-org".into(),
+                user_id: "test-user".into(),
+                edge: None,
+                local_only: false,
+            },
+        )
+        .unwrap();
+        let config = |model: &str, role: Option<&str>, orchestrator: Option<&str>| ChatConfig {
+            harness: zeron_proto::HarnessId::Mock,
+            model: Some(model.into()),
+            reasoning: None,
+            model_options: Default::default(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            role: role.map(str::to_owned),
+            orchestrator: orchestrator.map(str::to_owned),
+        };
+        host.create_chat(
+            "c1",
+            None,
+            Some("test-device"),
+            Some(config("old", Some("executor"), Some("o1"))),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            host.set_chat_config("c1", &config("new", None, None))
+                .unwrap()
+        );
+        let stored = host.chat("c1").unwrap().unwrap().config.unwrap();
+        assert_eq!(stored.model.as_deref(), Some("new"));
+        assert_eq!(stored.orchestrator.as_deref(), Some("o1"));
+        assert_eq!(stored.role.as_deref(), Some("executor"));
+
+        host.set_chat_config("c1", &config("newer", Some("revisor"), None))
+            .unwrap();
+        let stored = host.chat("c1").unwrap().unwrap().config.unwrap();
+        assert_eq!(stored.role.as_deref(), Some("revisor"));
+        assert_eq!(stored.orchestrator.as_deref(), Some("o1"));
     }
 
     #[tokio::test]

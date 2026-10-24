@@ -155,6 +155,8 @@ async fn agent_process_survives_sends_and_cancel() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::DangerFullAccess,
+                role: None,
+                orchestrator: None,
             },
         )
         .unwrap();

@@ -104,6 +104,8 @@ impl Rig {
                     reasoning: None,
                     model_options: Default::default(),
                     sandbox: SandboxLevel::DangerFullAccess,
+                    role: None,
+                    orchestrator: None,
                 },
             )
             .unwrap();

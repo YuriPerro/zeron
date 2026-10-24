@@ -1002,6 +1002,8 @@ impl Tools {
             reasoning,
             model_options: Default::default(),
             sandbox,
+            role: None,
+            orchestrator: None,
         };
 
         let chat_id = uuid::Uuid::new_v4().to_string();

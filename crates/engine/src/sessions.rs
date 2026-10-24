@@ -303,6 +303,9 @@ struct Inner {
     /// [`crate::Repos::scratch_root`]; bare tests fall back to
     /// `~/.zeron/scratch`.
     scratch_root: OnceLock<std::path::PathBuf>,
+    /// The engine data dir; roles and orchestrators live under it. Bare
+    /// tests leave it unset and runs get no resolved instructions.
+    data_dir: OnceLock<std::path::PathBuf>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
@@ -355,6 +358,7 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 scratch_root: OnceLock::new(),
+                data_dir: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
         }
@@ -399,6 +403,10 @@ impl SessionsEngine {
 
     /// Bind generated-image intake to the same profile store used by attachment RPCs.
     /// Where projectless chats' scratch folders resolve (set once at boot).
+    pub(crate) fn set_data_dir(&self, dir: std::path::PathBuf) {
+        let _ = self.inner.data_dir.set(dir);
+    }
+
     pub(crate) fn set_scratch_root(&self, root: std::path::PathBuf) {
         let _ = self.inner.scratch_root.set(root);
     }
@@ -2149,6 +2157,17 @@ impl Inner {
         })
     }
 
+    fn chat_instructions(&self, chat_id: &str) -> Option<String> {
+        let data_dir = self.data_dir.get()?;
+        let workspace = self.workspace()?;
+        let chat = workspace.chat(chat_id).ok().flatten()?;
+        let parent = chat
+            .parent_chat_id
+            .as_deref()
+            .and_then(|id| workspace.chat(id).ok().flatten());
+        crate::orchestration::instructions::instructions_for(&chat, parent.as_ref(), data_dir)
+    }
+
     fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {
         self.doc_host().and_then(|host| host.workspace().cloned())
     }
@@ -3373,6 +3392,9 @@ async fn drive_run(
     // agent can spawn and talk to side chats through the engine it runs in.
     if request.mcp.is_none() {
         request.mcp = inner.zeron_mcp(&chat_id);
+    }
+    if request.instructions.is_none() {
+        request.instructions = inner.chat_instructions(&chat_id);
     }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
@@ -5248,6 +5270,7 @@ mod tests {
         idle_calls: Arc<std::sync::atomic::AtomicUsize>,
         inference_calls: Arc<std::sync::atomic::AtomicUsize>,
         fail: bool,
+        instructions: Arc<Mutex<Vec<Option<String>>>>,
     }
     #[async_trait::async_trait]
     impl zeron_harness::Harness for IdleStartupFixture {
@@ -5282,6 +5305,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert!(request.prompt.is_empty());
             assert_eq!(request.resume.as_deref(), Some("old-native-thread"));
+            lock(&self.instructions).push(request.instructions.clone());
             let event = if self.fail {
                 AgentEvent::Done {
                     status: zeron_proto::DoneStatus::Errored,
@@ -5329,6 +5353,7 @@ mod tests {
             idle_calls: idle_calls.clone(),
             inference_calls: inference_calls.clone(),
             fail,
+            instructions: Default::default(),
         }));
         let core = crate::EngineCore::assemble_with_profile(
             crate::EngineProfile::local(temp.path()).unwrap(),
@@ -5394,6 +5419,80 @@ mod tests {
             let events = core.sessions.inner.journal.replay("idle", 0).unwrap();
             assert!(events.iter().any(|(_, event)| matches!(event, AgentEvent::SessionStarted { session_id, .. } if session_id == "new-native-thread")));
         }
+        core.sessions.shutdown().await;
+    }
+    #[tokio::test]
+    async fn run_instructions_are_resolved_from_the_chat_config() {
+        use super::*;
+        use crate::orchestration::store::{OrchestratorConfig, Store};
+        let temp = tempfile::tempdir().unwrap();
+        Store::new(temp.path())
+            .create(&OrchestratorConfig {
+                id: "o1".into(),
+                name: "Orchestrator".into(),
+                avatar: None,
+                harness: HarnessId::Codex,
+                model: None,
+                reasoning: None,
+                child_harness: HarnessId::Codex,
+                projects: Vec::new(),
+            })
+            .unwrap();
+        let expected = Store::new(temp.path()).prompt("o1").unwrap();
+        let idle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let instructions = Arc::new(Mutex::new(Vec::new()));
+        let registry = crate::HarnessRegistry::new();
+        registry.register(Arc::new(IdleStartupFixture {
+            idle_calls: idle_calls.clone(),
+            inference_calls: Default::default(),
+            fail: false,
+            instructions: instructions.clone(),
+        }));
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            Arc::new(registry),
+            HarnessId::Codex,
+            None,
+        )
+        .unwrap();
+        let config = |orchestrator: Option<&str>| zeron_proto::ChatConfig {
+            harness: HarnessId::Codex,
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            role: None,
+            orchestrator: orchestrator.map(str::to_owned),
+        };
+        for (chat_id, orchestrator) in [("orch", Some("o1")), ("plain", None)] {
+            core.workspace
+                .create_chat(
+                    chat_id,
+                    None,
+                    Some(&core.device_id),
+                    Some(config(orchestrator)),
+                    None,
+                )
+                .unwrap();
+            let mut request = request();
+            request.prompt.clear();
+            core.sessions.inner.remember_harness_session(
+                chat_id,
+                "old-native-thread",
+                &request.cwd,
+                HarnessId::Codex,
+            );
+            let before = idle_calls.load(std::sync::atomic::Ordering::SeqCst);
+            core.sessions.start_idle(chat_id, request).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while idle_calls.load(std::sync::atomic::Ordering::SeqCst) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(*lock(&instructions), vec![Some(expected), None]);
         core.sessions.shutdown().await;
     }
     #[tokio::test]

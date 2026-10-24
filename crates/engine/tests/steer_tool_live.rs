@@ -117,6 +117,8 @@ async fn steering_never_aborts_a_running_tool() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::DangerFullAccess,
+                role: None,
+                orchestrator: None,
             },
         )
         .unwrap();

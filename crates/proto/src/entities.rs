@@ -171,6 +171,12 @@ pub struct ChatConfig {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
+    /// Role this chat runs as; resolved against the roles folder at run start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Id of the orchestrator this chat embodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<String>,
 }
 
 /// Immutable-at-run-start repository context owned by one conversation.

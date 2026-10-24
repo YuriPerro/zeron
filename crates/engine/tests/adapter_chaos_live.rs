@@ -194,6 +194,8 @@ impl Suite {
                     reasoning: None,
                     model_options: Default::default(),
                     sandbox: SandboxLevel::DangerFullAccess,
+                    role: None,
+                    orchestrator: None,
                 },
             )
             .unwrap();
@@ -1282,6 +1284,8 @@ async fn restart_durability() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::DangerFullAccess,
+                role: None,
+                orchestrator: None,
             },
         )
         .unwrap();
