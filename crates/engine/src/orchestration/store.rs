@@ -118,9 +118,9 @@ fn render_plan(items: &[PlanItem]) -> String {
             PlanStatus::InProgress => '~',
             PlanStatus::Completed => 'x',
         };
-        out.push_str(&format!("- [{mark}] {}", item.text));
+        out.push_str(&format!("- [{mark}] {}", single_line(&item.text)));
         for extra in [&item.role, &item.project].into_iter().flatten() {
-            out.push_str(&format!(" · {extra}"));
+            out.push_str(&format!(" · {}", single_line(extra)));
         }
         out.push('\n');
     }
@@ -222,7 +222,16 @@ impl Store {
             }
         }
         ids.sort();
-        ids.iter().map(|id| self.get(id)).collect()
+        let mut configs = Vec::new();
+        for id in ids {
+            match self.get(&id) {
+                Ok(config) => configs.push(config),
+                Err(err) => {
+                    tracing::warn!(orchestrator = %id, %err, "skipping unreadable orchestrator")
+                }
+            }
+        }
+        Ok(configs)
     }
 
     pub fn prompt(&self, id: &str) -> io::Result<String> {
@@ -246,6 +255,10 @@ impl Store {
             } else {
                 format!("{base}-{attempt}")
             };
+            if demands.join(ARCHIVE_DIR).join(&demand).exists() {
+                attempt += 1;
+                continue;
+            }
             match fs::create_dir(demands.join(&demand)) {
                 Ok(()) => return Ok(demand),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
@@ -522,6 +535,48 @@ mod tests {
             read(&dir, "loja/historico.md"),
             format!("- 2026-10-24 · {demand} · Cupom corrigido\n")
         );
+    }
+
+    #[test]
+    fn recreated_demand_after_close_gets_new_id_and_closes() {
+        let (_dir, store) = store_with("loja");
+        let first = store.create_demand("loja", "Fix X", day()).unwrap();
+        store.close_demand("loja", &first, "done", day()).unwrap();
+        let second = store.create_demand("loja", "Fix X", day()).unwrap();
+        assert_eq!(second, format!("{first}-2"));
+        store
+            .close_demand("loja", &second, "done again", day())
+            .unwrap();
+    }
+
+    #[test]
+    fn plan_fields_cannot_forge_extra_lines() {
+        let (dir, store) = store_with("loja");
+        let demand = store.create_demand("loja", "Forge", day()).unwrap();
+        let item = PlanItem {
+            text: "real\n- [x] fake".into(),
+            status: PlanStatus::Pending,
+            role: Some("a\n- [x] role".into()),
+            project: Some("b\r\n- [x] project".into()),
+        };
+        store.write_plan("loja", &demand, &[item]).unwrap();
+        let plan = read(&dir, &format!("loja/demandas/{demand}/plano.md"));
+        assert_eq!(plan.lines().count(), 1);
+        assert_eq!(
+            plan,
+            "- [ ] real - [x] fake · a - [x] role · b - [x] project\n"
+        );
+    }
+
+    #[test]
+    fn list_skips_invalid_and_corrupt_entries() {
+        let (dir, store) = store_with("loja");
+        let root = dir.path().join("orchestrators");
+        std::fs::create_dir_all(root.join("broken")).unwrap();
+        std::fs::write(root.join("broken/orchestrator.toml"), "not = [valid").unwrap();
+        std::fs::create_dir_all(root.join("Bad Name")).unwrap();
+        std::fs::write(root.join("Bad Name/orchestrator.toml"), "").unwrap();
+        assert_eq!(store.list().unwrap(), vec![config("loja")]);
     }
 
     #[test]
