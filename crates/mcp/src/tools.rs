@@ -6,6 +6,7 @@
 //! deliver a message to a chat in this state" choice the composer makes
 //! for humans.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ use zeron_proto::{
     Space, UserInputAnswer,
 };
 
+use crate::orchestration::{self, Scope};
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
 use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
 
@@ -33,12 +35,12 @@ const MAX_WAIT: Duration = Duration::from_secs(3600);
 #[serde(rename_all = "camelCase")]
 pub struct ToolDef {
     pub name: &'static str,
-    pub description: &'static str,
+    pub description: Cow<'static, str>,
     pub input_schema: Value,
 }
 
 pub struct Tools {
-    zeron: Arc<Zeron>,
+    pub(crate) zeron: Arc<Zeron>,
     // Remember successful sends on this MCP connection so wait_for_turn after
     // wait:false also waits for a newly created chat with no session row yet.
     pending_turns: tokio::sync::Mutex<HashMap<String, Arc<PendingTurn>>>,
@@ -67,27 +69,27 @@ fn catalog() -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
             name: "whoami",
-            description: "Which chat and device this server speaks for, plus the engine's workspace mode. Call this first when you need to know your own chat id.",
+            description: "Which chat and device this server speaks for, plus the engine's workspace mode. Call this first when you need to know your own chat id.".into(),
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
             name: "list_devices",
-            description: "Devices in this workspace (the local engine's device is flagged). Chats and projects are hosted on a device.",
+            description: "Devices in this workspace (the local engine's device is flagged). Chats and projects are hosted on a device.".into(),
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
             name: "list_projects",
-            description: "Projects: folders on specific devices. Filter by device (id or name); omit for all projects. Use ids when names or paths repeat.",
+            description: "Projects: folders on specific devices. Filter by device (id or name); omit for all projects. Use ids when names or paths repeat.".into(),
             input_schema: json!({ "type": "object", "properties": { "device": device_schema() } }),
         },
         ToolDef {
             name: "list_harnesses",
-            description: "Agent harnesses (claude-code, codex, cursor, …) on the chosen device (local when omitted). `connected` = installed, enabled and not known to be signed out: those are the providers you can delegate to, whichever provider you are. `signedIn` is null when the login state is unknown.",
+            description: "Agent harnesses (claude-code, codex, cursor, …) on the chosen device (local when omitted). `connected` = installed, enabled and not known to be signed out: those are the providers you can delegate to, whichever provider you are. `signedIn` is null when the login state is unknown.".into(),
             input_schema: json!({ "type": "object", "properties": { "device": device_schema() } }),
         },
         ToolDef {
             name: "list_models",
-            description: "Models a harness offers on the chosen device (local engine when omitted). Model ids are harness-specific strings; pass one to create_chat.",
+            description: "Models a harness offers on the chosen device (local engine when omitted). Model ids are harness-specific strings; pass one to create_chat.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -99,7 +101,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_chats",
-            description: "Chats with project, device, harness/model, sidebar status, and last activity. Status is working, awaitingInput (needs input), completed (unseen result), errored, or idle. statusStale marks expired live reports; terminalActivity explains OSC 7501 reports. sessionStatus is native execution state. Newest activity first.",
+            description: "Chats with project, device, harness/model, sidebar status, and last activity. Status is working, awaitingInput (needs input), completed (unseen result), errored, or idle. statusStale marks expired live reports; terminalActivity explains OSC 7501 reports. sessionStatus is native execution state. Newest activity first.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -113,12 +115,12 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "get_chat",
-            description: "One chat's metadata, live status, and any question its agent is currently blocked on.",
+            description: "One chat's metadata, live status, and any question its agent is currently blocked on.".into(),
             input_schema: chat_key_schema(json!({})),
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a standalone session with kind chat, or a child with kind side. Omitted kind defaults to side with an origin/parent, standalone otherwise. Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.",
+            description: "Create a standalone session with kind chat, or a child with kind side. Omitted kind defaults to side with an origin/parent, standalone otherwise. Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -129,7 +131,10 @@ fn catalog() -> Vec<ToolDef> {
                     "harness": { "type": "string", "description": "Harness id (see list_harnesses with the chosen device). Prefers a connected provider, claude-code first." },
                     "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit for the harness default." },
                     "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max)." },
-                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write" },
+                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write", "description": "Defaults to the role's access when a role is given." },
+                    "role": { "type": "string", "description": "Role the chat runs as (see list_roles in an orchestrator chat). Picks the model, reasoning and sandbox; explicit model, reasoning and sandbox win." },
+                    "effort": { "type": "string", "enum": ["low", "medium", "high"], "description": "How hard the role's model should think, relative to its usual level. Needs role." },
+                    "demand": { "type": "string", "description": "Orchestrator chats only: demand id. The first prompt is prefixed with a pointer to read_demand. Needs prompt." },
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
                     "branch": { "type": "string", "description": "Branch label to record on the chat." },
                     "cwd": { "type": "string", "description": "Working directory override (an existing worktree path). Defaults to the project folder." },
@@ -142,7 +147,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_chat",
-            description: "Read a chat's transcript as plain messages (newest window by default). Tool calls are summarized one per line.",
+            description: "Read a chat's transcript as plain messages (newest window by default). Tool calls are summarized one per line.".into(),
             input_schema: chat_key_schema(json!({
                 "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 40, "description": "How many messages, counted from the newest." },
                 "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest messages (paging backwards)." },
@@ -152,7 +157,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "send_message",
-            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn through its live mailbox (at the next supported input boundary without interrupting the agent). Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
+            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn through its live mailbox (at the next supported input boundary without interrupting the agent). Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.".into(),
             input_schema: chat_key_schema(json!({
                 "text": { "type": "string" },
                 "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
@@ -162,19 +167,19 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "wait_for_turn",
-            description: "Wait for completed, awaitingInput, interrupted, errored, or timedOut. Native pendingInput can be answered with respond_to_input; terminalActivity input must be handled in its terminal. Stale/offline activity is not completion. Returns assistant replies when available.",
+            description: "Wait for completed, awaitingInput, interrupted, errored, or timedOut. Native pendingInput can be answered with respond_to_input; terminalActivity input must be handled in its terminal. Stale/offline activity is not completion. Returns assistant replies when available.".into(),
             input_schema: chat_key_schema(json!({
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
             })),
         },
         ToolDef {
             name: "interrupt_chat",
-            description: "Stop the chat's running turn.",
+            description: "Stop the chat's running turn.".into(),
             input_schema: chat_key_schema(json!({})),
         },
         ToolDef {
             name: "respond_to_input",
-            description: "Answer a question the chat's agent is blocked on (see get_chat / wait_for_turn pendingInput). Labels are the option strings, or free text for open questions.",
+            description: "Answer a question the chat's agent is blocked on (see get_chat / wait_for_turn pendingInput). Labels are the option strings, or free text for open questions.".into(),
             input_schema: chat_key_schema(json!({
                 "request_id": { "type": "string", "description": "The pending request id. Defaults to the chat's current pending question." },
                 "answers": {
@@ -192,7 +197,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "archive_chat",
-            description: "Archive a chat (hide it from the active sidebar list); pass archived=false to restore. Use it to tidy up chats you created.",
+            description: "Archive a chat (hide it from the active sidebar list); pass archived=false to restore. Use it to tidy up chats you created.".into(),
             input_schema: chat_key_schema(json!({
                 "archived": { "type": "boolean", "default": true }
             })),
@@ -217,7 +222,8 @@ fn catalog() -> Vec<ToolDef> {
             .input_schema
             .clone();
         tools.push(ToolDef {
-            name, description,
+            name,
+            description: description.into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"requests": {"type": "array", "minItems": 1, "maxItems": MAX_BATCH, "items": item_schema}},
@@ -227,7 +233,7 @@ fn catalog() -> Vec<ToolDef> {
     }
     tools.push(ToolDef {
         name: SHOW_VISUAL,
-        description: SHOW_VISUAL_DESCRIPTION,
+        description: SHOW_VISUAL_DESCRIPTION.into(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -519,6 +525,9 @@ struct CreateChatArgs {
     model: Option<String>,
     reasoning: Option<String>,
     sandbox: Option<String>,
+    role: Option<String>,
+    effort: Option<String>,
+    demand: Option<String>,
     title: Option<String>,
     branch: Option<String>,
     cwd: Option<String>,
@@ -668,7 +677,27 @@ impl Tools {
         }
     }
 
-    pub fn list(&self) -> Vec<ToolDef> {
+    pub async fn list(&self) -> Vec<ToolDef> {
+        let scope = self.scope().await;
+        let mut tools = self.base_tools();
+        tools.extend(orchestration::definitions_for(&scope));
+        if matches!(scope, Scope::Orchestrator { .. }) {
+            let roles = orchestration::roles_summary(&self.zeron).await;
+            if !roles.is_empty()
+                && let Some(create) = tools.iter_mut().find(|tool| tool.name == "create_chat")
+            {
+                create.description = format!("{} {roles}", create.description).into();
+            }
+        }
+        tools
+    }
+
+    pub async fn has(&self, name: &str) -> bool {
+        self.base_tools().iter().any(|t| t.name == name)
+            || orchestration::offers(&self.scope().await, name)
+    }
+
+    fn base_tools(&self) -> Vec<ToolDef> {
         let in_chat = self.zeron.origin().chat_id.is_some();
         catalog()
             .into_iter()
@@ -676,8 +705,10 @@ impl Tools {
             .collect()
     }
 
-    pub fn has(&self, name: &str) -> bool {
-        self.list().iter().any(|t| t.name == name)
+    async fn scope(&self) -> Scope {
+        orchestration::scope(&self.zeron)
+            .await
+            .unwrap_or(Scope::Plain)
     }
 
     /// `Ok` is the tool's structured result; `Err` is a message the model
@@ -701,6 +732,9 @@ impl Tools {
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
+            other if orchestration::handles(other) => {
+                return self.call_orchestration(other, args).await;
+            }
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))
@@ -929,6 +963,40 @@ impl Tools {
         } else {
             ChatKind::Chat
         };
+        let scope = orchestration::scope(&self.zeron).await?;
+        if matches!(scope, Scope::Orchestrator { .. }) {
+            anyhow::ensure!(
+                parent_chat_id.is_some() && parent_chat_id == self.zeron.origin().chat_id,
+                "Chats created from an orchestrator are its children: omit kind chat and parent."
+            );
+        } else {
+            anyhow::ensure!(
+                args.demand.is_none(),
+                "demand is only available in an orchestrator chat"
+            );
+        }
+        let role = args
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|role| !role.is_empty());
+        let effort = args.effort.as_deref().map(str::trim);
+        if let Some(effort) = effort {
+            anyhow::ensure!(
+                matches!(effort, "low" | "medium" | "high"),
+                "effort must be one of: low, medium, high"
+            );
+            anyhow::ensure!(role.is_some(), "effort needs a role");
+        }
+        let demand = args
+            .demand
+            .as_deref()
+            .map(str::trim)
+            .filter(|demand| !demand.is_empty());
+        anyhow::ensure!(
+            demand.is_none() || args.prompt.as_deref().is_some_and(|p| !p.trim().is_empty()),
+            "demand needs a prompt"
+        );
 
         // Delegation is one level deep: a chat that has a parent never
         // creates chats, and a new chat's parent is a top-level chat.
@@ -953,11 +1021,30 @@ impl Tools {
             .zeron
             .resolve_target(args.project.as_deref(), args.device.as_deref())
             .await?;
+        let orchestrator = match &scope {
+            Scope::Orchestrator { id } => {
+                let orchestrator = self.zeron.get_orchestrator(id).await?;
+                orchestration::ensure_project_associated(
+                    &self.zeron,
+                    &orchestrator,
+                    space.as_ref(),
+                )
+                .await?;
+                Some(orchestrator)
+            }
+            _ => None,
+        };
         let harnesses = self.zeron.harnesses_on(Some(&device_id)).await?;
-        let harness = match args.harness.as_deref() {
+        let requested: Option<HarnessId> = match args.harness.as_deref() {
+            Some(raw) => Some(parse_enum("harness", raw).map_err(anyhow::Error::msg)?),
+            None => orchestrator
+                .as_ref()
+                .map(|o| o.child_harness)
+                .filter(|id| !args.cloud || CLOUD_HARNESSES.contains(id)),
+        };
+        let harness = match requested {
             // Cloud runs its own agents, with your Cloud accounts.
-            Some(raw) if args.cloud => {
-                let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
+            Some(id) if args.cloud => {
                 anyhow::ensure!(
                     CLOUD_HARNESSES.contains(&id),
                     "Cloud runs Codex and Claude Code only"
@@ -965,16 +1052,28 @@ impl Tools {
                 id
             }
             None if args.cloud => CLOUD_HARNESSES[0],
-            Some(raw) => {
-                let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
+            Some(id) => {
                 anyhow::ensure!(
                     harnesses.iter().any(|h| h.id == id && h.available()),
-                    "harness {raw} is not available on device {device_id} (see list_harnesses with device)"
+                    "harness {} is not available on device {device_id} (see list_harnesses with device)",
+                    harness_label(id)
                 );
                 id
             }
             None => default_harness(&harnesses).with_context(|| format!("device {device_id}"))?,
         };
+        let resolved = match role {
+            Some(role) => Some(
+                self.zeron
+                    .resolve_role_model(role, harness, effort, Some(&device_id))
+                    .await?,
+            ),
+            None => None,
+        };
+        let model = args
+            .model
+            .clone()
+            .or_else(|| resolved.as_ref().map(|r| r.model.clone()));
         // A Cloud machine's catalog is checked when it runs, not here.
         if let Some(model) = args.model.as_deref().filter(|_| !args.cloud) {
             let models = self.zeron.models_on(harness, Some(&device_id)).await?;
@@ -990,19 +1089,21 @@ impl Tools {
         }
         let reasoning: Option<ReasoningLevel> = match args.reasoning.as_deref() {
             Some(raw) => Some(parse_enum("reasoning level", raw).map_err(anyhow::Error::msg)?),
-            None => None,
+            None => resolved.as_ref().and_then(|r| r.reasoning),
         };
         let sandbox: SandboxLevel = match args.sandbox.as_deref() {
             Some(raw) => parse_enum("sandbox", raw).map_err(anyhow::Error::msg)?,
-            None => SandboxLevel::WorkspaceWrite,
+            None => resolved
+                .as_ref()
+                .map_or(SandboxLevel::WorkspaceWrite, |r| r.sandbox),
         };
         let config = ChatConfig {
             harness,
-            model: args.model.clone(),
+            model: model.clone(),
             reasoning,
             model_options: Default::default(),
             sandbox,
-            role: None,
+            role: role.map(str::to_owned),
             orchestrator: None,
         };
 
@@ -1091,8 +1192,9 @@ impl Tools {
             "deviceId": device_id,
             "project": space.as_ref().map(|s| json!({ "id": s.id, "name": s.display_name(), "path": s.path })),
             "harness": harness,
-            "model": args.model,
+            "model": model,
             "reasoning": reasoning,
+            "role": role,
             "title": args.title,
             "parentChatId": parent_chat_id,
         });
@@ -1102,6 +1204,12 @@ impl Tools {
             ));
         }
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
+            let prompt = match demand {
+                Some(demand) => format!(
+                    "Demand: {demand}. Read it with read_demand before starting.\n\n{prompt}"
+                ),
+                None => prompt,
+            };
             // The row may not have folded into WatchChats yet; build the
             // chat locally from what we just wrote rather than re-reading.
             let chat = Chat {
@@ -1565,6 +1673,13 @@ impl Tools {
     }
 }
 
+fn harness_label(id: HarnessId) -> String {
+    serde_json::to_value(id)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{id:?}"))
+}
+
 /// claude-code when it is ready here, else the first ready harness — a
 /// provider that is installed but signed out only when nothing else is.
 fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
@@ -1614,6 +1729,36 @@ mod tests {
         extra_chats: Vec<Value>,
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
+        orch_child_harness: Option<&'static str>,
+    }
+
+    fn orchestrated_chats() -> Vec<Value> {
+        vec![
+            json!({
+                "id": "chat-orch-5", "deviceId": "dev-local", "title": "Plataforma",
+                "archived": false, "createdAt": "2026-10-01T00:00:00Z",
+                "config": { "harness": "claude-code", "model": null, "reasoning": null,
+                    "sandbox": "read-only", "orchestrator": "plataforma" }
+            }),
+            json!({
+                "id": "chat-kid-6", "deviceId": "dev-local", "title": "Kid",
+                "parentChatId": "chat-orch-5", "spaceId": "space-1",
+                "archived": false, "createdAt": "2026-10-02T00:00:00Z",
+                "config": { "harness": "claude-code", "model": "sonnet", "reasoning": null,
+                    "sandbox": "workspace-write", "role": "executor" }
+            }),
+        ]
+    }
+
+    fn orchestrated() -> Arc<World> {
+        Arc::new(World {
+            extra_chats: orchestrated_chats(),
+            ..Default::default()
+        })
+    }
+
+    fn names(defs: &[ToolDef]) -> Vec<&str> {
+        defs.iter().map(|d| d.name).collect()
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1625,7 +1770,10 @@ mod tests {
         async fn handle(&self, method: &str, params: Value) -> Result<RpcReply, RpcError> {
             if matches!(
                 method,
-                methods::LIST_HARNESSES | methods::LIST_MODELS | methods::LIST_AGENT_ACCOUNTS
+                methods::LIST_HARNESSES
+                    | methods::LIST_MODELS
+                    | methods::LIST_AGENT_ACCOUNTS
+                    | methods::RESOLVE_ROLE_MODEL
             ) {
                 self.reads
                     .lock()
@@ -1718,6 +1866,39 @@ mod tests {
                       "status": "complete",
                       "parts": [{ "kind": "text", "id": "t", "text": "hello back" }] }
                 ]})),
+                methods::LIST_ROLES => RpcReply::Value(json!({
+                    "roles": [
+                        { "name": "executor", "description": "Implements a plan item",
+                          "model": "@medio", "access": "write" },
+                        { "name": "explorador", "description": "Reads code, changes nothing",
+                          "model": "@rapido", "access": "read-only" }
+                    ],
+                    "errors": []
+                })),
+                methods::RESOLVE_ROLE_MODEL => RpcReply::Value(json!({
+                    "model": "sonnet",
+                    "reasoning": "high",
+                    "sandbox": if params["role"] == "explorador" { "read-only" } else { "workspace-write" }
+                })),
+                methods::GET_ORCHESTRATOR => RpcReply::Value(json!({
+                    "id": params["orchestratorId"], "name": "Plataforma", "avatar": null,
+                    "harness": "claude-code", "model": null, "reasoning": null,
+                    "childHarness": self.orch_child_harness.unwrap_or("claude-code"),
+                    "projects": ["space-1"]
+                })),
+                methods::ORCH_CREATE_DEMAND
+                | methods::ORCH_WRITE_SPEC
+                | methods::ORCH_WRITE_PLAN
+                | methods::ORCH_READ_DEMAND
+                | methods::ORCH_SUBMIT_REPORT
+                | methods::ORCH_CLOSE_DEMAND
+                | methods::ORCH_REMEMBER => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params));
+                    RpcReply::Value(json!({ "demand": "2026-10-24-login" }))
+                }
                 methods::PUBLISH_VISUAL => {
                     self.writes
                         .lock()
@@ -1786,7 +1967,7 @@ mod tests {
     async fn show_visual_is_offered_only_inside_a_chat() {
         let world = Arc::new(World::default());
         let outside = tools(world.clone(), Origin::default());
-        assert!(!outside.has("show_visual"));
+        assert!(!outside.has("show_visual").await);
         assert!(
             outside
                 .call(
@@ -1804,7 +1985,7 @@ mod tests {
                 device_id: Some("dev-local".into()),
             },
         );
-        assert!(inside.has("show_visual"));
+        assert!(inside.has("show_visual").await);
         // The guidance names every color the runtime accepts.
         for name in zeron_visual::TOKEN_NAMES {
             assert!(SHOW_VISUAL_DESCRIPTION.contains(name), "{name}");
@@ -2922,6 +3103,330 @@ mod tests {
                 assert_eq!(result["turn"]["replies"][0]["id"], "new-reply");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_sees_orchestrator_tools_only_in_orchestrator_chats() {
+        let world = orchestrated();
+        let plain = tools(world.clone(), origin("chat-alpha-1"));
+        let plain_defs = plain.list().await;
+        let plain_names = names(&plain_defs);
+        assert!(!plain_names.contains(&"write_spec"));
+        assert!(!plain_names.contains(&"submit_report"));
+        assert!(!plain.has("write_spec").await);
+        assert!(
+            plain
+                .call("write_spec", json!({ "demand": "d", "text": "t" }))
+                .await
+                .is_err()
+        );
+
+        let orchestrator = tools(world.clone(), origin("chat-orch-5"));
+        let listed = orchestrator.list().await;
+        let orchestrator_names = names(&listed);
+        for tool in [
+            "list_roles",
+            "create_demand",
+            "write_spec",
+            "update_plan",
+            "read_demand",
+            "close_demand",
+            "remember",
+            "create_chat",
+        ] {
+            assert!(orchestrator_names.contains(&tool), "{tool}");
+        }
+        assert!(!orchestrator_names.contains(&"submit_report"));
+        assert!(orchestrator.has("write_spec").await);
+
+        let child = tools(world.clone(), origin("chat-kid-6"));
+        let listed = child.list().await;
+        let child_names = names(&listed);
+        for tool in ["read_demand", "submit_report", "request_contract_change"] {
+            assert!(child_names.contains(&tool), "{tool}");
+        }
+        assert!(!child_names.contains(&"write_spec"));
+        assert!(!child_names.contains(&"update_plan"));
+        assert!(!child.has("write_spec").await);
+    }
+
+    #[tokio::test]
+    async fn create_chat_with_role_uses_resolved_model_and_records_role() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "role": "executor", "effort": "high" }),
+            )
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["config"]["model"], "sonnet");
+        assert_eq!(writes[0].1["config"]["reasoning"], "high");
+        assert_eq!(writes[0].1["config"]["role"], "executor");
+        assert_eq!(writes[0].1["config"]["sandbox"], "workspace-write");
+        let reads = world.reads.lock().unwrap();
+        let (_, resolve) = reads
+            .iter()
+            .find(|(method, _)| method == methods::RESOLVE_ROLE_MODEL)
+            .unwrap();
+        assert_eq!(resolve["role"], "executor");
+        assert_eq!(resolve["harness"], "claude-code");
+        assert_eq!(resolve["effort"], "high");
+        assert_eq!(resolve["targetDeviceId"], "dev-local");
+    }
+
+    #[tokio::test]
+    async fn the_role_decides_the_sandbox_and_the_explicit_one_wins() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        tools
+            .call("create_chat", json!({ "role": "explorador" }))
+            .await
+            .unwrap();
+        tools
+            .call(
+                "create_chat",
+                json!({ "role": "explorador", "sandbox": "workspace-write" }),
+            )
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["config"]["sandbox"], "read-only");
+        assert_eq!(writes[1].1["config"]["sandbox"], "workspace-write");
+    }
+
+    #[tokio::test]
+    async fn explicit_model_beats_role_model() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        tools
+            .call(
+                "create_chat",
+                json!({ "role": "executor", "model": "opus", "reasoning": "low" }),
+            )
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["config"]["model"], "opus");
+        assert_eq!(writes[0].1["config"]["reasoning"], "low");
+        assert_eq!(writes[0].1["config"]["role"], "executor");
+    }
+
+    #[tokio::test]
+    async fn effort_is_validated_and_needs_a_role() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let invalid = tools
+            .call(
+                "create_chat",
+                json!({ "role": "executor", "effort": "max" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(invalid.contains("low, medium, high"), "{invalid}");
+        let orphan = tools
+            .call("create_chat", json!({ "effort": "low" }))
+            .await
+            .unwrap_err();
+        assert!(orphan.contains("effort needs a role"), "{orphan}");
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_cannot_create_children_outside_its_projects() {
+        let world = orchestrated();
+        let tools = tools(world.clone(), origin("chat-orch-5"));
+        let outside = tools
+            .call("create_chat", json!({ "project": "space-unique" }))
+            .await
+            .unwrap_err();
+        assert!(
+            outside.contains("Project unique is not associated"),
+            "{outside}"
+        );
+        assert!(outside.contains("Associated: comet."), "{outside}");
+        let projectless = tools.call("create_chat", json!({})).await.unwrap_err();
+        assert!(projectless.contains("is not associated"), "{projectless}");
+        assert!(world.writes.lock().unwrap().is_empty());
+
+        let created = tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "role": "executor" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["parentChatId"], "chat-orch-5");
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["parentChatId"], "chat-orch-5");
+        assert_eq!(writes[0].1["config"]["role"], "executor");
+    }
+
+    #[tokio::test]
+    async fn an_orchestrator_cannot_detach_its_children() {
+        let world = orchestrated();
+        let tools = tools(world.clone(), origin("chat-orch-5"));
+        for args in [
+            json!({ "project": "space-1", "kind": "chat" }),
+            json!({ "project": "space-1", "parent": "Alpha" }),
+        ] {
+            let refused = tools.call("create_chat", args).await.unwrap_err();
+            assert!(refused.contains("orchestrator"), "{refused}");
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn children_default_to_the_orchestrators_child_harness() {
+        let world = Arc::new(World {
+            extra_chats: orchestrated_chats(),
+            orch_child_harness: Some("codex"),
+            ..Default::default()
+        });
+        let tools = tools(world.clone(), origin("chat-orch-5"));
+        let refused = tools
+            .call("create_chat", json!({ "project": "space-1" }))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("codex"), "{refused}");
+        tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "harness": "claude-code" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            world.writes.lock().unwrap()[0].1["config"]["harness"],
+            "claude-code"
+        );
+    }
+
+    #[tokio::test]
+    async fn demand_prefix_is_added_to_the_first_prompt() {
+        let world = orchestrated();
+        let tools = tools(world.clone(), origin("chat-orch-5"));
+        tools
+            .call(
+                "create_chat",
+                json!({
+                    "project": "space-1", "role": "executor",
+                    "demand": "2026-10-24-login", "prompt": "Build it."
+                }),
+            )
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        let (method, params) = writes.last().unwrap();
+        assert_eq!(method, methods::QUEUE_COMMAND);
+        assert_eq!(
+            params["command"]["request"]["prompt"],
+            "Demand: 2026-10-24-login. Read it with read_demand before starting.\n\nBuild it."
+        );
+        drop(writes);
+
+        let without_prompt = tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "demand": "2026-10-24-login" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            without_prompt.contains("demand needs a prompt"),
+            "{without_prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_chat_description_lists_roles_in_orchestrator_chats() {
+        let world = orchestrated();
+        let description = |defs: Vec<ToolDef>| {
+            defs.into_iter()
+                .find(|d| d.name == "create_chat")
+                .unwrap()
+                .description
+                .into_owned()
+        };
+        let orchestrator = description(tools(world.clone(), origin("chat-orch-5")).list().await);
+        assert!(
+            orchestrator.contains(
+                "Roles: executor (Implements a plan item); explorador (Reads code, changes nothing)."
+            ),
+            "{orchestrator}"
+        );
+        let plain = description(tools(world.clone(), origin("chat-alpha-1")).list().await);
+        assert!(!plain.contains("Roles:"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn child_tools_use_the_parents_orchestrator_id() {
+        let world = orchestrated();
+        let child = tools(world.clone(), origin("chat-kid-6"));
+        child
+            .call(
+                "submit_report",
+                json!({ "demand": "2026-10-24-login", "text": "done", "orchestratorId": "evil" }),
+            )
+            .await
+            .unwrap();
+        child
+            .call("read_demand", json!({ "demand": "2026-10-24-login" }))
+            .await
+            .unwrap();
+        child
+            .call(
+                "request_contract_change",
+                json!({ "demand": "2026-10-24-login", "reason": "The API differs." }),
+            )
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].0, methods::ORCH_SUBMIT_REPORT);
+        assert_eq!(writes[0].1["orchestratorId"], "plataforma");
+        assert_eq!(writes[0].1["childId"], "chat-kid-6");
+        assert_eq!(writes[0].1["text"], "done");
+        assert_eq!(writes[1].0, methods::ORCH_READ_DEMAND);
+        assert_eq!(writes[1].1["orchestratorId"], "plataforma");
+        assert_eq!(writes[2].0, methods::QUEUE_MESSAGE);
+        assert_eq!(writes[2].1["chatId"], "chat-orch-5");
+        assert_eq!(
+            writes[2].1["text"],
+            "[Contract change requested by Kid (chat-kid-6) for demand 2026-10-24-login]\n\nThe API differs."
+        );
+    }
+
+    #[tokio::test]
+    async fn update_plan_validates_items_and_writes_them_for_the_orchestrator() {
+        let world = orchestrated();
+        let tools = tools(world.clone(), origin("chat-orch-5"));
+        tools
+            .call(
+                "update_plan",
+                json!({ "demand": "2026-10-24-login", "items": [
+                    { "text": "Add endpoint", "status": "inProgress", "role": "executor", "project": "comet" },
+                    { "text": "Review", "status": "pending" }
+                ]}),
+            )
+            .await
+            .unwrap();
+        let invalid = tools
+            .call(
+                "update_plan",
+                json!({ "demand": "d", "items": [{ "text": "x", "status": "done" }] }),
+            )
+            .await
+            .unwrap_err();
+        assert!(invalid.contains("invalid arguments"), "{invalid}");
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, methods::ORCH_WRITE_PLAN);
+        assert_eq!(writes[0].1["orchestratorId"], "plataforma");
+        assert_eq!(writes[0].1["items"][0]["status"], "inProgress");
+        assert_eq!(writes[0].1["items"][0]["role"], "executor");
+        assert_eq!(writes[0].1["items"][1]["status"], "pending");
     }
 
     #[tokio::test]

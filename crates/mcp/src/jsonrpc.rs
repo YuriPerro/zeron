@@ -53,6 +53,11 @@ Delegation is one level deep: a chat that has a parent cannot create chats. \
 Pass `cloud: true` to run a child on a Cloud machine of its own (Codex or Claude Code); \
 from a Cloud chat it clones the same repository, and without `cloud` it shares your machine.\n\
 \n\
+Pass `role` to `create_chat` to run a child as a named role: the role picks the model, \
+reasoning and sandbox, and `effort` (low, medium, high) shifts how hard it thinks. \
+Explicit `model`, `reasoning` and `sandbox` still win. Roles are global; an orchestrator \
+chat lists them in `create_chat`'s description and with `list_roles`.\n\
+\n\
 When a chart, table, diagram, dashboard, or 3D view would say more than prose and \
 `show_visual` is available, write a Luau visual script and show it with `show_visual` before \
 your final reply. Zeron renders it with its own native interface and enforces its style: \
@@ -176,12 +181,12 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
             )
         }
         "ping" => ok_response(id, json!({})),
-        "tools/list" => ok_response(id, json!({ "tools": tools.list() })),
+        "tools/list" => ok_response(id, json!({ "tools": tools.list().await })),
         "tools/call" => {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return error_response(id, INVALID_PARAMS, "tools/call needs a tool name");
             };
-            if !tools.has(name) {
+            if !tools.has(name).await {
                 return error_response(id, INVALID_PARAMS, &format!("unknown tool: {name}"));
             }
             let arguments = params

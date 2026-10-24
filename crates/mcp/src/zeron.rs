@@ -10,14 +10,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use zeron_doc::{
     SessionCommandPayload, SessionMessageEntry, TranscriptFrame, apply_transcript_frame,
 };
 use zeron_proto::{
-    Chat, Device, HarnessId, Model, ReasoningLevel, Session, SessionStatus, Space, SteeringMode,
+    Chat, Device, HarnessId, Model, ReasoningLevel, SandboxLevel, Session, SessionStatus, Space,
+    SteeringMode,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcSubscription, connect_ipc, methods};
 
@@ -100,6 +101,66 @@ impl HarnessInfo {
     pub fn steers_mid_turn(&self) -> bool {
         self.supports_steering && self.steering_mode == SteeringMode::StepBoundary
     }
+}
+
+/// One role from `ListRoles`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleInfo {
+    pub name: String,
+    pub description: String,
+    pub model: String,
+    pub access: String,
+}
+
+/// `ListRoles` reply: the loadable roles plus the files that failed to load.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleCatalog {
+    pub roles: Vec<RoleInfo>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+/// `ResolveRoleModel` reply.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedRole {
+    pub model: String,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningLevel>,
+    pub sandbox: SandboxLevel,
+}
+
+/// `GetOrchestrator` reply; `projects` are space ids.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratorInfo {
+    pub id: String,
+    pub name: String,
+    pub child_harness: HarnessId,
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One line of a demand plan, as `OrchWritePlan` takes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanItem {
+    pub text: String,
+    pub status: PlanStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 /// Why a `wait_for_turn` returned.
@@ -412,6 +473,126 @@ impl Zeron {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned())
+    }
+
+    pub async fn list_roles(&self) -> anyhow::Result<RoleCatalog> {
+        let value = self.call(methods::LIST_ROLES, json!({})).await?;
+        serde_json::from_value(value).context("ListRoles: unexpected shape")
+    }
+
+    pub async fn resolve_role_model(
+        &self,
+        role: &str,
+        harness: HarnessId,
+        effort: Option<&str>,
+        device: Option<&str>,
+    ) -> anyhow::Result<ResolvedRole> {
+        let mut params = json!({ "role": role, "harness": harness });
+        if let Some(effort) = effort {
+            params["effort"] = json!(effort);
+        }
+        if let Some(device) = device {
+            params["targetDeviceId"] = json!(device);
+        }
+        let value = self.call(methods::RESOLVE_ROLE_MODEL, params).await?;
+        serde_json::from_value(value).context("ResolveRoleModel: unexpected shape")
+    }
+
+    pub async fn get_orchestrator(&self, id: &str) -> anyhow::Result<OrchestratorInfo> {
+        let value = self
+            .call(methods::GET_ORCHESTRATOR, json!({ "orchestratorId": id }))
+            .await?;
+        serde_json::from_value(value).context("GetOrchestrator: unexpected shape")
+    }
+
+    pub async fn orch_create_demand(
+        &self,
+        orchestrator: &str,
+        title: &str,
+    ) -> anyhow::Result<Value> {
+        self.call(
+            methods::ORCH_CREATE_DEMAND,
+            json!({ "orchestratorId": orchestrator, "title": title }),
+        )
+        .await
+    }
+
+    pub async fn orch_write_spec(
+        &self,
+        orchestrator: &str,
+        demand: &str,
+        text: &str,
+    ) -> anyhow::Result<Value> {
+        self.call(
+            methods::ORCH_WRITE_SPEC,
+            json!({ "orchestratorId": orchestrator, "demand": demand, "text": text }),
+        )
+        .await
+    }
+
+    pub async fn orch_write_plan(
+        &self,
+        orchestrator: &str,
+        demand: &str,
+        items: &[PlanItem],
+    ) -> anyhow::Result<Value> {
+        self.call(
+            methods::ORCH_WRITE_PLAN,
+            json!({ "orchestratorId": orchestrator, "demand": demand, "items": items }),
+        )
+        .await
+    }
+
+    pub async fn orch_read_demand(
+        &self,
+        orchestrator: &str,
+        demand: &str,
+    ) -> anyhow::Result<Value> {
+        self.call(
+            methods::ORCH_READ_DEMAND,
+            json!({ "orchestratorId": orchestrator, "demand": demand }),
+        )
+        .await
+    }
+
+    pub async fn orch_submit_report(
+        &self,
+        orchestrator: &str,
+        demand: &str,
+        child_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Value> {
+        self.call(
+            methods::ORCH_SUBMIT_REPORT,
+            json!({
+                "orchestratorId": orchestrator,
+                "demand": demand,
+                "childId": child_id,
+                "text": text,
+            }),
+        )
+        .await
+    }
+
+    pub async fn orch_close_demand(
+        &self,
+        orchestrator: &str,
+        demand: &str,
+        summary: &str,
+    ) -> anyhow::Result<Value> {
+        self.call(
+            methods::ORCH_CLOSE_DEMAND,
+            json!({ "orchestratorId": orchestrator, "demand": demand, "summary": summary }),
+        )
+        .await
+    }
+
+    pub async fn orch_remember(&self, orchestrator: &str, note: &str) -> anyhow::Result<Value> {
+        self.call(
+            methods::ORCH_REMEMBER,
+            json!({ "orchestratorId": orchestrator, "note": note }),
+        )
+        .await
     }
 
     // ---- resolution --------------------------------------------------------
