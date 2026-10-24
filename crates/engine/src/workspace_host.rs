@@ -1376,8 +1376,7 @@ impl WorkspaceHost {
             let stored = doc.chat(chat_id)?.and_then(|chat| chat.config);
             let mut merged = config.clone();
             if let Some(stored) = stored {
-                merged.role = merged.role.or(stored.role);
-                merged.orchestrator = merged.orchestrator.or(stored.orchestrator);
+                merged.keep_orchestration_from(&stored);
             }
             doc.set_chat_config(chat_id, &merged)
         })?)

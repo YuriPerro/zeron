@@ -825,7 +825,16 @@ impl Client {
                 "This chat's computer needs a newer Zeron to switch provider.".into(),
             ));
         }
-        self.chat_write(chat_id, |doc| doc.set_chat_config(chat_id, config))
+        let mut merged = config.clone();
+        if let Some(stored) = self
+            .inner
+            .workspace
+            .chat(chat_id)
+            .and_then(|chat| chat.config)
+        {
+            merged.keep_orchestration_from(&stored);
+        }
+        self.chat_write(chat_id, |doc| doc.set_chat_config(chat_id, &merged))
     }
 
     /// Remove the chat row (the doc itself stays on the edge).

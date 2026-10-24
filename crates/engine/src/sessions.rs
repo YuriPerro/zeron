@@ -401,16 +401,17 @@ impl SessionsEngine {
         lock(&self.inner.doc_host).take();
     }
 
-    /// Bind generated-image intake to the same profile store used by attachment RPCs.
-    /// Where projectless chats' scratch folders resolve (set once at boot).
+    /// Where roles and orchestrators resolve (set once at boot).
     pub(crate) fn set_data_dir(&self, dir: std::path::PathBuf) {
         let _ = self.inner.data_dir.set(dir);
     }
 
+    /// Where projectless chats' scratch folders resolve (set once at boot).
     pub(crate) fn set_scratch_root(&self, root: std::path::PathBuf) {
         let _ = self.inner.scratch_root.set(root);
     }
 
+    /// Bind generated-image intake to the same profile store used by attachment RPCs.
     pub fn set_generated_images(
         &self,
         uploads: crate::uploads::Uploads,

@@ -179,6 +179,19 @@ pub struct ChatConfig {
     pub orchestrator: Option<String>,
 }
 
+impl ChatConfig {
+    /// Fills `role` and `orchestrator` from `stored` where this config has none,
+    /// so a write from a client that does not know them never clears them.
+    pub fn keep_orchestration_from(&mut self, stored: &ChatConfig) {
+        if self.role.is_none() {
+            self.role = stored.role.clone();
+        }
+        if self.orchestrator.is_none() {
+            self.orchestrator = stored.orchestrator.clone();
+        }
+    }
+}
+
 /// Immutable-at-run-start repository context owned by one conversation.
 ///
 /// This is deliberately separate from the live checkout snapshot: another
@@ -1618,6 +1631,35 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn config(role: Option<&str>, orchestrator: Option<&str>) -> ChatConfig {
+        ChatConfig {
+            harness: HarnessId::Mock,
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            role: role.map(str::to_owned),
+            orchestrator: orchestrator.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn keep_orchestration_from_fills_only_missing_fields() {
+        let stored = config(Some("executor"), Some("o1"));
+
+        let mut bare = config(None, None);
+        bare.keep_orchestration_from(&stored);
+        assert_eq!(bare, stored);
+
+        let mut explicit = config(Some("revisor"), Some("o2"));
+        explicit.keep_orchestration_from(&stored);
+        assert_eq!(explicit, config(Some("revisor"), Some("o2")));
+
+        let mut partial = config(Some("revisor"), None);
+        partial.keep_orchestration_from(&stored);
+        assert_eq!(partial, config(Some("revisor"), Some("o1")));
+    }
 
     #[test]
     fn outside_workspace_reads_round_trip_without_breaking_older_reasons() {

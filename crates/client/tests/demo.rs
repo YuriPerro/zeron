@@ -603,6 +603,25 @@ fn sends_to_an_offline_host_park_as_queued_not_working() {
 /// A provider change goes through only where the chat's host switches
 /// providers; a model change goes through anywhere.
 #[test]
+fn config_writes_without_orchestration_fields_keep_the_stored_ones() {
+    let (client, _dir) = demo(fast());
+    let mut config = client.session_config("chat-blog").unwrap();
+    config.orchestrator = Some("o1".into());
+    config.role = Some("executor".into());
+    client.set_session_config("chat-blog", &config).unwrap();
+
+    config.model = Some("another-model".into());
+    config.orchestrator = None;
+    config.role = None;
+    client.set_session_config("chat-blog", &config).unwrap();
+
+    let stored = client.session_config("chat-blog").unwrap();
+    assert_eq!(stored.model.as_deref(), Some("another-model"));
+    assert_eq!(stored.orchestrator.as_deref(), Some("o1"));
+    assert_eq!(stored.role.as_deref(), Some("executor"));
+}
+
+#[test]
 fn provider_switch_needs_a_host_that_switches() {
     let (client, _dir) = demo(fast());
     let switched = |chat: &str| {
