@@ -110,6 +110,7 @@ async fn orchestration_rpcs_round_trip() {
     let chat = fx.core.workspace.chat(&chat_id).unwrap().unwrap();
     assert_eq!(chat.title.as_deref(), Some("Loja Online"));
     assert_eq!(chat.space_id, None);
+    assert_eq!(chat.parent_chat_id, None);
     assert_eq!(chat.device_id, fx.core.device_id);
     let config = chat.config.unwrap();
     assert_eq!(config.orchestrator.as_deref(), Some(id.as_str()));
@@ -230,6 +231,44 @@ async fn create_orchestrator_rejects_unknown_project_without_side_effects() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn create_orchestrator_requires_a_name_and_dedupes_projects() {
+    let fx = fixture().await;
+    create_space(&fx, "space-1").await;
+    create_space(&fx, "space-2").await;
+
+    for blank in ["", "   \t"] {
+        let err = fx
+            .client
+            .call(
+                methods::CREATE_ORCHESTRATOR,
+                json!({ "name": blank, "harness": "mock", "projects": [] }),
+            )
+            .await
+            .expect_err("blank name");
+        assert!(err.to_string().contains("name is required"), "{err}");
+    }
+    assert!(fx.core.workspace.read_chats().unwrap().is_empty());
+
+    let created = create_orchestrator(
+        &fx,
+        "  Loja  ",
+        &["space-2", "space-1", "space-2", "space-1"],
+    )
+    .await;
+    let stored = fx
+        .client
+        .call(
+            methods::GET_ORCHESTRATOR,
+            json!({ "orchestratorId": created["orchestratorId"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored["name"], "Loja");
+    assert_eq!(stored["projects"], json!(["space-2", "space-1"]));
+    fx.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn orchestrator_ids_follow_the_name_and_avoid_collisions() {
     let fx = fixture().await;
 
@@ -318,5 +357,51 @@ async fn list_roles_seeds_defaults_and_resolve_role_model_reads_the_catalog() {
         .await
         .expect_err("alias without a candidate");
     assert!(unmapped.to_string().contains("forte"), "{unmapped}");
+
+    std::fs::write(
+        fx.tmp.path().join("data/roles/quebrado.md"),
+        "no frontmatter",
+    )
+    .unwrap();
+    let missing = fx
+        .client
+        .call(
+            methods::RESOLVE_ROLE_MODEL,
+            json!({ "role": "quebrado", "harness": "mock" }),
+        )
+        .await
+        .expect_err("role file that failed to parse");
+    let message = missing.to_string();
+    assert!(message.contains("unknown role `quebrado`"), "{message}");
+    assert!(message.contains("quebrado.md"), "{message}");
+    fx.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_role_model_loads_the_role_locally_before_asking_a_target_for_its_catalog() {
+    let fx = fixture().await;
+
+    let unknown = fx
+        .client
+        .call(
+            methods::RESOLVE_ROLE_MODEL,
+            json!({ "role": "arquiteto", "harness": "mock", "targetDeviceId": "device-elsewhere" }),
+        )
+        .await
+        .expect_err("unknown role");
+    assert!(unknown.to_string().contains("arquiteto"), "{unknown}");
+
+    let offline = fx
+        .client
+        .call(
+            methods::RESOLVE_ROLE_MODEL,
+            json!({ "role": "executor", "harness": "mock", "targetDeviceId": "device-elsewhere" }),
+        )
+        .await
+        .expect_err("catalog comes from the target, which is unreachable");
+    assert!(
+        offline.to_string().contains("remote routing unavailable"),
+        "{offline}"
+    );
     fx.core.shutdown().await;
 }

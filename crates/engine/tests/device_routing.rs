@@ -1217,6 +1217,120 @@ async fn target_device_id_routes_over_the_relay() {
     core_b.shutdown().await;
 }
 
+/// Fixed model catalog, so a role can only resolve against the device that has it.
+struct CatalogHarness;
+
+#[async_trait]
+impl Harness for CatalogHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Catalog"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Low]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![Model {
+            id: "remote-pro".into(),
+            label: "Remote Pro".into(),
+            description: None,
+            reasoning_levels: vec![ReasoningLevel::Low],
+            options: vec![],
+        }])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        Err(HarnessError::Protocol("not runnable".into()))
+    }
+}
+
+/// Roles and the model map are the caller's own; only the catalog is the
+/// target device's. A's catalog is empty and B has no roles at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_role_model_uses_local_roles_and_the_target_devices_catalog() {
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+
+    let b_dir = dirs.path().join("b");
+    std::fs::create_dir_all(&b_dir).expect("create data dir");
+    std::fs::write(b_dir.join("device-id"), "device-b").expect("write device id");
+    let b_registry = HarnessRegistry::new();
+    b_registry.register(Arc::new(CatalogHarness));
+    let core_b = EngineCore::assemble(&b_dir, Arc::new(b_registry), HarnessId::Mock, None)
+        .expect("engine B assembles");
+    let _host = core_b.start_host_relay(&relay_url);
+
+    let core_a = assemble(&dirs.path().join("a"), "device-a");
+    let mut link_config =
+        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
+    link_config.probe_timeout = Duration::from_secs(5);
+    core_a.set_links(LinkCache::new(link_config));
+    let client = zeron_rpc::memory_client(core_a.rpc_service());
+
+    client
+        .call(methods::LIST_ROLES, serde_json::json!({}))
+        .await
+        .expect("seed roles on A");
+    std::fs::write(
+        dirs.path().join("a/roles/models.toml"),
+        "[alias.rapido]\nmock = [\"remote-pro:low\"]\n",
+    )
+    .expect("write A's model map");
+    assert!(!dirs.path().join("b/roles").exists());
+
+    let local = client
+        .call(
+            methods::RESOLVE_ROLE_MODEL,
+            serde_json::json!({ "role": "explorador", "harness": "mock" }),
+        )
+        .await
+        .expect_err("A's own catalog has no remote-pro");
+    assert!(local.to_string().contains("remote-pro"), "{local}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let resolved = loop {
+        match client
+            .call(
+                methods::RESOLVE_ROLE_MODEL,
+                serde_json::json!({
+                    "role": "explorador", "harness": "mock", "targetDeviceId": "device-b",
+                }),
+            )
+            .await
+        {
+            Ok(value) => break value,
+            Err(err) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "relay never came up: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    assert_eq!(
+        resolved,
+        serde_json::json!({
+            "model": "remote-pro", "reasoning": "low", "sandbox": "read-only",
+        })
+    );
+    assert!(!dirs.path().join("b/roles").exists());
+
+    core_a.shutdown().await;
+    core_b.shutdown().await;
+}
+
 /// M5: terminals are device-addressable — OpenTerminal/WriteTerminal forward as
 /// unary calls and SubscribeTerminal proxies its stream through the relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

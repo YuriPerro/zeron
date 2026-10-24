@@ -6,7 +6,7 @@ use serde_json::json;
 use zeron_proto::{ChatConfig, HarnessId, Model, ReasoningLevel, SandboxLevel};
 use zeron_rpc::{RpcError, RpcReply, methods, parse_params};
 
-use super::models::{RelativeEffort, parse_model_map, resolve};
+use super::models::{ModelMap, RelativeEffort, parse_model_map, resolve};
 use super::roles::{Role, RoleAccess, load_roles, seed_defaults};
 use super::store::{OrchestratorConfig, PlanItem, Store};
 
@@ -76,10 +76,12 @@ struct RememberParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResolveRoleModelParams {
-    role: String,
+    pub(crate) role: String,
     pub(crate) harness: HarnessId,
     #[serde(default)]
     effort: Option<RelativeEffort>,
+    #[serde(default)]
+    pub(crate) target_device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,24 +218,31 @@ fn list_roles(data_dir: &Path) -> Result<RpcReply, RpcError> {
     })
 }
 
-pub(crate) fn resolve_role_model(
-    data_dir: &Path,
-    p: &ResolveRoleModelParams,
-    catalog: &[Model],
-) -> Result<RpcReply, RpcError> {
+pub(crate) struct LocalRole {
+    alias: String,
+    map: ModelMap,
+    sandbox: SandboxLevel,
+}
+
+pub(crate) fn load_role(data_dir: &Path, name: &str) -> Result<LocalRole, RpcError> {
     let dir = data_dir.join(ROLES_DIR);
     seed_defaults(&dir).map_err(failed)?;
-    let (roles, _) = load_roles(&dir);
-    let role = roles
-        .iter()
-        .find(|role| role.name == p.role)
-        .ok_or_else(|| RpcError::Failed(format!("unknown role `{}`", p.role)))?;
+    let (roles, errors) = load_roles(&dir);
+    let Some(role) = roles.iter().find(|role| role.name == name) else {
+        let mut message = format!("unknown role `{name}`");
+        if !errors.is_empty() {
+            let details: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            message.push_str(&format!(
+                " (role files that failed to load: {})",
+                details.join("; ")
+            ));
+        }
+        return Err(RpcError::Failed(message));
+    };
     let text = std::fs::read_to_string(dir.join(MODELS_FILE)).map_err(failed)?;
-    let map = parse_model_map(&text).map_err(failed)?;
-    let resolved = resolve(&map, &role.model, p.harness, catalog, p.effort).map_err(failed)?;
-    RpcReply::value(&ResolvedRoleReply {
-        model: resolved.model,
-        reasoning: resolved.reasoning,
+    Ok(LocalRole {
+        alias: role.model.clone(),
+        map: parse_model_map(&text).map_err(failed)?,
         sandbox: match role.access {
             RoleAccess::ReadOnly => SandboxLevel::ReadOnly,
             RoleAccess::Write => SandboxLevel::WorkspaceWrite,
@@ -241,13 +250,38 @@ pub(crate) fn resolve_role_model(
     })
 }
 
+impl LocalRole {
+    pub(crate) fn resolve(
+        &self,
+        p: &ResolveRoleModelParams,
+        catalog: &[Model],
+    ) -> Result<RpcReply, RpcError> {
+        let resolved =
+            resolve(&self.map, &self.alias, p.harness, catalog, p.effort).map_err(failed)?;
+        RpcReply::value(&ResolvedRoleReply {
+            model: resolved.model,
+            reasoning: resolved.reasoning,
+            sandbox: self.sandbox,
+        })
+    }
+}
+
 pub(crate) fn create_orchestrator_entry(
     data_dir: &Path,
     p: CreateOrchestratorParams,
     known_spaces: &[String],
 ) -> Result<OrchestratorConfig, RpcError> {
-    if let Some(unknown) = p
-        .projects
+    let name = p.name.trim().to_string();
+    if name.is_empty() {
+        return Err(RpcError::Failed("name is required".into()));
+    }
+    let mut projects: Vec<String> = Vec::with_capacity(p.projects.len());
+    for project in p.projects {
+        if !projects.contains(&project) {
+            projects.push(project);
+        }
+    }
+    if let Some(unknown) = projects
         .iter()
         .find(|project| !known_spaces.contains(project))
     {
@@ -255,14 +289,14 @@ pub(crate) fn create_orchestrator_entry(
     }
     let store = Store::new(data_dir);
     let config = OrchestratorConfig {
-        id: store.available_id(&p.name),
-        name: p.name,
+        id: store.available_id(&name),
+        name,
         avatar: p.avatar,
         harness: p.harness,
         model: p.model,
         reasoning: p.reasoning,
         child_harness: p.child_harness.unwrap_or(p.harness),
-        projects: p.projects,
+        projects,
     };
     store.create(&config).map_err(failed)?;
     Ok(config)

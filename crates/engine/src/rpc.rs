@@ -1566,6 +1566,35 @@ impl EngineRpc {
             .map_err(|e| RpcError::Failed(e.to_string()))
     }
 
+    async fn resolve_role_model(&self, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        let p: crate::orchestration::rpc::ResolveRoleModelParams = parse_params(params)?;
+        let role = crate::orchestration::rpc::load_role(self.repos.data_dir(), &p.role)?;
+        let remote = p
+            .target_device_id
+            .as_deref()
+            .filter(|target| *target != self.doc_host.device_id());
+        let catalog = match remote {
+            Some(target) => self.remote_model_catalog(target, p.harness).await?,
+            None => self.model_catalog(p.harness, false).await?,
+        };
+        role.resolve(&p, &catalog)
+    }
+
+    async fn remote_model_catalog(
+        &self,
+        target: &str,
+        harness: HarnessId,
+    ) -> Result<Vec<zeron_proto::Model>, RpcError> {
+        let params = serde_json::json!({ "harness": harness, "targetDeviceId": target });
+        match Box::pin(RpcService::handle(self, methods::LIST_MODELS, params)).await? {
+            RpcReply::Value(models) => serde_json::from_value(models)
+                .map_err(|e| RpcError::Failed(format!("invalid model catalog from {target}: {e}"))),
+            RpcReply::Stream(_) => Err(RpcError::Failed(format!(
+                "unexpected stream from {target} for ListModels"
+            ))),
+        }
+    }
+
     fn create_orchestrator(&self, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         let p: crate::orchestration::rpc::CreateOrchestratorParams = parse_params(params)?;
         let title = p.name.clone();
@@ -1579,24 +1608,33 @@ impl EngineRpc {
         let data_dir = self.repos.data_dir();
         let config = crate::orchestration::rpc::create_orchestrator_entry(data_dir, p, &spaces)?;
         let chat_id = uuid::Uuid::new_v4().to_string();
-        let created = self
-            .mutate(MutateParams::CreateChat {
-                chat_id: chat_id.clone(),
-                space_id: None,
-                device_id: Some(self.doc_host.device_id().to_string()),
-                config: Some(crate::orchestration::rpc::chat_config(&config)),
-                branch: None,
-                cwd: None,
-                parent_chat_id: None,
-                cloud: false,
-            })
-            .and_then(|()| {
-                self.mutate(MutateParams::RenameChat {
-                    chat_id: chat_id.clone(),
-                    title,
-                })
-            });
-        if let Err(err) = created {
+        let created = self.mutate(MutateParams::CreateChat {
+            chat_id: chat_id.clone(),
+            space_id: None,
+            device_id: Some(self.doc_host.device_id().to_string()),
+            config: Some(crate::orchestration::rpc::chat_config(&config)),
+            branch: None,
+            cwd: None,
+            parent_chat_id: None,
+            cloud: false,
+        });
+        let titled = created.and_then(|()| {
+            let renamed = self.workspace.rename_chat(&chat_id, &title);
+            let outcome = match renamed {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(RpcError::Failed(format!(
+                    "chat {chat_id} disappeared before it was titled"
+                ))),
+                Err(e) => Err(RpcError::Failed(e.to_string())),
+            };
+            if outcome.is_err()
+                && let Err(cleanup) = self.workspace.delete_chat(&chat_id)
+            {
+                tracing::warn!(%chat_id, %cleanup, "could not delete orchestrator chat after titling failed");
+            }
+            outcome
+        });
+        if let Err(err) = titled {
             if let Err(cleanup) =
                 crate::orchestration::rpc::discard_orchestrator(data_dir, &config.id)
             {
@@ -2004,7 +2042,6 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_COMMIT_CREDIT
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
-            | methods::RESOLVE_ROLE_MODEL
             | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
@@ -2489,11 +2526,7 @@ impl RpcService for EngineRpc {
                 let p: ListModelsParams = parse_params(params)?;
                 RpcReply::value(&self.model_catalog(p.harness, p.force).await?)
             }
-            methods::RESOLVE_ROLE_MODEL => {
-                let p: crate::orchestration::rpc::ResolveRoleModelParams = parse_params(params)?;
-                let catalog = self.model_catalog(p.harness, false).await?;
-                crate::orchestration::rpc::resolve_role_model(self.repos.data_dir(), &p, &catalog)
-            }
+            methods::RESOLVE_ROLE_MODEL => self.resolve_role_model(params).await,
             methods::CREATE_ORCHESTRATOR => self.create_orchestrator(params),
             method if crate::orchestration::rpc::handles(method) => {
                 crate::orchestration::rpc::dispatch(self.repos.data_dir(), method, params)
