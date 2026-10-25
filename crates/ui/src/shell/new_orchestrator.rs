@@ -6,9 +6,11 @@ use crate::settings::widgets::{self, SelectOption};
 use zeron_engine::registry::HarnessDescriptor;
 use zeron_proto::ReasoningLevel;
 
-const DIALOG_WIDTH: f32 = 420.0;
+const DIALOG_WIDTH: f32 = 460.0;
 const LABEL_WIDTH: f32 = 76.0;
 const SELECT_WIDTH: f32 = 220.0;
+const MODEL_WIDTH: f32 = 210.0;
+const REASONING_WIDTH: f32 = 110.0;
 const PROJECT_LIST_HEIGHT: f32 = 132.0;
 
 impl Shell {
@@ -442,7 +444,7 @@ impl Shell {
                         &theme,
                         |shell: &mut Shell| &mut shell.new_orchestrator.selects.model,
                     )
-                    .width(SELECT_WIDTH)
+                    .width(MODEL_WIDTH)
                     .open_rightward()
                     .options(
                         models
@@ -476,7 +478,7 @@ impl Shell {
                             &theme,
                             |shell: &mut Shell| &mut shell.new_orchestrator.selects.reasoning,
                         )
-                        .width(110.0)
+                        .width(REASONING_WIDTH)
                         .options(options, selected)
                         .on_select(move |shell, ix, _, cx| {
                             if let Some(level) = levels.get(ix).copied() {
