@@ -17,6 +17,7 @@ use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, ac
 use crate::appearance::{self, AppearanceMode};
 use crate::composer;
 use crate::shell;
+use crate::typography;
 
 actions!(
     zeron,
@@ -33,6 +34,8 @@ actions!(
         AppearanceSystem,
         AppearanceLight,
         AppearanceDark,
+        IncreaseUiFontSize,
+        DecreaseUiFontSize,
     ]
 );
 
@@ -64,6 +67,19 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &AppearanceSystem, cx| appearance::set_mode(AppearanceMode::System, cx));
     cx.on_action(|_: &AppearanceLight, cx| appearance::set_mode(AppearanceMode::Light, cx));
     cx.on_action(|_: &AppearanceDark, cx| appearance::set_mode(AppearanceMode::Dark, cx));
+    cx.on_action(|_: &IncreaseUiFontSize, cx| step_ui_font_size(1, cx));
+    cx.on_action(|_: &DecreaseUiFontSize, cx| step_ui_font_size(-1, cx));
+}
+
+fn step_ui_font_size(steps: isize, cx: &mut App) {
+    let size = typography::font_size(cx).stepped(steps);
+    if let Some(window) = cx.active_window() {
+        window
+            .update(cx, |_, window, cx| {
+                typography::set_font_size(size, window, cx);
+            })
+            .ok();
+    }
 }
 
 fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {
@@ -143,11 +159,13 @@ pub fn bind_keys(cx: &mut App) {
 /// The binding table behind [`bind_keys`] — `KeyBinding` construction is pure
 /// (no `App`), so unit tests can inspect it directly.
 fn app_key_bindings(macos: bool) -> Vec<KeyBinding> {
-    let mut bindings = vec![KeyBinding::new(
-        if macos { "cmd-," } else { "ctrl-," },
-        shell::OpenSettings,
-        None,
-    )];
+    let primary = if macos { "cmd" } else { "ctrl" };
+    let mut bindings = vec![
+        KeyBinding::new(&format!("{primary}-,"), shell::OpenSettings, None),
+        KeyBinding::new(&format!("{primary}-="), IncreaseUiFontSize, None),
+        KeyBinding::new(&format!("{primary}-+"), IncreaseUiFontSize, None),
+        KeyBinding::new(&format!("{primary}--"), DecreaseUiFontSize, None),
+    ];
     if macos {
         bindings.extend([
             KeyBinding::new("cmd-q", Quit, None),
@@ -209,12 +227,14 @@ pub fn app_menus() -> Vec<Menu> {
             MenuItem::os_action("Select All", composer::SelectAll, OsAction::SelectAll),
         ]),
     ];
-    // Appearance lives under View on every platform — it is the only View verb
-    // today, but "Appearance" as a top-level menu would read oddly next to Edit.
+    // Appearance and interface text size live under View on every platform.
     menus.push(Menu::new("View").items([
         MenuItem::action("Appearance: System", AppearanceSystem),
         MenuItem::action("Appearance: Light", AppearanceLight),
         MenuItem::action("Appearance: Dark", AppearanceDark),
+        MenuItem::separator(),
+        MenuItem::action("Increase Font Size", IncreaseUiFontSize),
+        MenuItem::action("Decrease Font Size", DecreaseUiFontSize),
     ]));
     if macos {
         // Standard Window menu; macOS appends the open-window list itself.
@@ -340,7 +360,9 @@ mod tests {
             vec![
                 AppearanceSystem.name(),
                 AppearanceLight.name(),
-                AppearanceDark.name()
+                AppearanceDark.name(),
+                IncreaseUiFontSize.name(),
+                DecreaseUiFontSize.name()
             ]
         );
     }
@@ -377,6 +399,18 @@ mod tests {
             Some(combo("ctrl-,"))
         );
         assert_eq!(find(&other, Quit.name()), None);
+        assert_eq!(
+            find(&macos, IncreaseUiFontSize.name()),
+            Some(combo("cmd-="))
+        );
+        assert_eq!(
+            find(&macos, DecreaseUiFontSize.name()),
+            Some(combo("cmd--"))
+        );
+        assert_eq!(
+            find(&other, DecreaseUiFontSize.name()),
+            Some(combo("ctrl--"))
+        );
     }
 }
 
