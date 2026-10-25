@@ -266,11 +266,24 @@ impl LocalRole {
     }
 }
 
+fn keeps_instructions(harness: HarnessId) -> bool {
+    matches!(
+        harness,
+        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Mock
+    )
+}
+
 pub(crate) fn create_orchestrator_entry(
     data_dir: &Path,
     p: CreateOrchestratorParams,
     known_spaces: &[String],
 ) -> Result<OrchestratorConfig, RpcError> {
+    if !keeps_instructions(p.harness) {
+        return Err(RpcError::Failed(format!(
+            "Orchestrators run on Claude Code or Codex. {} can drop the orchestrator prompt when its session restarts.",
+            p.harness.as_str()
+        )));
+    }
     let name = p.name.trim().to_string();
     if name.is_empty() {
         return Err(RpcError::Failed("name is required".into()));

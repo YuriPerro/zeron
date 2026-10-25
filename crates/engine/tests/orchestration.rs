@@ -241,6 +241,30 @@ async fn create_orchestrator_rejects_unknown_project_without_side_effects() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn create_orchestrator_refuses_harnesses_that_drop_instructions() {
+    let fx = fixture().await;
+
+    let err = fx
+        .client
+        .call(
+            methods::CREATE_ORCHESTRATOR,
+            json!({ "name": "Loja", "harness": "hermes", "projects": [] }),
+        )
+        .await
+        .expect_err("hermes drops instructions");
+    assert!(
+        err.to_string().contains(
+            "Orchestrators run on Claude Code or Codex. hermes can drop the orchestrator prompt when its session restarts."
+        ),
+        "{err}"
+    );
+
+    assert!(!fx.tmp.path().join("data/orchestrators").exists());
+    assert!(fx.core.workspace.read_chats().unwrap().is_empty());
+    fx.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn create_orchestrator_requires_a_name_and_dedupes_projects() {
     let fx = fixture().await;
     create_space(&fx, "space-1").await;
