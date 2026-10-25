@@ -3504,11 +3504,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             UiSettings::path(dir.path()),
-            r#"{"uiFontSize": 19, "soundEnabled": false}"#,
+            r#"{"uiFontSize": 40, "soundEnabled": false}"#,
         )
         .unwrap();
         let loaded = UiSettings::load(dir.path());
-        assert_eq!(loaded.ui_font_size.pixels(), 18.0);
+        assert_eq!(loaded.ui_font_size.pixels(), 24.0);
         assert!(!loaded.sound_enabled);
     }
 

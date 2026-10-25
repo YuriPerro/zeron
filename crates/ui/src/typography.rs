@@ -84,18 +84,34 @@ impl<'de> Deserialize<'de> for UiFontFamily {
 pub struct UiFontSize(u8);
 
 impl UiFontSize {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 13] = [
         Self(12),
         Self(13),
         Self(14),
         Self(15),
         Self(16),
+        Self(17),
         Self(18),
+        Self(19),
         Self(20),
+        Self(21),
+        Self(22),
+        Self(23),
+        Self(24),
     ];
 
     pub const fn pixels(self) -> f32 {
         self.0 as f32
+    }
+
+    /// The neighbouring rung `steps` away, held at either end of the ladder.
+    pub fn stepped(self, steps: isize) -> Self {
+        let ix = Self::ALL
+            .iter()
+            .position(|size| *size == self.normalized())
+            .unwrap_or_default();
+        let last = Self::ALL.len() as isize - 1;
+        Self::ALL[(ix as isize + steps).clamp(0, last) as usize]
     }
 
     pub fn label(self) -> SharedString {
@@ -863,8 +879,17 @@ mod tests {
     #[test]
     fn ui_font_sizes_have_stable_labels_and_normalize() {
         assert_eq!(UiFontSize::default().label().as_ref(), "16 px");
-        assert_eq!(UiFontSize(19).normalized(), UiFontSize(18));
-        assert_eq!(UiFontSize(250).normalized(), UiFontSize(20));
+        assert_eq!(UiFontSize(19).normalized(), UiFontSize(19));
+        assert_eq!(UiFontSize(250).normalized(), UiFontSize(24));
+        assert_eq!(UiFontSize(9).normalized(), UiFontSize(12));
+    }
+
+    #[test]
+    fn ui_font_size_steps_one_pixel_and_holds_at_the_ends() {
+        assert_eq!(UiFontSize(16).stepped(1), UiFontSize(17));
+        assert_eq!(UiFontSize(16).stepped(-1), UiFontSize(15));
+        assert_eq!(UiFontSize(24).stepped(1), UiFontSize(24));
+        assert_eq!(UiFontSize(12).stepped(-1), UiFontSize(12));
         assert_eq!(ui_rems(14.0).0, 0.875);
     }
 
