@@ -57,7 +57,9 @@ pub(crate) fn child_event_text(title: &str, kind: ChildEventKind) -> String {
 pub(crate) fn queue_label(text: &str) -> Option<String> {
     match classify_message(text) {
         MessageOrigin::Plain => None,
-        MessageOrigin::ChildEvent { title, kind, .. } => Some(child_event_text(&title, kind)),
+        MessageOrigin::ChildEvent { title, kind, .. } => {
+            Some(format!("Zeron · {}", child_event_text(&title, kind)))
+        }
         MessageOrigin::FromChat {
             label,
             body,
@@ -140,7 +142,7 @@ mod tests {
     fn queue_labels_read_like_the_transcript() {
         assert_eq!(
             queue_label(&event("investiga: kit-ui", ID, CHILD_EVENT_VERBS[0].0)).as_deref(),
-            Some("investiga: kit-ui finished")
+            Some("Zeron · investiga: kit-ui finished")
         );
         assert_eq!(
             queue_label(&format!(
