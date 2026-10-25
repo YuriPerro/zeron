@@ -84,6 +84,21 @@ impl Shell {
         })
     }
 
+    pub(super) fn in_orchestrator_section(&self, chat_id: &str, cx: &App) -> bool {
+        let chats = &self.state.read(cx).chats;
+        chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_some_and(|chat| {
+                is_orchestrator(chat)
+                    || chat.parent_chat_id.as_deref().is_some_and(|parent| {
+                        chats
+                            .iter()
+                            .any(|candidate| candidate.id == parent && is_orchestrator(candidate))
+                    })
+            })
+    }
+
     pub(super) fn reveal_orchestrator_row(&mut self, chat_id: &str, cx: &App) -> bool {
         let state = self.state.read(cx);
         let entries = orchestrator_entries(state, Utc::now());
@@ -195,10 +210,13 @@ impl Shell {
         let list_height = SIDEBAR_LIST_GAP
             + stacked_height(rows.iter().map(|row| row_height(&self.settings, row)));
         self.begin_queued_sidebar_reveal(&key, open, list_height);
-        let animating = self
+        let motion = self
             .sidebar_disclosure_motion
             .get(&key)
-            .is_some_and(|motion| motion.animating());
+            .copied()
+            .filter(|motion| motion.animating());
+        let animating = motion.is_some();
+        let list_now = motion.map_or(if open { list_height } else { 0.0 }, |m| m.current());
 
         let body = (open || animating).then(|| {
             let items: Vec<AnyElement> = rows
@@ -250,7 +268,7 @@ impl Shell {
             );
             cx.notify();
         }));
-        let height = SIDEBAR_DISCLOSURE_HEADER_HEIGHT + if open { list_height } else { 0.0 };
+        let height = SIDEBAR_DISCLOSURE_HEADER_HEIGHT + list_now;
         let element = div()
             .w_full()
             .flex()
@@ -624,6 +642,114 @@ mod tests {
                 .sidebar_collapsed_groups
                 .insert("orchestrators".into());
             assert!(!shell.sidebar_hover_card_row_visible("orch", cx));
+        });
+    }
+
+    #[gpui::test]
+    fn reveal_finds_orchestrator_and_done_rows(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            fixture(),
+            working_fixture(),
+        );
+        shell.update(cx, |shell, cx| {
+            shell
+                .sidebar_collapsed_groups
+                .insert("orchestrators".into());
+            assert!(shell.reveal_sidebar_chat("orch", cx));
+            assert!(!shell.sidebar_collapsed_groups.contains("orchestrators"));
+            assert!(!shell.orchestrator_done_open.contains("orch"));
+
+            assert!(shell.reveal_sidebar_chat("work", cx));
+            assert!(!shell.orchestrator_done_open.contains("orch"));
+
+            shell
+                .sidebar_collapsed_groups
+                .insert("orchestrators".into());
+            assert!(shell.reveal_sidebar_chat("idle", cx));
+            assert!(!shell.sidebar_collapsed_groups.contains("orchestrators"));
+            assert!(shell.orchestrator_done_open.contains("orch"));
+
+            assert!(shell.reveal_sidebar_chat("plain", cx));
+            assert!(!shell.reveal_sidebar_chat("missing", cx));
+        });
+    }
+
+    #[gpui::test]
+    fn rename_of_a_done_child_uses_the_sidebar_row(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            fixture(),
+            working_fixture(),
+        );
+        shell.update(cx, |shell, cx| {
+            shell
+                .sidebar_collapsed_groups
+                .insert("orchestrators".into());
+            shell.open_rename_chat("idle".into(), cx);
+            let rename = shell.chat_rename.as_ref().expect("rename opened");
+            assert_eq!(rename.chat_id, "idle");
+            assert_eq!(rename.surface, ChatRenameSurface::Sidebar);
+            assert!(!shell.sidebar_collapsed_groups.contains("orchestrators"));
+            assert!(shell.orchestrator_done_open.contains("orch"));
+        });
+    }
+
+    #[gpui::test]
+    fn ordinary_side_chats_are_not_in_the_orchestrator_section(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            vec![
+                chat("plain", None, false, 1),
+                chat("side", Some("plain"), false, 2),
+            ],
+            Vec::new(),
+        );
+        shell.update(cx, |shell, cx| {
+            assert!(!shell.in_orchestrator_section("side", cx));
+            assert!(!shell.in_orchestrator_section("plain", cx));
+        });
+    }
+
+    #[gpui::test]
+    fn painted_height_is_measured_for_pinned_hit_testing(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            vec![chat("plain", None, false, 1)],
+            Vec::new(),
+        );
+        redraw(cx);
+        let header_only = shell.read_with(cx, |shell, _| shell.orchestrators_height.get());
+        assert!(header_only >= SIDEBAR_DISCLOSURE_HEADER_HEIGHT);
+
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| state.chats = fixture());
+        });
+        redraw(cx);
+        let with_rows = shell.read_with(cx, |shell, _| shell.orchestrators_height.get());
+        assert!(with_rows > header_only);
+    }
+
+    #[gpui::test]
+    fn done_toggle_starts_a_disclosure_motion(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            fixture(),
+            working_fixture(),
+        );
+        click(cx, "orchestrator-done-orch");
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.orchestrator_done_open.contains("orch"));
+            assert!(
+                shell
+                    .sidebar_disclosure_motion
+                    .contains_key("orchestrator-done:orch")
+            );
         });
     }
 

@@ -6037,7 +6037,7 @@ impl Shell {
         // The sidebar lists only top-level chats; side chats ride the
         // session card's lanes. Either way the row must be on screen first:
         // a field on a hidden row would take keystrokes unseen.
-        let surface = if parent.is_some() {
+        let surface = if parent.is_some() && !self.in_orchestrator_section(&chat_id, cx) {
             ChatRenameSurface::SessionCard
         } else {
             ChatRenameSurface::Sidebar
