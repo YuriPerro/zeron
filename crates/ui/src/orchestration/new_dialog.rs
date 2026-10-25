@@ -360,6 +360,7 @@ pub(crate) struct NewOrchestratorDialog {
     pub selects: DialogSelects,
     pub sessions: u64,
     pub pending_chat: Option<String>,
+    pub pending_baseline: Option<String>,
 }
 
 #[cfg(test)]

@@ -240,6 +240,7 @@ impl Shell {
             return;
         }
         self.new_orchestrator.pending_chat = Some(chat_id.clone());
+        self.new_orchestrator.pending_baseline = self.state.read(cx).selected_chat.clone();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_secs(30))
@@ -258,6 +259,10 @@ impl Shell {
         let Some(chat_id) = self.new_orchestrator.pending_chat.clone() else {
             return;
         };
+        if self.state.read(cx).selected_chat != self.new_orchestrator.pending_baseline {
+            self.new_orchestrator.pending_chat = None;
+            return;
+        }
         if self
             .state
             .read(cx)

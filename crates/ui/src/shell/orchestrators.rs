@@ -1211,4 +1211,25 @@ mod tests {
             );
         });
     }
+
+    #[gpui::test]
+    fn manual_selection_cancels_the_pending_orchestrator_open(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        shell.update(cx, |shell, cx| {
+            let session = shell.new_orchestrator.open.as_ref().unwrap().session;
+            shell.land_new_orchestrator(session, Ok("fresh".into()), cx);
+            shell
+                .state
+                .update(cx, |state, cx| state.select_chat(Some("plain".into()), cx));
+            shell.state.update(cx, |state, cx| {
+                state.chats.push(chat("fresh", None, true, 9));
+                cx.notify();
+            });
+        });
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("plain"));
+            assert_eq!(shell.new_orchestrator.pending_chat, None);
+        });
+    }
 }
