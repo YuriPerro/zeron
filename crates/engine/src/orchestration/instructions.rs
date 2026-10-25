@@ -10,25 +10,34 @@ pub const CHILD_RULES: &str = "You are working for a Zeron orchestrator. Your br
 
 /// Resolves the instructions a chat's runs start with. An orchestrator chat
 /// gets its `prompt.md` plus its memory; a role chat gets the role prompt, with
-/// [`CHILD_RULES`] when `parent` is an orchestrator chat; any other chat gets none.
+/// [`CHILD_RULES`] when `parent` is an orchestrator chat, and a roleless child of
+/// an orchestrator gets [`CHILD_RULES`] alone; any other chat gets none.
 pub fn instructions_for(chat: &Chat, parent: Option<&Chat>, data_dir: &Path) -> Option<String> {
     let config = chat.config.as_ref()?;
     if let Some(id) = &config.orchestrator {
         return orchestrator_instructions(id, data_dir);
     }
-    let name = config.role.as_deref()?;
-    let (roles, _) = load_roles(&data_dir.join("roles"));
-    let Some(role) = roles.into_iter().find(|role| role.name == name) else {
-        tracing::warn!(chat = %chat.id, role = name, "chat role not found; running without instructions");
-        return None;
-    };
     let under_orchestrator =
         parent.is_some_and(|p| p.config.as_ref().is_some_and(|c| c.orchestrator.is_some()));
-    Some(if under_orchestrator {
-        format!("{}\n\n{CHILD_RULES}", role.prompt)
-    } else {
-        role.prompt
-    })
+    let role_prompt = config
+        .role
+        .as_deref()
+        .and_then(|name| role_prompt(chat, name, data_dir));
+    match (role_prompt, under_orchestrator) {
+        (Some(prompt), true) => Some(format!("{prompt}\n\n{CHILD_RULES}")),
+        (Some(prompt), false) => Some(prompt),
+        (None, true) => Some(CHILD_RULES.to_owned()),
+        (None, false) => None,
+    }
+}
+
+fn role_prompt(chat: &Chat, name: &str, data_dir: &Path) -> Option<String> {
+    let (roles, _) = load_roles(&data_dir.join("roles"));
+    let role = roles.into_iter().find(|role| role.name == name);
+    if role.is_none() {
+        tracing::warn!(chat = %chat.id, role = name, "chat role not found; running without instructions");
+    }
+    role.map(|role| role.prompt)
 }
 
 fn orchestrator_instructions(id: &str, data_dir: &Path) -> Option<String> {
@@ -171,6 +180,18 @@ mod tests {
         assert_eq!(
             instructions_for(&child, Some(&parent), dir.path()),
             Some(format!("Role prompt.\n\n{CHILD_RULES}"))
+        );
+    }
+
+    #[test]
+    fn roleless_child_of_orchestrator_gets_child_rules() {
+        let dir = data_dir();
+        let parent = chat("p", None, Some("o1"));
+        let child = chat("c1", None, None);
+
+        assert_eq!(
+            instructions_for(&child, Some(&parent), dir.path()),
+            Some(CHILD_RULES.to_owned())
         );
     }
 
