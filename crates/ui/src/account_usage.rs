@@ -28,7 +28,7 @@ const FORCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// Background re-probe while a composer is alive: usage moves as turns run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-const RESET_WIDTH: f32 = 112.0;
+const RESET_WIDTH: f32 = 132.0;
 
 /// When a usage window resets: a countdown within a day ("resets in 2h 14m"),
 /// weekday and time within a week ("resets Thu 2:00 PM"), else the date. Pure.
@@ -419,9 +419,9 @@ impl AccountUsage {
                                     .child(render_usage_meter(window, theme))
                                     .child(
                                         div()
-                                            .w(px(RESET_WIDTH))
+                                            .min_w(px(RESET_WIDTH))
                                             .flex_none()
-                                            .truncate()
+                                            .whitespace_nowrap()
                                             .text_size(crate::typography::ui_rems(11.5))
                                             .text_color(theme.text_muted)
                                             .children(
