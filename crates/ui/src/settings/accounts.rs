@@ -37,8 +37,8 @@ use crate::theme::Theme;
 // Pure: usage meters + labels
 // ---------------------------------------------------------------------------
 
-pub const USAGE_WARN_FRACTION: f32 = 0.80;
-pub const USAGE_CRITICAL_FRACTION: f32 = 0.95;
+pub const USAGE_WARN_FRACTION: f32 = 0.75;
+pub const USAGE_CRITICAL_FRACTION: f32 = 0.90;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageLevel {
@@ -74,7 +74,7 @@ const ACCOUNT_ACTION_WIDTH: f32 = 112.0;
 
 pub fn usage_color(level: UsageLevel, theme: &Theme) -> Hsla {
     match level {
-        UsageLevel::Normal => theme.accent,
+        UsageLevel::Normal => theme.success,
         UsageLevel::Warn => theme.warning,
         UsageLevel::Critical => theme.danger,
     }
@@ -2384,17 +2384,17 @@ mod tests {
     #[test]
     fn usage_thresholds_match_zeron() {
         assert_eq!(usage_level(0.0), UsageLevel::Normal);
-        assert_eq!(usage_level(0.79), UsageLevel::Normal);
-        assert_eq!(usage_level(0.80), UsageLevel::Warn);
-        assert_eq!(usage_level(0.94), UsageLevel::Warn);
-        assert_eq!(usage_level(0.95), UsageLevel::Critical);
+        assert_eq!(usage_level(0.74), UsageLevel::Normal);
+        assert_eq!(usage_level(0.75), UsageLevel::Warn);
+        assert_eq!(usage_level(0.89), UsageLevel::Warn);
+        assert_eq!(usage_level(0.90), UsageLevel::Critical);
         assert_eq!(usage_level(1.0), UsageLevel::Critical);
     }
 
     #[test]
     fn usage_colors_map_to_theme_accents() {
         let theme = Theme::dark();
-        assert_eq!(usage_color(UsageLevel::Normal, &theme), theme.accent);
+        assert_eq!(usage_color(UsageLevel::Normal, &theme), theme.success);
         assert_eq!(usage_color(UsageLevel::Warn, &theme), theme.warning);
         assert_eq!(usage_color(UsageLevel::Critical, &theme), theme.danger);
     }
