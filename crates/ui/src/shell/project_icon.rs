@@ -68,7 +68,7 @@ const MONOGRAM_PALETTE: [(u32, u32); 8] = [
     (0xfdba74, 0xc2410c), // orange
 ];
 
-fn monogram(name: &str, seed: &str, selected: bool, theme: &Theme) -> AnyElement {
+pub(crate) fn monogram(name: &str, seed: &str, selected: bool, theme: &Theme) -> AnyElement {
     // FNV-1a selects a stable entry from the curated palette.
     let hash = seed.bytes().fold(2166136261u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(16777619)

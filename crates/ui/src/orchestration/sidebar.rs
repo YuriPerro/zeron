@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
+use gpui::AnyElement;
 use zeron_proto::{Chat, ChatIndicator};
+
+use crate::theme::Theme;
 
 pub(crate) const UNTITLED_ORCHESTRATOR: &str = "Orchestrator";
 
@@ -79,17 +82,25 @@ pub(crate) fn orchestrator_groups(chats: &[(Chat, ChatIndicator)]) -> Vec<Orches
         .collect()
 }
 
+pub(crate) fn orchestrator_avatar(
+    name: &str,
+    seed: &str,
+    selected: bool,
+    theme: &Theme,
+) -> AnyElement {
+    crate::shell::project_icon::monogram(name, seed, selected, theme)
+}
+
 pub(crate) fn needing_you(groups: &[OrchestratorGroup]) -> usize {
     groups.iter().filter(|group| group.needs_you).count()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ChatIndicator::*;
+pub(crate) mod test_support {
     use chrono::{TimeZone, Utc};
+    use zeron_proto::Chat;
 
-    fn chat(id: &str, parent: Option<&str>, orchestrator: bool, at: i64) -> Chat {
+    pub(crate) fn chat(id: &str, parent: Option<&str>, orchestrator: bool, at: i64) -> Chat {
         Chat {
             id: id.into(),
             device_id: "dev".into(),
@@ -120,6 +131,14 @@ mod tests {
             room_gen: None,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::chat;
+    use super::*;
+    use ChatIndicator::*;
+    use chrono::{TimeZone, Utc};
 
     fn orch(id: &str, at: i64) -> Chat {
         chat(id, None, true, at)

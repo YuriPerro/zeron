@@ -1121,6 +1121,13 @@ pub enum RowKind {
         title: SharedString,
         kind: crate::orchestration::messages::ChildEventKind,
     },
+    /// A message another chat sent into this one, with its sender.
+    FromChat {
+        chat_id: SharedString,
+        label: SharedString,
+        body: SharedString,
+        contract_demand: Option<SharedString>,
+    },
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1381,7 +1388,6 @@ pub fn rows_for_entry(
         {
             return vec![row];
         }
-        let body = agent_message_display(&body);
         // Chips stand in for their attachments: those leave the strip, and a
         // chip carries its upload's path for its progress and, for an image,
         // a click opening it.
@@ -7689,6 +7695,35 @@ impl Transcript {
                 &theme,
                 cx,
             ),
+            RowKind::FromChat {
+                chat_id,
+                label,
+                body,
+                contract_demand,
+            } => {
+                let sender = crate::orchestration::transcript_rows::sender_for(
+                    &self.state.read(cx).chats,
+                    chat_id,
+                    label,
+                );
+                let body = self.render_user_body(
+                    &row.id,
+                    ix,
+                    body.clone(),
+                    Arc::default(),
+                    &theme,
+                    window,
+                    cx,
+                );
+                crate::orchestration::transcript_rows::from_chat_bubble(
+                    &sender,
+                    chat_id,
+                    contract_demand.as_ref(),
+                    body,
+                    self.content_width * 0.8,
+                    &theme,
+                )
+            }
         };
         // Diagram fences this row just requested start rendering after layout.
         self.ensure_diagram_worker(cx);
@@ -8784,31 +8819,8 @@ impl Transcript {
 /// run when there are none), with the same selection machinery as rendered
 /// markdown — the element registers into the frame's document-ordered
 /// registry, so drags select, span into adjacent rows, and Cmd+C copies.
-/// Keep routing instructions in the stored prompt for agents, but show a
-/// concise attribution in the human transcript (including existing messages).
-fn agent_message_display(text: &str) -> String {
-    let Some(rest) = text.strip_prefix("[Message from Zeron chat ") else {
-        return text.to_owned();
-    };
-    let Some((header, body)) = rest.split_once("]\n\n") else {
-        return text.to_owned();
-    };
-    let Some((label, id)) =
-        header.rsplit_once(". Reply to it with the Zeron `send_message` tool, chat ")
-    else {
-        return text.to_owned();
-    };
-    let Some(id) = id.strip_suffix('.') else {
-        return text.to_owned();
-    };
-    let suffix = format!(" ({id})");
-    let name = label.strip_suffix(&suffix).unwrap_or(label);
-    format!("Message from {name}\n\n{body}")
-}
-
 /// The bubble text's runs: body text in the sans font, chips as labels in it
-/// with their padding pinned to [`crate::composer::CHIP_PAD_FAMILY`], and an
-/// agent attribution's name in bold.
+/// with their padding pinned to [`crate::composer::CHIP_PAD_FAMILY`].
 fn user_bubble_runs(
     text: &str,
     mentions: &[crate::composer::SentMentionSpan],
@@ -8850,39 +8862,6 @@ fn user_bubble_runs(
     }
     if at < text.len() {
         runs.push(body_run(text.len() - at));
-    }
-    // Attribution names are bold sans text, never Markdown/italic. Split
-    // existing runs so file-mention styling and selection offsets stay intact.
-    if let Some(rest) = text.strip_prefix("Message from ")
-        && let Some((name, _)) = rest.split_once("\n\n")
-    {
-        let bold = "Message from ".len().."Message from ".len() + name.len();
-        let mut offset = 0;
-        runs = runs
-            .into_iter()
-            .flat_map(|run| {
-                let end = offset + run.len;
-                let mut pieces = Vec::new();
-                while offset < end {
-                    let in_name = bold.contains(&offset);
-                    let next = if offset < bold.start {
-                        end.min(bold.start)
-                    } else if in_name {
-                        end.min(bold.end)
-                    } else {
-                        end
-                    };
-                    let mut piece = run.clone();
-                    piece.len = next - offset;
-                    if in_name {
-                        piece.font.weight = gpui::FontWeight::BOLD;
-                    }
-                    pieces.push(piece);
-                    offset = next;
-                }
-                pieces
-            })
-            .collect();
     }
     runs
 }
