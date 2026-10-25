@@ -3489,6 +3489,9 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// A child event line's "Open": show the chat in the right-pane tab the
+    /// Side chats card uses, leaving this transcript in the main area.
+    OpenChildChat { chat_id: String },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -7686,15 +7689,23 @@ impl Transcript {
                 chat_id,
                 title,
                 kind,
-            } => crate::orchestration::transcript_rows::child_event_line(
-                &row.id,
-                chat_id,
-                title,
-                *kind,
-                &self.state,
-                &theme,
-                cx,
-            ),
+            } => {
+                let open = crate::orchestration::transcript_rows::chat_exists(
+                    &self.state.read(cx).chats,
+                    chat_id,
+                )
+                .then(|| {
+                    let chat_id = chat_id.to_string();
+                    cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
+                        cx.emit(TranscriptEvent::OpenChildChat {
+                            chat_id: chat_id.clone(),
+                        });
+                    })
+                });
+                crate::orchestration::transcript_rows::child_event_line(
+                    &row.id, title, *kind, open, &theme,
+                )
+            }
             RowKind::FromChat {
                 chat_id,
                 label,

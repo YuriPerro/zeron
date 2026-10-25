@@ -1,13 +1,12 @@
 use gpui::{
-    AnyElement, App, Entity, InteractiveElement as _, IntoElement as _, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
+    AnyElement, App, ClickEvent, InteractiveElement as _, IntoElement as _, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use zeron_doc::SessionMessageEntry;
 use zeron_proto::{Chat, HarnessId};
 
 use super::messages::{ChildEventKind, MessageOrigin, child_event_text, classify_message};
 use super::sidebar::{is_orchestrator, orchestrator_avatar};
-use crate::state::AppState;
 use crate::theme::Theme;
 use crate::transcript::{Row, RowKind};
 
@@ -96,35 +95,29 @@ pub(crate) fn sender_for(chats: &[Chat], chat_id: &str, label: &str) -> Sender {
     }
 }
 
-fn chat_exists(chats: &[Chat], chat_id: &str) -> bool {
+pub(crate) fn chat_exists(chats: &[Chat], chat_id: &str) -> bool {
     chats.iter().any(|chat| chat.id == chat_id)
 }
 
 pub(crate) fn child_event_line(
     row_id: &SharedString,
-    chat_id: &SharedString,
     title: &SharedString,
     kind: ChildEventKind,
-    state: &Entity<AppState>,
+    open: Option<impl Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
     theme: &Theme,
-    cx: &App,
 ) -> AnyElement {
     let tone = match kind {
         ChildEventKind::Finished => theme.text_muted,
         ChildEventKind::WaitingForAnswer => theme.warning,
         ChildEventKind::Failed => theme.danger,
     };
-    let open = chat_exists(&state.read(cx).chats, chat_id).then(|| {
-        let state = state.clone();
-        let chat_id = chat_id.to_string();
+    let open = open.map(|on_click| {
         div()
             .id(SharedString::from(format!("{row_id}-open")))
             .flex_none()
             .cursor_pointer()
             .text_color(theme.accent)
-            .on_click(move |_, _, cx| {
-                state.update(cx, |state, cx| state.select_chat(Some(chat_id.clone()), cx));
-            })
+            .on_click(on_click)
             .child("Open")
     });
     div()
@@ -211,6 +204,9 @@ pub(crate) fn from_chat_bubble(
                 .px(px(16.0))
                 .py(px(10.0))
                 .text_size(crate::typography::ui_rems(14.0))
+                .line_height(crate::typography::ui_rems(
+                    crate::transcript::USER_LINE_HEIGHT,
+                ))
                 .text_color(theme.text)
                 .child(header)
                 .child(body),
