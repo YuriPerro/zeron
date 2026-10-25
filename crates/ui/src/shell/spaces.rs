@@ -2061,12 +2061,12 @@ pub(super) fn pinned_drag_snapshot_is_valid(
     snapshot_ids.iter().any(|id| id == dragged_id) && snapshot_ids == current_ids
 }
 
-struct ActiveChatRow {
-    status: ChatIndicator,
-    chat: zeron_proto::Chat,
-    folder: String,
-    branch: Option<String>,
-    change_request: Option<zeron_proto::ChangeRequestSummary>,
+pub(super) struct ActiveChatRow {
+    pub(super) status: ChatIndicator,
+    pub(super) chat: zeron_proto::Chat,
+    pub(super) folder: String,
+    pub(super) branch: Option<String>,
+    pub(super) change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
 }
 
@@ -2182,7 +2182,7 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 12] = [
 // list items stay tightly related at 2px, while section boundaries use 12px
 // (well over 2x the intra-list gap). Disclosure content gets a small 4px
 // handoff from its header without leaving dead space while collapsed.
-const SIDEBAR_SECTION_GAP: f32 = 12.0;
+pub(super) const SIDEBAR_SECTION_GAP: f32 = 12.0;
 pub(super) const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 pub(super) const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
@@ -5040,6 +5040,9 @@ impl Shell {
 
     /// Hover targets include the paged Archived shelf, unlike jump shortcuts.
     pub(super) fn sidebar_hover_card_row_visible(&self, chat_id: &str, cx: &Context<Self>) -> bool {
+        if self.orchestrator_row_visible(chat_id, cx) {
+            return true;
+        }
         if self
             .sidebar_visible_order(cx)
             .iter()
@@ -5196,7 +5199,7 @@ impl Shell {
     }
 
     /// Shared metadata and visibility settings for active and archived sessions.
-    fn sidebar_chat_data(
+    pub(super) fn sidebar_chat_data(
         &self,
         status: ChatIndicator,
         chat: zeron_proto::Chat,

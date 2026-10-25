@@ -6,6 +6,7 @@ use zeron_proto::{Chat, ChatIndicator};
 use crate::theme::Theme;
 
 pub(crate) const UNTITLED_ORCHESTRATOR: &str = "Orchestrator";
+pub(crate) const NEEDS_YOU: &str = "Needs you";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OrchestratorGroup {
@@ -23,6 +24,14 @@ pub(crate) fn is_orchestrator(chat: &Chat) -> bool {
             .config
             .as_ref()
             .is_some_and(|config| config.orchestrator.is_some())
+}
+
+pub(crate) fn display_name(chat: &Chat) -> &str {
+    chat.title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(UNTITLED_ORCHESTRATOR)
 }
 
 fn recency(chat: &Chat) -> chrono::DateTime<chrono::Utc> {
@@ -64,15 +73,9 @@ pub(crate) fn orchestrator_groups(chats: &[(Chat, ChatIndicator)]) -> Vec<Orches
             let (active, done): (Vec<_>, Vec<_>) = children
                 .into_iter()
                 .partition(|(_, indicator)| is_active(*indicator));
-            let name = chat
-                .title
-                .as_deref()
-                .map(str::trim)
-                .filter(|title| !title.is_empty())
-                .unwrap_or(UNTITLED_ORCHESTRATOR);
             OrchestratorGroup {
                 chat_id: chat.id.clone(),
-                name: name.to_owned(),
+                name: display_name(chat).to_owned(),
                 indicator: *indicator,
                 needs_you: *indicator == ChatIndicator::AwaitingInput,
                 active_children: active.into_iter().map(|(c, _)| c.id.clone()).collect(),
@@ -93,6 +96,14 @@ pub(crate) fn orchestrator_avatar(
 
 pub(crate) fn needing_you(groups: &[OrchestratorGroup]) -> usize {
     groups.iter().filter(|group| group.needs_you).count()
+}
+
+pub(crate) fn need_you_summary(count: usize) -> Option<String> {
+    (count > 0).then(|| format!("{count} need you"))
+}
+
+pub(crate) fn awaiting_input_label(orchestrator: bool) -> &'static str {
+    if orchestrator { NEEDS_YOU } else { "Input" }
 }
 
 #[cfg(test)]
@@ -182,6 +193,19 @@ mod tests {
         assert!(groups.iter().find(|g| g.chat_id == "a").unwrap().needs_you);
         assert!(!groups.iter().find(|g| g.chat_id == "b").unwrap().needs_you);
         assert_eq!(needing_you(&groups), 1);
+    }
+
+    #[test]
+    fn collapsed_header_summarizes_who_needs_you() {
+        assert_eq!(need_you_summary(0), None);
+        assert_eq!(need_you_summary(1).as_deref(), Some("1 need you"));
+        assert_eq!(need_you_summary(2).as_deref(), Some("2 need you"));
+    }
+
+    #[test]
+    fn only_orchestrators_say_needs_you() {
+        assert_eq!(awaiting_input_label(true), "Needs you");
+        assert_eq!(awaiting_input_label(false), "Input");
     }
 
     #[test]

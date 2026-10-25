@@ -1,0 +1,571 @@
+use super::*;
+use crate::orchestration::sidebar::{
+    OrchestratorGroup, is_orchestrator, need_you_summary, needing_you, orchestrator_groups,
+};
+use spaces::{
+    ActiveChatRow, SIDEBAR_DISCLOSURE_BODY_INSET, SIDEBAR_DISCLOSURE_HEADER_HEIGHT,
+    SIDEBAR_SECTION_GAP,
+};
+use std::collections::{HashMap, HashSet};
+use zeron_proto::ChatIndicator;
+
+const ORCHESTRATORS_KEY: &str = "orchestrators";
+const CHILD_INDENT: f32 = 16.0;
+
+type SectionRow = (f32, AnyElement);
+
+impl Shell {
+    pub(super) fn open_new_orchestrator(&mut self, _cx: &mut Context<Self>) {}
+
+    fn orchestrator_entries(
+        &self,
+        now: chrono::DateTime<Utc>,
+        cx: &App,
+    ) -> Vec<(zeron_proto::Chat, ChatIndicator)> {
+        let state = self.state.read(cx);
+        state
+            .chats
+            .iter()
+            .filter(|chat| is_orchestrator(chat) || chat.parent_chat_id.is_some())
+            .map(|chat| (chat.clone(), state.display_status_for(chat, now)))
+            .collect()
+    }
+
+    pub(super) fn orchestrator_row_visible(&self, chat_id: &str, cx: &App) -> bool {
+        if self.sidebar_collapsed_groups.contains(ORCHESTRATORS_KEY) {
+            return false;
+        }
+        let entries = self.orchestrator_entries(Utc::now(), cx);
+        orchestrator_groups(&entries).iter().any(|group| {
+            let done_shown = self.orchestrator_done_open.contains(&group.chat_id);
+            group.chat_id == chat_id
+                || group.active_children.iter().any(|id| id == chat_id)
+                || (done_shown && group.done_children.iter().any(|id| id == chat_id))
+        })
+    }
+
+    fn orchestrator_row_data(
+        &self,
+        now: chrono::DateTime<Utc>,
+        cx: &App,
+    ) -> (Vec<OrchestratorGroup>, HashMap<String, ActiveChatRow>) {
+        let entries = self.orchestrator_entries(now, cx);
+        let state = self.state.read(cx);
+        let groups = orchestrator_groups(&entries);
+        let shown: HashSet<&str> = groups
+            .iter()
+            .flat_map(|group| {
+                let done: &[String] = if self.orchestrator_done_open.contains(&group.chat_id) {
+                    &group.done_children
+                } else {
+                    &[]
+                };
+                std::iter::once(&group.chat_id)
+                    .chain(&group.active_children)
+                    .chain(done)
+            })
+            .map(String::as_str)
+            .collect();
+        let rows = entries
+            .into_iter()
+            .filter(|(chat, _)| shown.contains(chat.id.as_str()))
+            .map(|(chat, status)| (chat.id.clone(), self.sidebar_chat_data(status, chat, state)))
+            .collect();
+        (groups, rows)
+    }
+
+    fn render_orchestrator_chat_row(
+        &mut self,
+        row: ActiveChatRow,
+        title: String,
+        indent: bool,
+        now: chrono::DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> SectionRow {
+        let ActiveChatRow {
+            status,
+            chat,
+            folder,
+            branch,
+            change_request,
+            ..
+        } = row;
+        let selected = self.state.read(cx).selected_chat.as_deref() == Some(chat.id.as_str());
+        let harness = self
+            .settings
+            .sidebar_show_harness
+            .then(|| chat.config.as_ref().map(|config| config.harness))
+            .flatten();
+        let height = sidebar_row_height(
+            self.settings.sidebar_compact,
+            self.settings.sidebar_show_project_label,
+            branch.is_some(),
+            change_request.is_some(),
+        );
+        let element = self.render_chat_row(
+            chat.id.clone(),
+            transcript::single_line(&title).into(),
+            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into(),
+            folder.into(),
+            branch.map(SharedString::from),
+            change_request,
+            harness,
+            status,
+            selected,
+            false,
+            false,
+            None,
+            None,
+            self.settings.sidebar_show_project_icon,
+            None,
+            theme,
+            cx,
+        );
+        let element = div()
+            .w_full()
+            .when(indent, |el| el.pl(px(CHILD_INDENT)))
+            .child(element)
+            .into_any_element();
+        (height, element)
+    }
+
+    fn render_orchestrator_done_header(
+        &self,
+        chat_id: &str,
+        count: usize,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> SectionRow {
+        let key = format!("orchestrator-done:{chat_id}");
+        let chevron = self.sidebar_disclosure_chevron(&key, open, theme);
+        let toggled = chat_id.to_owned();
+        let selector = format!("orchestrator-done-{chat_id}");
+        let header = spaces::sidebar_disclosure_header(
+            theme,
+            None,
+            format!("{count} done").into(),
+            None,
+            None,
+            chevron,
+        )
+        .ml(px(CHILD_INDENT))
+        .id(SharedString::from(key))
+        .debug_selector(move || selector.clone())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if !this.orchestrator_done_open.remove(&toggled) {
+                this.orchestrator_done_open.insert(toggled.clone());
+            }
+            cx.notify();
+        }));
+        (SIDEBAR_DISCLOSURE_HEADER_HEIGHT, header.into_any_element())
+    }
+
+    fn render_orchestrators_add(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("orchestrators-add")
+            .debug_selector(|| "orchestrators-add".into())
+            .size(px(20.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .role(gpui::Role::Button)
+            .aria_label("New orchestrator")
+            .hover(|el| el.bg(theme.glass_hover()))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.open_new_orchestrator(cx);
+            }))
+            .tooltip(crate::settings::widgets::text_tooltip_above(
+                "New orchestrator",
+            ))
+            .child(
+                icon(icons::PLUS)
+                    .size(px(14.0))
+                    .text_color(spaces::sidebar_header_glyph(theme)),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn render_orchestrators_section(
+        &mut self,
+        gap_below: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let now = Utc::now();
+        let (groups, mut data) = self.orchestrator_row_data(now, cx);
+        let mut items: Vec<SectionRow> = Vec::new();
+        for group in &groups {
+            if let Some(mut row) = data.remove(&group.chat_id) {
+                row.status = group.indicator;
+                items.push(self.render_orchestrator_chat_row(
+                    row,
+                    group.name.clone(),
+                    false,
+                    now,
+                    theme,
+                    cx,
+                ));
+            }
+            let done_open = self.orchestrator_done_open.contains(&group.chat_id);
+            let mut children: Vec<&String> = group.active_children.iter().collect();
+            let done_at = children.len();
+            if done_open {
+                children.extend(&group.done_children);
+            }
+            for (index, child_id) in children.into_iter().enumerate() {
+                if index == done_at {
+                    items.push(self.render_orchestrator_done_header(
+                        &group.chat_id,
+                        group.done_children.len(),
+                        true,
+                        theme,
+                        cx,
+                    ));
+                }
+                if let Some(row) = data.remove(child_id) {
+                    let title = row
+                        .chat
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "New session".into());
+                    items.push(self.render_orchestrator_chat_row(row, title, true, now, theme, cx));
+                }
+            }
+            if !done_open && !group.done_children.is_empty() {
+                items.push(self.render_orchestrator_done_header(
+                    &group.chat_id,
+                    group.done_children.len(),
+                    false,
+                    theme,
+                    cx,
+                ));
+            }
+        }
+
+        let collapsed = self.sidebar_collapsed_groups.contains(ORCHESTRATORS_KEY);
+        let has_rows = !items.is_empty();
+        let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
+            + items.iter().map(|(height, _)| *height).sum::<f32>()
+            + SIDEBAR_LIST_GAP * items.len().saturating_sub(1) as f32;
+        let summary = collapsed
+            .then(|| need_you_summary(needing_you(&groups)))
+            .flatten();
+        let count = (collapsed && summary.is_none() && !groups.is_empty()).then_some(groups.len());
+        let action = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .children(summary.map(|text| {
+                div()
+                    .text_size(crate::typography::ui_rems(10.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(spaces::status_dot_color(
+                        ChatIndicator::AwaitingInput,
+                        theme,
+                    ))
+                    .child(SharedString::from(text))
+            }))
+            .child(self.render_orchestrators_add(theme, cx))
+            .into_any_element();
+        let chevron = if has_rows {
+            self.sidebar_disclosure_chevron(ORCHESTRATORS_KEY, !collapsed, theme)
+        } else {
+            div().flex_none().size(px(12.0)).into_any_element()
+        };
+        let header = spaces::sidebar_disclosure_header(
+            theme,
+            None,
+            "Orchestrators".into(),
+            count,
+            Some(action),
+            chevron,
+        )
+        .id("orchestrators-toggle")
+        .debug_selector(|| "orchestrators-toggle".into())
+        .when(has_rows, |header| {
+            header.on_click(cx.listener(move |this, _, _, cx| {
+                let was_open = !this.sidebar_collapsed_groups.contains(ORCHESTRATORS_KEY);
+                this.begin_sidebar_disclosure_motion(
+                    ORCHESTRATORS_KEY,
+                    if was_open { body_height } else { 0.0 },
+                    if was_open { 0.0 } else { body_height },
+                );
+                if was_open {
+                    this.sidebar_collapsed_groups
+                        .insert(ORCHESTRATORS_KEY.to_owned());
+                } else {
+                    this.sidebar_collapsed_groups.remove(ORCHESTRATORS_KEY);
+                }
+                cx.notify();
+            }))
+        });
+        let body = has_rows.then(|| {
+            let list = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
+                .gap(px(SIDEBAR_LIST_GAP))
+                .children(items.into_iter().map(|(_, element)| element));
+            self.render_sidebar_disclosure_body(
+                ORCHESTRATORS_KEY,
+                !collapsed,
+                body_height,
+                list.into_any_element(),
+            )
+        });
+        div()
+            .id("sidebar-orchestrators-section")
+            .flex()
+            .flex_col()
+            .when(gap_below, |el| el.pb(px(SIDEBAR_SECTION_GAP)))
+            .child(header)
+            .children(body)
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::sidebar::test_support::chat;
+    use gpui::MouseButton;
+
+    struct SidebarHost(Entity<Shell>);
+
+    impl Render for SidebarHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.update(cx, |shell, cx| {
+                div()
+                    .w(px(280.0))
+                    .h(px(800.0))
+                    .child(shell.render_chat_sidebar(&Theme::default(), cx))
+            })
+        }
+    }
+
+    fn session(chat_id: &str, status: zeron_proto::SessionStatus) -> zeron_proto::Session {
+        zeron_proto::Session {
+            last_completed_turn: None,
+            last_turn_outcome: None,
+            terminal_activity: None,
+            running_subagents: 0,
+            chat_id: chat_id.into(),
+            device_id: "dev".into(),
+            status,
+            started_at: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn sidebar(
+        cx: &mut gpui::TestAppContext,
+        organization: SidebarOrganization,
+        chats: Vec<zeron_proto::Chat>,
+        sessions: Vec<zeron_proto::Session>,
+    ) -> (Entity<Shell>, &mut gpui::VisualTestContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            SidebarHost(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                let mut shell = Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.keep(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                );
+                shell.settings.sidebar_organization = organization;
+                shell.state.update(cx, |state, _| {
+                    state.chats = chats;
+                    state.sessions = sessions;
+                });
+                shell
+            }))
+        });
+        let shell = host.read_with(cx, |host, _| host.0.clone());
+        (shell, cx)
+    }
+
+    fn redraw(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+    }
+
+    fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let point = cx.debug_bounds(selector).unwrap().center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+    }
+
+    fn fixture() -> Vec<zeron_proto::Chat> {
+        vec![
+            chat("orch", None, true, 1),
+            chat("work", Some("orch"), false, 2),
+            chat("idle", Some("orch"), false, 3),
+            chat("plain", None, false, 4),
+        ]
+    }
+
+    fn working_fixture() -> Vec<zeron_proto::Session> {
+        vec![
+            session("orch", zeron_proto::SessionStatus::AwaitingInput),
+            session("work", zeron_proto::SessionStatus::Working),
+        ]
+    }
+
+    #[gpui::test]
+    fn section_nests_active_children_and_folds_done(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            fixture(),
+            working_fixture(),
+        );
+
+        assert!(cx.debug_bounds("orchestrators-toggle").is_some());
+        assert!(cx.debug_bounds("orchestrators-add").is_some());
+        let orchestrator = cx.debug_bounds("chat-orch").unwrap();
+        let child = cx.debug_bounds("chat-work").unwrap();
+        assert!(child.left() > orchestrator.left());
+        assert!(child.top() > orchestrator.top());
+        assert!(cx.debug_bounds("chat-idle").is_none());
+        assert!(cx.debug_bounds("orchestrator-done-orch").is_some());
+
+        assert!(cx.debug_bounds("session-slot-orch").is_none());
+        assert!(cx.debug_bounds("session-slot-work").is_none());
+        assert!(cx.debug_bounds("session-slot-plain").is_some());
+
+        click(cx, "orchestrator-done-orch");
+        redraw(cx);
+        assert!(cx.debug_bounds("chat-idle").is_some());
+        click(cx, "orchestrator-done-orch");
+        redraw(cx);
+        assert!(cx.debug_bounds("chat-idle").is_none());
+    }
+
+    #[gpui::test]
+    fn section_shows_in_every_organization_and_filter(cx: &mut gpui::TestAppContext) {
+        for organization in [
+            SidebarOrganization::InOneList,
+            SidebarOrganization::ByDevice,
+            SidebarOrganization::ByProject,
+        ] {
+            let (shell, cx) = sidebar(cx, organization, fixture(), working_fixture());
+            shell.update(cx, |shell, _| {
+                shell.settings.space_filter = Some("elsewhere".into());
+            });
+            redraw(cx);
+            assert!(cx.debug_bounds("chat-orch").is_some(), "{organization:?}");
+            assert!(cx.debug_bounds("chat-work").is_some(), "{organization:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn empty_section_is_header_and_add_only(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            vec![chat("plain", None, false, 1)],
+            Vec::new(),
+        );
+        assert!(cx.debug_bounds("orchestrators-toggle").is_some());
+        assert!(cx.debug_bounds("orchestrators-add").is_some());
+        assert!(cx.debug_bounds("session-slot-plain").is_some());
+    }
+
+    #[gpui::test]
+    fn archived_orchestrator_leaves_the_section(cx: &mut gpui::TestAppContext) {
+        let mut archived = chat("orch", None, true, 1);
+        archived.archived = true;
+        let (_, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            vec![archived, chat("work", Some("orch"), false, 2)],
+            Vec::new(),
+        );
+        assert!(cx.debug_bounds("orchestrators-toggle").is_some());
+        assert!(cx.debug_bounds("session-slot-orch").is_none());
+        assert!(cx.debug_bounds("chat-work").is_none());
+    }
+
+    #[gpui::test]
+    fn hover_card_follows_the_rows_on_screen(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            fixture(),
+            working_fixture(),
+        );
+        shell.update(cx, |shell, cx| {
+            assert!(shell.sidebar_hover_card_row_visible("orch", cx));
+            assert!(shell.sidebar_hover_card_row_visible("work", cx));
+            assert!(!shell.sidebar_hover_card_row_visible("idle", cx));
+            shell.orchestrator_done_open.insert("orch".into());
+            assert!(shell.sidebar_hover_card_row_visible("idle", cx));
+            shell
+                .sidebar_collapsed_groups
+                .insert("orchestrators".into());
+            assert!(!shell.sidebar_hover_card_row_visible("orch", cx));
+        });
+    }
+
+    #[gpui::test]
+    fn header_toggle_collapses_the_section(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            fixture(),
+            working_fixture(),
+        );
+        click(cx, "orchestrators-toggle");
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.sidebar_collapsed_groups.contains("orchestrators"));
+        });
+        click(cx, "orchestrators-toggle");
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.sidebar_collapsed_groups.contains("orchestrators"));
+        });
+    }
+
+    #[gpui::test]
+    fn add_action_is_inert_until_the_dialog_lands(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            fixture(),
+            working_fixture(),
+        );
+        click(cx, "orchestrators-add");
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.sidebar_collapsed_groups.contains("orchestrators"));
+        });
+    }
+}

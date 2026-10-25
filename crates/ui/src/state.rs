@@ -2908,6 +2908,7 @@ impl AppState {
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
+            .filter(|c| !crate::orchestration::sidebar::is_orchestrator(c))
             .filter(|c| match c.space_id.as_deref() {
                 // Project-less sessions are first-class rows.
                 None => true,
@@ -6923,6 +6924,25 @@ mod tests {
         assert_eq!(rows, ["parent"]);
         // The child row itself is still addressable (deep links, tabs).
         assert!(state.chats.iter().any(|c| c.id == "child"));
+    }
+
+    #[test]
+    fn orchestrators_are_not_in_sessions() {
+        use crate::orchestration::sidebar::test_support::chat as orchestration_chat;
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.apply_chats(vec![
+            orchestration_chat("orch", None, true, 1),
+            orchestration_chat("plain", None, false, 2),
+            orchestration_chat("worker", Some("orch"), false, 3),
+        ]);
+        let rows: Vec<&str> = state
+            .sidebar_chats(now, None)
+            .into_iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(rows, ["plain"]);
+        assert!(state.chats.iter().any(|c| c.id == "orch"));
     }
 
     #[test]

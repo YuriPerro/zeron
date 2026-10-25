@@ -79,6 +79,7 @@ mod harness_updates;
 mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
+mod orchestrators;
 mod panel_layout;
 use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_tween};
 #[cfg(test)]
@@ -2034,6 +2035,8 @@ pub struct Shell {
     pub(super) archived_shown: usize,
     /// Ephemeral collapsed project/device sections, keyed by organization + id.
     pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
+    /// Orchestrator chat ids whose "N done" children list is expanded.
+    pub(super) orchestrator_done_open: std::collections::HashSet<String>,
     /// In-flight disclosure tweens, shared by device groups, Pinned and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -2619,6 +2622,7 @@ impl Shell {
             sessions_open: true,
             archived_shown: 0,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
+            orchestrator_done_open: std::collections::HashSet::new(),
             sidebar_reveal_motions: std::collections::HashSet::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
@@ -8672,6 +8676,28 @@ impl Shell {
         };
         let project_icon = (project_icon && search_query.is_none())
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
+        let orchestrator_avatar = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == id)
+            .filter(|chat| crate::orchestration::sidebar::is_orchestrator(chat))
+            .map(|chat| {
+                div()
+                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                    .flex_none()
+                    .child(crate::orchestration::sidebar::orchestrator_avatar(
+                        crate::orchestration::sidebar::display_name(chat),
+                        &chat.id,
+                        selected,
+                        theme,
+                    ))
+                    .into_any_element()
+            });
+        let is_orchestrator = orchestrator_avatar.is_some();
+        let harness = harness.filter(|_| !is_orchestrator);
+        let project_icon = orchestrator_avatar.or(project_icon);
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
         let archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
         let project_icon = project_icon.map(|icon| {
@@ -8708,7 +8734,9 @@ impl Shell {
         } else {
             match status {
                 zeron_proto::ChatIndicator::Working => Some("Working"),
-                zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
+                zeron_proto::ChatIndicator::AwaitingInput => Some(
+                    crate::orchestration::sidebar::awaiting_input_label(is_orchestrator),
+                ),
                 zeron_proto::ChatIndicator::Errored => Some("Failed"),
                 zeron_proto::ChatIndicator::Completed => Some("Done"),
                 zeron_proto::ChatIndicator::Idle => None,
@@ -9854,6 +9882,11 @@ impl Shell {
 
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
+        let orchestrators_section = self.render_orchestrators_section(
+            show_pinned_section || (ungrouped && custom_count == 0),
+            theme,
+            cx,
+        );
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -10040,6 +10073,7 @@ impl Shell {
                     // No "Sessions" header (user request) — the list
                     // is the whole column; a little air stands in.
                     .pt(px(SIDEBAR_LIST_PAD_TOP))
+                    .child(orchestrators_section)
                     .child(active_list)
                     .children(archived_section)
                     .children(moving_row)
