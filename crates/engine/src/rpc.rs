@@ -2041,8 +2041,6 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_COMMIT_CREDIT
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
-            // An orchestrator's files live on its own device; a child hosted
-            // elsewhere reads and reports through that device.
             | methods::GET_ORCHESTRATOR
             | methods::ORCH_CREATE_DEMAND
             | methods::ORCH_WRITE_SPEC
