@@ -73,21 +73,31 @@ Uma mensagem de usuário é classificada pelo texto completo, antes de desenhar:
 ## 5. Criar orquestrador
 
 ```
- ┌ New orchestrator ─────────────────────────┐
- │ Name       [ Plataforma               ]   │
- │ Projects   [x] arch-live                  │
- │            [x] chess-arena                │
- │ Provider   ( Claude Code ▾ )              │
- │ Model      ( Opus 5.5 · High ▾ )          │
- │ Children   ( Same provider ▾ )            │
- │                     [Cancel] [Create]     │
- └───────────────────────────────────────────┘
+ ┌ New orchestrator ─────────────────────────────── × ┐
+ │ Name       [ Plataforma                       ]    │
+ │ Projects   [ Search projects… ] [Add folder…]      │
+ │            ┌──────────────────────────────────┐    │
+ │            │ [x] kit-ui       ~/dev/kit-ui    │    │
+ │            │ [x] chess-arena  ~/dev/pers…     │    │
+ │            │ [ ] arch-live    Folder not found│    │
+ │            └──────────────────────────────────┘    │
+ │            2 selected                              │
+ │ Provider   ( Claude Code ▾ )                       │
+ │ Model      ( Opus 5.5 ▾ ) ( High ▾ )               │
+ │ Children   ( Same provider ▾ )                     │
+ │                             [Cancel] [Create]      │
+ └────────────────────────────────────────────────────┘
 ```
 
 - Janela no padrão de diálogo que o Zeron já usa (criar pasta, renomear projeto).
 - Projects: lista com caixas de marcar dos projetos deste computador. O motor só aceita projetos locais.
+- Busca: o campo "Search projects…" filtra a lista pelo nome ou pelo caminho, sem diferenciar maiúsculas. Projetos marcados continuam marcados quando saem do filtro. Sem resultado, a lista mostra "No projects match.".
+- Caminho: cada linha mostra o nome do projeto e a pasta em cinza, com a pasta pessoal escrita como "~" e o excesso cortado com reticências.
+- Pasta ausente: a existência da pasta é verificada ao abrir a janela e quando a lista de projetos muda. Se a pasta não existe mais, a linha fica desligada, não pode ser marcada, mostra "Folder not found" no lugar do caminho e vai para o fim da lista.
+- Add folder…: abre o seletor de pastas do sistema e registra a pasta escolhida como projeto neste computador, pelo mesmo pedido que "Adicionar projeto" usa. Se a pasta já é um projeto, ela só é marcada. Um projeto novo é marcado assim que aparece na lista. Se o registro falha, a mensagem do erro aparece dentro da janela.
+- Contagem: abaixo da lista, "N selected" em cinza, escondido quando N é zero.
 - Provider: só Claude Code e Codex, e só os conectados. O motor recusa os demais.
-- Model: modelos do provedor escolhido, com o nível de raciocínio. Padrão: o modelo padrão do provedor.
+- Model: modelos do provedor escolhido, com o nível de raciocínio ao lado. Padrão: o modelo padrão do provedor.
 - Children: "Same provider" ou outro provedor conectado.
 - Create chama `CreateOrchestrator`. No sucesso, fecha a janela e abre o chat novo. No erro, mostra a mensagem do motor dentro da janela e mantém o que foi preenchido.
 - Validação antes de enviar: "Name is required." e "Select at least one project.". O botão Create fica desligado enquanto envia.

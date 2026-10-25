@@ -1,33 +1,25 @@
 use super::*;
 use crate::orchestration::new_dialog::{
-    ChildChoice, DialogState, OpenDialog, ProjectChoice, parse_created, parse_models,
+    ChildChoice, DialogState, FolderOutcome, OpenDialog, ProjectChoice, ProjectSource,
+    build_projects, display_path, parse_created, parse_models,
 };
 use crate::settings::widgets::{self, SelectOption};
 use zeron_engine::registry::HarnessDescriptor;
 use zeron_proto::ReasoningLevel;
 
-const DIALOG_WIDTH: f32 = 460.0;
+const DIALOG_WIDTH: f32 = 560.0;
 const LABEL_WIDTH: f32 = 76.0;
-const SELECT_WIDTH: f32 = 220.0;
-const MODEL_WIDTH: f32 = 210.0;
+const SELECT_WIDTH: f32 = 250.0;
+const MODEL_WIDTH: f32 = 250.0;
 const REASONING_WIDTH: f32 = 110.0;
-const PROJECT_LIST_HEIGHT: f32 = 132.0;
+const PROJECT_LIST_HEIGHT: f32 = 240.0;
 
 impl Shell {
     pub(super) fn open_new_orchestrator(&mut self, cx: &mut Context<Self>) {
         self.close_sidebar_view_menu(cx);
         self.section_menu = None;
         let state = self.state.read(cx);
-        let local = state.local_device_id.clone();
-        let projects: Vec<ProjectChoice> = state
-            .spaces_sorted()
-            .into_iter()
-            .filter(|space| local.as_deref() == Some(space.device_id.as_str()))
-            .map(|space| ProjectChoice {
-                id: space.id.clone(),
-                label: space.display_name().to_owned(),
-            })
-            .collect();
+        let projects = build_projects(local_project_sources(state), &[], folder_exists);
         let engine = state.engine().cloned();
         let input = cx.new(|cx| ComposerInput::new("Name", cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
@@ -44,10 +36,20 @@ impl Shell {
         if engine.is_none() {
             dialog_state.set_providers_error("Engine not connected".into());
         }
+        let search =
+            cx.new(|cx| ComposerInput::with_context("Search projects…", "PaletteSearch", cx));
+        let search_events = cx.subscribe(&search, |this: &mut Shell, input, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                let text = input.read(cx).text().to_string();
+                this.edit_orchestrator_dialog(cx, |state| state.set_search(&text));
+            }
+        });
         self.new_orchestrator.open = Some(OpenDialog {
             session,
             state: dialog_state,
             name: input,
+            search,
+            _search_events: search_events,
             card_focus: cx.focus_handle(),
             focus_pending: true,
             _events: events,
@@ -276,6 +278,126 @@ impl Shell {
         }
     }
 
+    pub(super) fn sync_new_orchestrator(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.new_orchestrator.open.as_ref() {
+            let sources = local_project_sources(self.state.read(cx));
+            if !dialog.state.same_sources(&sources) {
+                let projects = build_projects(sources, &dialog.state.projects, folder_exists);
+                if let Some(dialog) = self.new_orchestrator.open.as_mut() {
+                    dialog.state.set_projects(projects);
+                }
+                cx.notify();
+            }
+        }
+        self.open_pending_orchestrator(cx);
+    }
+
+    fn pick_orchestrator_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.new_orchestrator.open.as_ref().map(|d| d.session) else {
+            return;
+        };
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add Folder".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.add_orchestrator_folder(session, path, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn add_orchestrator_folder(
+        &mut self,
+        session: u64,
+        path: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let path = path.to_string_lossy().into_owned();
+        let state = self.state.read(cx);
+        let engine = state.engine().cloned();
+        let device = state.local_device_id.clone();
+        let Some(dialog) = self
+            .new_orchestrator
+            .open
+            .as_mut()
+            .filter(|dialog| dialog.session == session)
+        else {
+            return;
+        };
+        if dialog.state.pick_folder(&path) == FolderOutcome::Selected {
+            cx.notify();
+            return;
+        }
+        let (Some(engine), Some(device)) = (engine, device) else {
+            dialog.state.fail("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let space_id = uuid::Uuid::new_v4().to_string();
+        let git_detected = std::path::Path::new(&path).join(".git").exists();
+        dialog.state.expect_project(space_id.clone());
+        let space = zeron_proto::Space {
+            id: space_id.clone(),
+            device_id: device.clone(),
+            path: path.clone(),
+            name: None,
+            git_detected,
+            git_checked_at: None,
+            checkout_id: None,
+            repository_id: None,
+            github_repo: None,
+            created_at: Utc::now(),
+        };
+        self.state.update(cx, |state, cx| {
+            if !state.spaces.iter().any(|existing| existing.id == space.id) {
+                state.spaces.push(space);
+            }
+            cx.notify();
+        });
+        let params = serde_json::json!({
+            "op": "createSpace",
+            "spaceId": space_id,
+            "deviceId": device,
+            "path": path,
+            "gitDetected": git_detected,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::MUTATE, params).await;
+            let Err(error) = result else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.spaces.retain(|space| space.id != space_id);
+                    cx.notify();
+                });
+                if let Some(dialog) = this
+                    .new_orchestrator
+                    .open
+                    .as_mut()
+                    .filter(|dialog| dialog.session == session)
+                {
+                    dialog.state.fail(error.to_string());
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn edit_orchestrator_dialog(
         &mut self,
         cx: &mut Context<Self>,
@@ -316,10 +438,17 @@ impl Shell {
         theme: &Theme,
         project: &ProjectChoice,
         checked: bool,
+        home: Option<&str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = project.id.clone();
+        let missing = project.missing;
         let selector = format!("new-orchestrator-project-{}", project.id);
+        let path = if missing {
+            "Folder not found".to_owned()
+        } else {
+            display_path(&project.path, home)
+        };
         div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector.clone())
@@ -330,7 +459,6 @@ impl Shell {
             .px(px(6.0))
             .py(px(5.0))
             .rounded(px(6.0))
-            .cursor_pointer()
             .role(gpui::Role::CheckBox)
             .aria_label(SharedString::from(project.label.clone()))
             .aria_toggled(if checked {
@@ -338,10 +466,14 @@ impl Shell {
             } else {
                 gpui::Toggled::False
             })
-            .hover(|el| el.bg(theme.glass_hover()))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.edit_orchestrator_dialog(cx, |state| state.toggle_project(&id));
-            }))
+            .when(missing, |el| el.opacity(0.5))
+            .when(!missing, |el| {
+                el.cursor_pointer()
+                    .hover(|el| el.bg(theme.glass_hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.edit_orchestrator_dialog(cx, |state| state.toggle_project(&id));
+                    }))
+            })
             .child(
                 div()
                     .size(px(16.0))
@@ -360,11 +492,20 @@ impl Shell {
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .flex_none()
+                    .max_w(px(200.0))
                     .truncate()
                     .text_size(crate::typography::ui_rems(13.0))
                     .child(SharedString::from(project.label.clone())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(11.5))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(path)),
             )
             .into_any_element()
     }
@@ -385,16 +526,72 @@ impl Shell {
         let state = &dialog.state;
         let can_create = state.can_submit();
 
+        let home = std::env::var("HOME").ok();
+        let visible = state.visible_projects();
+        let list = (!state.projects.is_empty()).then(|| {
+            div()
+                .id("new-orchestrator-projects")
+                .max_h(px(PROJECT_LIST_HEIGHT))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .p(px(4.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(crate::theme::hairline(0.08))
+                .children(visible.iter().map(|project| {
+                    let checked = state.checked.contains(&project.id);
+                    Self::orchestrator_project_row(&theme, project, checked, home.as_deref(), cx)
+                }))
+                .when(visible.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .id("new-orchestrator-no-match")
+                            .debug_selector(|| "new-orchestrator-no-match".into())
+                            .px(px(6.0))
+                            .py(px(5.0))
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .text_color(theme.text_muted)
+                            .child("No projects match."),
+                    )
+                })
+        });
+        let selected_note = state.selected_note().map(|text| {
+            div()
+                .id("new-orchestrator-selected")
+                .debug_selector(|| "new-orchestrator-selected".into())
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(text))
+        });
         let projects = div()
-            .id("new-orchestrator-projects")
-            .max_h(px(PROJECT_LIST_HEIGHT))
-            .overflow_y_scroll()
             .flex()
             .flex_col()
-            .children(state.projects.iter().map(|project| {
-                let checked = state.checked.contains(&project.id);
-                Self::orchestrator_project_row(&theme, project, checked, cx)
-            }));
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        popover::dialog_field(dialog.search.clone().into_any_element())
+                            .flex_1()
+                            .min_w_0(),
+                    )
+                    .child(
+                        widgets::action_button(&theme, widgets::ActionTone::Filled)
+                            .id("new-orchestrator-add-folder")
+                            .debug_selector(|| "new-orchestrator-add-folder".into())
+                            .flex_none()
+                            .child("Add folder…")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.pick_orchestrator_folder(cx)),
+                            ),
+                    ),
+            )
+            .children(list)
+            .children(selected_note);
 
         let providers = state.provider_list();
         let provider_loading = state.providers.is_loading().then(|| {
@@ -618,6 +815,24 @@ impl Shell {
             card.into_any_element(),
         ))
     }
+}
+
+fn folder_exists(path: &str) -> bool {
+    std::path::Path::new(path).exists()
+}
+
+fn local_project_sources(state: &AppState) -> Vec<ProjectSource> {
+    let local = state.local_device_id.as_deref();
+    state
+        .spaces_sorted()
+        .into_iter()
+        .filter(|space| local == Some(space.device_id.as_str()))
+        .map(|space| ProjectSource {
+            id: space.id.clone(),
+            label: space.display_name().to_owned(),
+            path: space.path.clone(),
+        })
+        .collect()
 }
 
 fn muted_note(theme: &Theme, text: &'static str) -> AnyElement {

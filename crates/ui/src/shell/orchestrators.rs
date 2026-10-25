@@ -875,8 +875,8 @@ mod tests {
             shell.state.update(cx, |state, _| {
                 state.local_device_id = Some("dev".into());
                 state.spaces = vec![
-                    space("api", "dev", "/work/api"),
-                    space("web", "dev", "/work/web"),
+                    space("api", "dev", &real_dir("api")),
+                    space("web", "dev", &real_dir("web")),
                     space("far", "other", "/work/far"),
                 ];
             });
@@ -897,6 +897,12 @@ mod tests {
             );
         });
         redraw(cx);
+    }
+
+    fn real_dir(name: &str) -> String {
+        let dir = tempfile::tempdir().unwrap().keep().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().into_owned()
     }
 
     fn space(id: &str, device: &str, path: &str) -> zeron_proto::Space {
@@ -927,8 +933,8 @@ mod tests {
             shell.state.update(cx, |state, _| {
                 state.local_device_id = Some("dev".into());
                 state.spaces = vec![
-                    space("web", "dev", "/work/web"),
-                    space("api", "dev", "/work/api"),
+                    space("web", "dev", &real_dir("web")),
+                    space("api", "dev", &real_dir("api")),
                     space("far", "other", "/work/far"),
                 ];
             });
@@ -1246,6 +1252,128 @@ mod tests {
             assert!(shell.in_orchestrator_section("work", cx));
             shell.open_rename_chat("old".into(), cx);
             assert!(shell.chat_rename.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn search_filters_the_rows_and_says_when_nothing_matches(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        shell.update(cx, |shell, cx| {
+            let dialog = shell.new_orchestrator.open.as_ref().unwrap();
+            dialog
+                .search
+                .update(cx, |input, cx| input.set_text("WEB", cx));
+        });
+        redraw(cx);
+        shell.read_with(cx, |shell, _| {
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            let ids: Vec<_> = state
+                .visible_projects()
+                .iter()
+                .map(|p| p.id.clone())
+                .collect();
+            assert_eq!(ids, vec!["web".to_owned()]);
+        });
+        shell.update(cx, |shell, cx| {
+            let dialog = shell.new_orchestrator.open.as_ref().unwrap();
+            dialog
+                .search
+                .update(cx, |input, cx| input.set_text("zzz", cx));
+        });
+        redraw(cx);
+        assert!(cx.debug_bounds("new-orchestrator-no-match").is_some());
+    }
+
+    #[gpui::test]
+    fn missing_folder_rows_cannot_be_checked(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.local_device_id = Some("dev".into());
+                state.spaces = vec![
+                    space("api", "dev", &real_dir("api")),
+                    space("gone", "dev", "/definitely/not/here"),
+                ];
+            });
+            shell.open_new_orchestrator(cx);
+        });
+        redraw(cx);
+        click(cx, "new-orchestrator-project-gone");
+        click(cx, "new-orchestrator-project-api");
+        shell.read_with(cx, |shell, _| {
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            assert_eq!(state.checked, vec!["api".to_owned()]);
+            assert_eq!(state.projects.last().unwrap().id, "gone");
+            assert!(state.projects.last().unwrap().missing);
+        });
+        redraw(cx);
+        assert!(cx.debug_bounds("new-orchestrator-selected").is_some());
+    }
+
+    #[gpui::test]
+    fn add_folder_selects_an_already_registered_folder(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        let web = shell.read_with(cx, |shell, _| {
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            state
+                .projects
+                .iter()
+                .find(|p| p.id == "web")
+                .unwrap()
+                .path
+                .clone()
+        });
+        click(cx, "new-orchestrator-add-folder");
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(move |_| Some(vec![std::path::PathBuf::from(web)]));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            assert_eq!(state.checked, vec!["web".to_owned()]);
+        });
+    }
+
+    #[gpui::test]
+    fn add_folder_without_an_engine_reports_it_and_registers_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        let fresh = real_dir("fresh");
+        shell.update(cx, |shell, cx| {
+            let session = shell.new_orchestrator.open.as_ref().unwrap().session;
+            shell.add_orchestrator_folder(session, std::path::PathBuf::from(fresh), cx);
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            assert_eq!(state.error.as_deref(), Some("Engine not connected"));
+            assert_eq!(state.expected_project, None);
+            assert_eq!(shell.state.read(cx).spaces.len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_project_in_the_list_is_checked_when_awaited(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        let fresh = real_dir("fresh");
+        shell.update(cx, |shell, cx| {
+            shell
+                .new_orchestrator
+                .open
+                .as_mut()
+                .unwrap()
+                .state
+                .expect_project("fresh".into());
+            shell.state.update(cx, |state, cx| {
+                state.spaces.push(space("fresh", "dev", &fresh));
+                cx.notify();
+            });
+        });
+        shell.read_with(cx, |shell, _| {
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            assert_eq!(state.checked, vec!["fresh".to_owned()]);
+            assert!(state.projects.iter().any(|p| p.id == "fresh"));
         });
     }
 }

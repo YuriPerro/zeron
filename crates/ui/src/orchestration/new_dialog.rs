@@ -57,9 +57,64 @@ pub(crate) struct ProviderChoice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectSource {
+    pub id: String,
+    pub label: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectChoice {
     pub id: String,
     pub label: String,
+    pub path: String,
+    pub missing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FolderOutcome {
+    Selected,
+    New,
+}
+
+/// Project rows with the folder check applied once per new id or path, folders that no longer exist last.
+pub(crate) fn build_projects(
+    sources: Vec<ProjectSource>,
+    previous: &[ProjectChoice],
+    exists: impl Fn(&str) -> bool,
+) -> Vec<ProjectChoice> {
+    let mut projects: Vec<ProjectChoice> = sources
+        .into_iter()
+        .map(|source| {
+            let missing = previous
+                .iter()
+                .find(|choice| choice.id == source.id && choice.path == source.path)
+                .map_or_else(|| !exists(&source.path), |choice| choice.missing);
+            ProjectChoice {
+                id: source.id,
+                label: source.label,
+                path: source.path,
+                missing,
+            }
+        })
+        .collect();
+    projects.sort_by_key(|project| project.missing);
+    projects
+}
+
+/// `path` with the home folder written as `~`.
+pub(crate) fn display_path(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home
+        .map(|home| home.trim_end_matches('/'))
+        .filter(|h| !h.is_empty())
+    else {
+        return path.to_owned();
+    };
+    match path.strip_prefix(home) {
+        Some("") => "~".to_owned(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_owned(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +161,8 @@ pub(crate) fn parse_created(value: Value) -> Result<String, String> {
 pub(crate) struct DialogState {
     pub projects: Vec<ProjectChoice>,
     pub checked: Vec<String>,
+    pub search: String,
+    pub expected_project: Option<String>,
     pub providers: Loadable<Vec<ProviderChoice>>,
     pub provider: Option<HarnessId>,
     pub models: HashMap<HarnessId, Loadable<Vec<Model>>>,
@@ -117,10 +174,13 @@ pub(crate) struct DialogState {
 }
 
 impl DialogState {
-    pub(crate) fn new(projects: Vec<ProjectChoice>) -> Self {
+    pub(crate) fn new(mut projects: Vec<ProjectChoice>) -> Self {
+        projects.sort_by_key(|project| project.missing);
         Self {
             projects,
             checked: Vec::new(),
+            search: String::new(),
+            expected_project: None,
             providers: Loadable::Loading,
             provider: None,
             models: HashMap::new(),
@@ -232,9 +292,92 @@ impl DialogState {
     pub(crate) fn toggle_project(&mut self, id: &str) {
         if let Some(position) = self.checked.iter().position(|checked| checked == id) {
             self.checked.remove(position);
-        } else if self.projects.iter().any(|project| project.id == id) {
+        } else if self.projects.iter().any(|p| p.id == id && !p.missing) {
             self.checked.push(id.to_owned());
         }
+    }
+
+    pub(crate) fn set_search(&mut self, search: &str) {
+        self.search = search.to_owned();
+    }
+
+    /// Projects whose name or folder contains the search text, case-insensitive.
+    pub(crate) fn visible_projects(&self) -> Vec<&ProjectChoice> {
+        let needle = self.search.trim().to_lowercase();
+        self.projects
+            .iter()
+            .filter(|project| {
+                needle.is_empty()
+                    || project.label.to_lowercase().contains(&needle)
+                    || project.path.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    pub(crate) fn same_sources(&self, sources: &[ProjectSource]) -> bool {
+        self.projects.len() == sources.len()
+            && sources.iter().all(|source| {
+                self.projects.iter().any(|project| {
+                    project.id == source.id
+                        && project.path == source.path
+                        && project.label == source.label
+                })
+            })
+    }
+
+    /// Replaces the list. Selections that vanished or went missing are dropped,
+    /// and the project awaited from the folder picker is selected when it shows up.
+    pub(crate) fn set_projects(&mut self, mut projects: Vec<ProjectChoice>) {
+        projects.sort_by_key(|project| project.missing);
+        self.projects = projects;
+        let projects = &self.projects;
+        self.checked
+            .retain(|id| projects.iter().any(|p| &p.id == id && !p.missing));
+        if let Some(expected) = self.expected_project.clone()
+            && let Some(project) = self.projects.iter().find(|p| p.id == expected)
+        {
+            if !project.missing && !self.checked.contains(&expected) {
+                self.checked.push(expected);
+            }
+            self.expected_project = None;
+        }
+    }
+
+    /// A folder from the picker: an already registered one is selected now,
+    /// otherwise the caller registers it.
+    pub(crate) fn pick_folder(&mut self, path: &str) -> FolderOutcome {
+        let known = self
+            .projects
+            .iter()
+            .find(|project| {
+                crate::pickers::same_folder_path(
+                    project.path.trim_end_matches('/'),
+                    path.trim_end_matches('/'),
+                )
+            })
+            .map(|project| (project.id.clone(), project.missing));
+        match known {
+            Some((id, missing)) => {
+                if !missing && !self.checked.contains(&id) {
+                    self.checked.push(id);
+                }
+                FolderOutcome::Selected
+            }
+            None => FolderOutcome::New,
+        }
+    }
+
+    pub(crate) fn expect_project(&mut self, id: String) {
+        self.expected_project = Some(id);
+    }
+
+    pub(crate) fn fail(&mut self, message: String) {
+        self.expected_project = None;
+        self.error = Some(message);
+    }
+
+    pub(crate) fn selected_note(&self) -> Option<String> {
+        (!self.checked.is_empty()).then(|| format!("{} selected", self.checked.len()))
     }
 
     /// "Same provider" first, then every other connected provider.
@@ -252,7 +395,7 @@ impl DialogState {
     fn disabled_reason(&self) -> Option<&'static str> {
         if self.providers.ready().is_some_and(Vec::is_empty) {
             Some(CONNECT_FIRST)
-        } else if self.projects.is_empty() {
+        } else if self.projects.iter().all(|project| project.missing) {
             Some(PROJECTS_REQUIRED)
         } else {
             None
@@ -347,6 +490,8 @@ pub(crate) struct OpenDialog {
     pub session: u64,
     pub state: DialogState,
     pub name: Entity<ComposerInput>,
+    pub search: Entity<ComposerInput>,
+    pub _search_events: Subscription,
     pub card_focus: FocusHandle,
     pub focus_pending: bool,
     pub _events: Subscription,
@@ -467,16 +612,19 @@ mod tests {
         ]
     }
 
+    fn project(id: &str, path: &str, missing: bool) -> ProjectChoice {
+        ProjectChoice {
+            id: id.into(),
+            label: id.into(),
+            path: path.into(),
+            missing,
+        }
+    }
+
     fn projects() -> Vec<ProjectChoice> {
         vec![
-            ProjectChoice {
-                id: "api".into(),
-                label: "api".into(),
-            },
-            ProjectChoice {
-                id: "web".into(),
-                label: "web".into(),
-            },
+            project("api", "/work/api", false),
+            project("web", "/work/web", false),
         ]
     }
 
@@ -690,5 +838,162 @@ mod tests {
         assert_eq!(state.model_note(), Some("Default"));
         state.set_models(HarnessId::ClaudeCode, Loadable::Ready(catalog()));
         assert_eq!(state.model_note(), None);
+    }
+
+    fn named(id: &str, label: &str, path: &str) -> ProjectChoice {
+        ProjectChoice {
+            id: id.into(),
+            label: label.into(),
+            path: path.into(),
+            missing: false,
+        }
+    }
+
+    #[test]
+    fn search_filters_by_name_and_path_and_keeps_hidden_selections() {
+        let mut state = DialogState::new(vec![
+            named("kit", "Kit-UI", "/dev/kit-ui"),
+            named("chess", "chess-arena", "/dev/personal/arena"),
+            named("arch", "arch-live", "/dev/arch-live"),
+        ]);
+        state.toggle_project("kit");
+        let ids = |state: &DialogState| -> Vec<String> {
+            state
+                .visible_projects()
+                .iter()
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&state), vec!["kit", "chess", "arch"]);
+        state.set_search("  KIT ");
+        assert_eq!(ids(&state), vec!["kit"]);
+        state.set_search("personal");
+        assert_eq!(ids(&state), vec!["chess"]);
+        state.set_search("zzz");
+        assert!(ids(&state).is_empty());
+        assert_eq!(state.checked, vec!["kit".to_owned()]);
+        assert_eq!(state.selected_note().as_deref(), Some("1 selected"));
+    }
+
+    #[test]
+    fn missing_folders_cannot_be_selected_and_sort_last() {
+        let sources = vec![
+            ProjectSource {
+                id: "gone".into(),
+                label: "arch-live".into(),
+                path: "/gone".into(),
+            },
+            ProjectSource {
+                id: "here".into(),
+                label: "kit-ui".into(),
+                path: "/here".into(),
+            },
+        ];
+        let built = build_projects(sources, &[], |path| path == "/here");
+        let ids: Vec<_> = built.iter().map(|p| (p.id.as_str(), p.missing)).collect();
+        assert_eq!(ids, vec![("here", false), ("gone", true)]);
+
+        let mut state = DialogState::new(built);
+        state.toggle_project("gone");
+        assert!(state.checked.is_empty());
+        state.toggle_project("here");
+        assert_eq!(state.checked, vec!["here".to_owned()]);
+    }
+
+    #[test]
+    fn folder_checks_are_not_repeated_for_unchanged_projects() {
+        let source = |id: &str, path: &str| ProjectSource {
+            id: id.into(),
+            label: id.into(),
+            path: path.into(),
+        };
+        let first = build_projects(vec![source("a", "/a")], &[], |_| false);
+        assert!(first[0].missing);
+        let second = build_projects(vec![source("a", "/a"), source("b", "/b")], &first, |path| {
+            path == "/a" || path == "/b"
+        });
+        let flags: Vec<_> = second.iter().map(|p| (p.id.as_str(), p.missing)).collect();
+        assert_eq!(flags, vec![("b", false), ("a", true)]);
+    }
+
+    #[test]
+    fn a_folder_added_with_the_picker_is_selected_when_its_project_appears() {
+        let mut state = DialogState::new(projects());
+        assert_eq!(state.pick_folder("/work/new"), FolderOutcome::New);
+        state.expect_project("new-id".into());
+        assert!(state.checked.is_empty());
+
+        let mut list = projects();
+        list.push(project("new-id", "/work/new", false));
+        state.set_projects(list);
+        assert_eq!(state.checked, vec!["new-id".to_owned()]);
+        assert_eq!(state.expected_project, None);
+    }
+
+    #[test]
+    fn a_failed_folder_registration_clears_the_wait_and_shows_the_error() {
+        let mut state = DialogState::new(projects());
+        state.expect_project("new-id".into());
+        state.fail("could not register".into());
+        assert_eq!(state.notice().as_deref(), Some("could not register"));
+        let mut list = projects();
+        list.push(project("new-id", "/work/new", false));
+        state.set_projects(list);
+        assert!(state.checked.is_empty());
+    }
+
+    #[test]
+    fn an_already_registered_folder_is_just_selected() {
+        let mut state = DialogState::new(projects());
+        assert_eq!(state.pick_folder("/work/web/"), FolderOutcome::Selected);
+        assert_eq!(state.checked, vec!["web".to_owned()]);
+        assert_eq!(state.pick_folder("/work/web"), FolderOutcome::Selected);
+        assert_eq!(state.checked, vec!["web".to_owned()]);
+    }
+
+    #[test]
+    fn selections_that_vanish_or_go_missing_are_dropped_on_refresh() {
+        let mut state = DialogState::new(projects());
+        state.toggle_project("api");
+        state.toggle_project("web");
+        state.set_projects(vec![
+            project("api", "/work/api", true),
+            project("web", "/work/web", false),
+        ]);
+        assert_eq!(state.checked, vec!["web".to_owned()]);
+        state.set_projects(Vec::new());
+        assert!(state.checked.is_empty());
+        assert_eq!(state.selected_note(), None);
+    }
+
+    #[test]
+    fn selected_note_counts_the_checked_projects() {
+        let mut state = DialogState::new(projects());
+        assert_eq!(state.selected_note(), None);
+        state.toggle_project("api");
+        state.toggle_project("web");
+        assert_eq!(state.selected_note().as_deref(), Some("2 selected"));
+    }
+
+    #[test]
+    fn only_missing_folders_block_create_with_the_validation_message() {
+        let mut state = DialogState::new(vec![project("gone", "/gone", true)]);
+        state.set_providers(&both());
+        state.set_models(HarnessId::ClaudeCode, Loadable::Ready(catalog()));
+        assert_eq!(
+            state.notice().as_deref(),
+            Some("Select at least one project.")
+        );
+        assert!(!state.can_submit());
+    }
+
+    #[test]
+    fn home_is_shortened_to_a_tilde() {
+        let home = Some("/Users/ana");
+        assert_eq!(display_path("/Users/ana/dev/kit", home), "~/dev/kit");
+        assert_eq!(display_path("/Users/ana", home), "~");
+        assert_eq!(display_path("/Users/anabel/dev", home), "/Users/anabel/dev");
+        assert_eq!(display_path("/srv/kit", home), "/srv/kit");
+        assert_eq!(display_path("/Users/ana/x", None), "/Users/ana/x");
     }
 }
