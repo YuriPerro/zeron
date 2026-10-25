@@ -31,11 +31,27 @@ pub(crate) enum Scope {
     Plain,
     Orchestrator {
         id: String,
+        device: String,
     },
     Child {
         orchestrator: String,
+        device: String,
         parent: String,
     },
+}
+
+impl Scope {
+    fn store(&self) -> Option<(&str, &str)> {
+        match self {
+            Scope::Plain => None,
+            Scope::Orchestrator { id, device } => Some((id, device)),
+            Scope::Child {
+                orchestrator,
+                device,
+                ..
+            } => Some((orchestrator, device)),
+        }
+    }
 }
 
 pub(crate) async fn scope(zeron: &Zeron) -> anyhow::Result<Scope> {
@@ -53,17 +69,21 @@ pub(crate) async fn scope(zeron: &Zeron) -> anyhow::Result<Scope> {
             .and_then(|config| config.orchestrator.clone())
     };
     if let Some(id) = orchestrator_of(&chat) {
-        return Ok(Scope::Orchestrator { id });
+        return Ok(Scope::Orchestrator {
+            id,
+            device: chat.device_id.clone(),
+        });
     }
     let parent = chat
         .parent_chat_id
         .as_deref()
         .and_then(|id| chats.iter().find(|c| c.id == id));
     Ok(
-        match parent.and_then(|p| orchestrator_of(p).map(|id| (id, p.id.clone()))) {
+        match parent.and_then(|p| orchestrator_of(p).map(|id| (id, p))) {
             Some((orchestrator, parent)) => Scope::Child {
                 orchestrator,
-                parent,
+                device: parent.device_id.clone(),
+                parent: parent.id.clone(),
             },
             None => Scope::Plain,
         },
@@ -227,6 +247,35 @@ pub(crate) async fn roles_summary(zeron: &Zeron) -> String {
     format!("Roles: {}.", roles.join("; "))
 }
 
+pub(crate) fn ensure_cwd_within_project(space: &Space, cwd: &str) -> anyhow::Result<()> {
+    let root = lexical_path(&space.path);
+    let inside = std::path::Path::new(cwd).is_absolute()
+        && lexical_path(cwd).is_some_and(|path| root.as_ref().is_some_and(|r| path.starts_with(r)));
+    anyhow::ensure!(
+        inside,
+        "cwd must be inside the project folder {}.",
+        space.path
+    );
+    Ok(())
+}
+
+fn lexical_path(raw: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in std::path::Path::new(raw).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
 pub(crate) async fn ensure_project_associated(
     zeron: &Zeron,
     orchestrator: &OrchestratorInfo,
@@ -305,19 +354,20 @@ fn parse<T: serde::de::DeserializeOwned>(args: Value) -> anyhow::Result<T> {
     serde_json::from_value(args).map_err(|e| anyhow::anyhow!("invalid arguments: {e}"))
 }
 
-fn orchestrator_id(scope: &Scope) -> anyhow::Result<&str> {
+fn orchestrator_store(scope: &Scope) -> anyhow::Result<(&str, &str)> {
     match scope {
-        Scope::Orchestrator { id } => Ok(id),
+        Scope::Orchestrator { id, device } => Ok((id, device)),
         _ => anyhow::bail!("this tool is only available in an orchestrator chat"),
     }
 }
 
-fn child_of(scope: &Scope) -> anyhow::Result<(&str, &str)> {
+fn child_of(scope: &Scope) -> anyhow::Result<(&str, &str, &str)> {
     match scope {
         Scope::Child {
             orchestrator,
+            device,
             parent,
-        } => Ok((orchestrator, parent)),
+        } => Ok((orchestrator, device, parent)),
         _ => anyhow::bail!("this tool is only available to a chat started by an orchestrator"),
     }
 }
@@ -344,54 +394,53 @@ impl Tools {
             }
             "create_demand" => {
                 let args: CreateDemandArgs = parse(args)?;
-                zeron
-                    .orch_create_demand(orchestrator_id(&scope)?, &args.title)
-                    .await
+                let (id, device) = orchestrator_store(&scope)?;
+                zeron.orch_create_demand(id, device, &args.title).await
             }
             "write_spec" => {
                 let args: WriteSpecArgs = parse(args)?;
+                let (id, device) = orchestrator_store(&scope)?;
                 zeron
-                    .orch_write_spec(orchestrator_id(&scope)?, &args.demand, &args.text)
+                    .orch_write_spec(id, device, &args.demand, &args.text)
                     .await
             }
             "update_plan" => {
                 let args: UpdatePlanArgs = parse(args)?;
+                let (id, device) = orchestrator_store(&scope)?;
                 zeron
-                    .orch_write_plan(orchestrator_id(&scope)?, &args.demand, &args.items)
+                    .orch_write_plan(id, device, &args.demand, &args.items)
                     .await
             }
             "read_demand" => {
                 let args: DemandArgs = parse(args)?;
-                let orchestrator = match &scope {
-                    Scope::Orchestrator { id } => id,
-                    Scope::Child { orchestrator, .. } => orchestrator,
-                    Scope::Plain => anyhow::bail!("read_demand is not available in this chat"),
-                };
-                zeron.orch_read_demand(orchestrator, &args.demand).await
+                let (id, device) = scope
+                    .store()
+                    .context("read_demand is not available in this chat")?;
+                zeron.orch_read_demand(id, device, &args.demand).await
             }
             "close_demand" => {
                 let args: CloseDemandArgs = parse(args)?;
+                let (id, device) = orchestrator_store(&scope)?;
                 zeron
-                    .orch_close_demand(orchestrator_id(&scope)?, &args.demand, &args.summary)
+                    .orch_close_demand(id, device, &args.demand, &args.summary)
                     .await
             }
             "remember" => {
                 let args: RememberArgs = parse(args)?;
-                zeron
-                    .orch_remember(orchestrator_id(&scope)?, &args.note)
-                    .await
+                let (id, device) = orchestrator_store(&scope)?;
+                zeron.orch_remember(id, device, &args.note).await
             }
             "submit_report" => {
                 let args: SubmitReportArgs = parse(args)?;
-                let (orchestrator, _) = child_of(&scope)?;
+                let (orchestrator, device, _) = child_of(&scope)?;
                 let me = self.own_chat_id()?;
                 zeron
-                    .orch_submit_report(orchestrator, &args.demand, &me, &args.text)
+                    .orch_submit_report(orchestrator, device, &args.demand, &me, &args.text)
                     .await
             }
             "request_contract_change" => {
                 let args: ContractChangeArgs = parse(args)?;
-                let (_, parent) = child_of(&scope)?;
+                let (_, _, parent) = child_of(&scope)?;
                 let me = self.own_chat_id()?;
                 let chats = zeron.chats().await?;
                 let title = resolve_chat_in(&chats, &me)?.title;

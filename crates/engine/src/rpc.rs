@@ -2041,6 +2041,16 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_COMMIT_CREDIT
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
+            // An orchestrator's files live on its own device; a child hosted
+            // elsewhere reads and reports through that device.
+            | methods::GET_ORCHESTRATOR
+            | methods::ORCH_CREATE_DEMAND
+            | methods::ORCH_WRITE_SPEC
+            | methods::ORCH_WRITE_PLAN
+            | methods::ORCH_READ_DEMAND
+            | methods::ORCH_SUBMIT_REPORT
+            | methods::ORCH_CLOSE_DEMAND
+            | methods::ORCH_REMEMBER
             | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
@@ -5070,6 +5080,12 @@ mod tests {
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
         assert!(!forwardable(methods::RESOLVE_ROLE_MODEL));
+        assert!(!forwardable(methods::LIST_ROLES));
+        assert!(!forwardable(methods::CREATE_ORCHESTRATOR));
+        assert!(!forwardable(methods::LIST_ORCHESTRATORS));
+        assert!(forwardable(methods::GET_ORCHESTRATOR));
+        assert!(forwardable(methods::ORCH_READ_DEMAND));
+        assert!(forwardable(methods::ORCH_SUBMIT_REPORT));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::SEARCH_GIT_HISTORY));

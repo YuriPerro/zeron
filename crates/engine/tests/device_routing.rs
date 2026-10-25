@@ -1255,6 +1255,111 @@ impl Harness for CatalogHarness {
     }
 }
 
+/// An orchestrator's files stay on its device: a call addressed there from
+/// another device reads (and writes) the orchestrator's own data dir.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn orchestration_calls_with_a_target_device_reach_that_devices_data() {
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+
+    let core_a = assemble(&dirs.path().join("a"), "device-a");
+    let core_b = assemble(&dirs.path().join("b"), "device-b");
+    let _host = core_a.start_host_relay(&relay_url);
+    let client_a = zeron_rpc::memory_client(core_a.rpc_service());
+
+    let created = client_a
+        .call(
+            methods::CREATE_ORCHESTRATOR,
+            serde_json::json!({ "name": "Loja", "harness": "mock", "projects": [] }),
+        )
+        .await
+        .expect("CreateOrchestrator on A");
+    let id = created["orchestratorId"].as_str().unwrap().to_string();
+    let demand = client_a
+        .call(
+            methods::ORCH_CREATE_DEMAND,
+            serde_json::json!({ "orchestratorId": id, "title": "Cupom" }),
+        )
+        .await
+        .expect("create demand on A")["demand"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client_a
+        .call(
+            methods::ORCH_WRITE_SPEC,
+            serde_json::json!({ "orchestratorId": id, "demand": demand, "text": "A's spec" }),
+        )
+        .await
+        .expect("write spec on A");
+
+    let mut link_config =
+        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
+    link_config.probe_timeout = Duration::from_secs(5);
+    core_b.set_links(LinkCache::new(link_config));
+    let client_b = zeron_rpc::memory_client(core_b.rpc_service());
+
+    client_b
+        .call(
+            methods::ORCH_READ_DEMAND,
+            serde_json::json!({ "orchestratorId": id, "demand": demand }),
+        )
+        .await
+        .expect_err("B has no such orchestrator");
+
+    let read_params = serde_json::json!({
+        "orchestratorId": id, "demand": demand, "targetDeviceId": "device-a",
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let view = loop {
+        match client_b
+            .call(methods::ORCH_READ_DEMAND, read_params.clone())
+            .await
+        {
+            Ok(value) => break value,
+            Err(err) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "relay never came up: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    assert_eq!(view["spec"], "A's spec");
+
+    client_b
+        .call(
+            methods::ORCH_SUBMIT_REPORT,
+            serde_json::json!({
+                "orchestratorId": id, "demand": demand, "childId": "child-b",
+                "text": "done on B", "targetDeviceId": "device-a",
+            }),
+        )
+        .await
+        .expect("report lands on A");
+    let after = client_a
+        .call(
+            methods::ORCH_READ_DEMAND,
+            serde_json::json!({ "orchestratorId": id, "demand": demand }),
+        )
+        .await
+        .expect("read on A");
+    assert_eq!(after["reports"], serde_json::json!([["child-b", "done on B"]]));
+
+    let config = client_b
+        .call(
+            methods::GET_ORCHESTRATOR,
+            serde_json::json!({ "orchestratorId": id, "targetDeviceId": "device-a" }),
+        )
+        .await
+        .expect("GetOrchestrator forwarded");
+    assert_eq!(config["name"], "Loja");
+
+    core_a.shutdown().await;
+    core_b.shutdown().await;
+}
+
 /// Roles and the model map are the caller's own; only the catalog is the
 /// target device's. A's catalog is empty and B has no roles at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

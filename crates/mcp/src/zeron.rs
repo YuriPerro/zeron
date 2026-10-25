@@ -498,9 +498,16 @@ impl Zeron {
         serde_json::from_value(value).context("ResolveRoleModel: unexpected shape")
     }
 
-    pub async fn get_orchestrator(&self, id: &str) -> anyhow::Result<OrchestratorInfo> {
+    pub async fn get_orchestrator(
+        &self,
+        id: &str,
+        device: &str,
+    ) -> anyhow::Result<OrchestratorInfo> {
         let value = self
-            .call(methods::GET_ORCHESTRATOR, json!({ "orchestratorId": id }))
+            .call(
+                methods::GET_ORCHESTRATOR,
+                json!({ "orchestratorId": id, "targetDeviceId": device }),
+            )
             .await?;
         serde_json::from_value(value).context("GetOrchestrator: unexpected shape")
     }
@@ -508,11 +515,12 @@ impl Zeron {
     pub async fn orch_create_demand(
         &self,
         orchestrator: &str,
+        device: &str,
         title: &str,
     ) -> anyhow::Result<Value> {
         self.call(
             methods::ORCH_CREATE_DEMAND,
-            json!({ "orchestratorId": orchestrator, "title": title }),
+            json!({ "orchestratorId": orchestrator, "targetDeviceId": device, "title": title }),
         )
         .await
     }
@@ -520,12 +528,13 @@ impl Zeron {
     pub async fn orch_write_spec(
         &self,
         orchestrator: &str,
+        device: &str,
         demand: &str,
         text: &str,
     ) -> anyhow::Result<Value> {
         self.call(
             methods::ORCH_WRITE_SPEC,
-            json!({ "orchestratorId": orchestrator, "demand": demand, "text": text }),
+            json!({ "orchestratorId": orchestrator, "targetDeviceId": device, "demand": demand, "text": text }),
         )
         .await
     }
@@ -533,12 +542,13 @@ impl Zeron {
     pub async fn orch_write_plan(
         &self,
         orchestrator: &str,
+        device: &str,
         demand: &str,
         items: &[PlanItem],
     ) -> anyhow::Result<Value> {
         self.call(
             methods::ORCH_WRITE_PLAN,
-            json!({ "orchestratorId": orchestrator, "demand": demand, "items": items }),
+            json!({ "orchestratorId": orchestrator, "targetDeviceId": device, "demand": demand, "items": items }),
         )
         .await
     }
@@ -546,11 +556,12 @@ impl Zeron {
     pub async fn orch_read_demand(
         &self,
         orchestrator: &str,
+        device: &str,
         demand: &str,
     ) -> anyhow::Result<Value> {
         self.call(
             methods::ORCH_READ_DEMAND,
-            json!({ "orchestratorId": orchestrator, "demand": demand }),
+            json!({ "orchestratorId": orchestrator, "targetDeviceId": device, "demand": demand }),
         )
         .await
     }
@@ -558,6 +569,7 @@ impl Zeron {
     pub async fn orch_submit_report(
         &self,
         orchestrator: &str,
+        device: &str,
         demand: &str,
         child_id: &str,
         text: &str,
@@ -565,7 +577,7 @@ impl Zeron {
         self.call(
             methods::ORCH_SUBMIT_REPORT,
             json!({
-                "orchestratorId": orchestrator,
+                "orchestratorId": orchestrator, "targetDeviceId": device,
                 "demand": demand,
                 "childId": child_id,
                 "text": text,
@@ -577,20 +589,26 @@ impl Zeron {
     pub async fn orch_close_demand(
         &self,
         orchestrator: &str,
+        device: &str,
         demand: &str,
         summary: &str,
     ) -> anyhow::Result<Value> {
         self.call(
             methods::ORCH_CLOSE_DEMAND,
-            json!({ "orchestratorId": orchestrator, "demand": demand, "summary": summary }),
+            json!({ "orchestratorId": orchestrator, "targetDeviceId": device, "demand": demand, "summary": summary }),
         )
         .await
     }
 
-    pub async fn orch_remember(&self, orchestrator: &str, note: &str) -> anyhow::Result<Value> {
+    pub async fn orch_remember(
+        &self,
+        orchestrator: &str,
+        device: &str,
+        note: &str,
+    ) -> anyhow::Result<Value> {
         self.call(
             methods::ORCH_REMEMBER,
-            json!({ "orchestratorId": orchestrator, "note": note }),
+            json!({ "orchestratorId": orchestrator, "targetDeviceId": device, "note": note }),
         )
         .await
     }

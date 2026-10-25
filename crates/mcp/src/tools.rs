@@ -693,8 +693,13 @@ impl Tools {
     }
 
     pub async fn has(&self, name: &str) -> bool {
-        self.base_tools().iter().any(|t| t.name == name)
-            || orchestration::offers(&self.scope().await, name)
+        if self.base_tools().iter().any(|t| t.name == name) {
+            return true;
+        }
+        orchestration::handles(name)
+            && orchestration::scope(&self.zeron)
+                .await
+                .map_or(true, |scope| orchestration::offers(&scope, name))
     }
 
     fn base_tools(&self) -> Vec<ToolDef> {
@@ -1012,6 +1017,14 @@ impl Tools {
         if let Some(parent) = parent_chat_id.as_deref() {
             let parent = self.zeron.resolve_chat(parent).await?;
             anyhow::ensure!(
+                parent
+                    .config
+                    .as_ref()
+                    .is_none_or(|c| c.orchestrator.is_none())
+                    || self.zeron.origin().chat_id.as_deref() == Some(parent.id.as_str()),
+                "Only the orchestrator can start its own children."
+            );
+            anyhow::ensure!(
                 parent.parent_chat_id.is_none(),
                 "{} is itself a delegated chat: only top-level chats have side chats.",
                 parent.title.as_deref().unwrap_or(&parent.id)
@@ -1022,8 +1035,8 @@ impl Tools {
             .resolve_target(args.project.as_deref(), args.device.as_deref())
             .await?;
         let orchestrator = match &scope {
-            Scope::Orchestrator { id } => {
-                let orchestrator = self.zeron.get_orchestrator(id).await?;
+            Scope::Orchestrator { id, device } => {
+                let orchestrator = self.zeron.get_orchestrator(id, device).await?;
                 orchestration::ensure_project_associated(
                     &self.zeron,
                     &orchestrator,
@@ -1062,7 +1075,9 @@ impl Tools {
             }
             None => default_harness(&harnesses).with_context(|| format!("device {device_id}"))?,
         };
-        let resolved = match role {
+        let all_explicit =
+            args.model.is_some() && args.reasoning.is_some() && args.sandbox.is_some();
+        let resolved = match role.filter(|_| !all_explicit) {
             Some(role) => Some(
                 self.zeron
                     .resolve_role_model(role, harness, effort, Some(&device_id))
@@ -1134,6 +1149,11 @@ impl Tools {
             .map(str::trim)
             .filter(|c| !c.is_empty())
             .map(str::to_owned);
+        if orchestrator.is_some()
+            && let (Some(cwd), Some(space)) = (cwd.as_deref(), space.as_ref())
+        {
+            orchestration::ensure_cwd_within_project(space, cwd)?;
+        }
         // A projectless chat runs in its own scratch folder on a host that
         // creates them; naming it here keeps createChat and the first run
         // in agreement.
@@ -1741,7 +1761,7 @@ mod tests {
                     "sandbox": "read-only", "orchestrator": "plataforma" }
             }),
             json!({
-                "id": "chat-kid-6", "deviceId": "dev-local", "title": "Kid",
+                "id": "chat-kid-6", "deviceId": "dev-remote", "title": "Kid",
                 "parentChatId": "chat-orch-5", "spaceId": "space-1",
                 "archived": false, "createdAt": "2026-10-02T00:00:00Z",
                 "config": { "harness": "claude-code", "model": "sonnet", "reasoning": null,
@@ -1774,6 +1794,7 @@ mod tests {
                     | methods::LIST_MODELS
                     | methods::LIST_AGENT_ACCOUNTS
                     | methods::RESOLVE_ROLE_MODEL
+                    | methods::GET_ORCHESTRATOR
             ) {
                 self.reads
                     .lock()
@@ -3387,9 +3408,11 @@ mod tests {
         assert_eq!(writes[0].0, methods::ORCH_SUBMIT_REPORT);
         assert_eq!(writes[0].1["orchestratorId"], "plataforma");
         assert_eq!(writes[0].1["childId"], "chat-kid-6");
+        assert_eq!(writes[0].1["targetDeviceId"], "dev-local");
         assert_eq!(writes[0].1["text"], "done");
         assert_eq!(writes[1].0, methods::ORCH_READ_DEMAND);
         assert_eq!(writes[1].1["orchestratorId"], "plataforma");
+        assert_eq!(writes[1].1["targetDeviceId"], "dev-local");
         assert_eq!(writes[2].0, methods::QUEUE_MESSAGE);
         assert_eq!(writes[2].1["chatId"], "chat-orch-5");
         assert_eq!(
@@ -3427,6 +3450,170 @@ mod tests {
         assert_eq!(writes[0].1["items"][0]["status"], "inProgress");
         assert_eq!(writes[0].1["items"][0]["role"], "executor");
         assert_eq!(writes[0].1["items"][1]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn orchestrator_tools_address_the_orchestrators_device() {
+        let world = orchestrated();
+        let orchestrator = tools(world.clone(), origin("chat-orch-5"));
+        orchestrator
+            .call("remember", json!({ "note": "small PRs" }))
+            .await
+            .unwrap();
+        orchestrator
+            .call("create_chat", json!({ "project": "space-1" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            world.writes.lock().unwrap()[0].1["targetDeviceId"],
+            "dev-local"
+        );
+        let reads = world.reads.lock().unwrap();
+        let (_, get) = reads
+            .iter()
+            .find(|(method, _)| method == methods::GET_ORCHESTRATOR)
+            .unwrap();
+        assert_eq!(get["orchestratorId"], "plataforma");
+        assert_eq!(get["targetDeviceId"], "dev-local");
+    }
+
+    #[tokio::test]
+    async fn only_the_orchestrator_can_start_its_children() {
+        let world = orchestrated();
+        for from in [Origin::default(), origin("chat-alpha-1")] {
+            let refused = tools(world.clone(), from)
+                .call(
+                    "create_chat",
+                    json!({ "project": "space-unique", "parent": "Plataforma" }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                refused.contains("Only the orchestrator can start its own children."),
+                "{refused}"
+            );
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_orchestrators_cwd_must_stay_inside_the_project() {
+        let world = orchestrated();
+        let tools = tools(world.clone(), origin("chat-orch-5"));
+        for cwd in [
+            "/repo/other",
+            "/repo/comet/../other",
+            "/repo/comet-evil",
+            "relative/path",
+            "/repo/comet/../../etc",
+        ] {
+            let refused = tools
+                .call("create_chat", json!({ "project": "space-1", "cwd": cwd }))
+                .await
+                .unwrap_err();
+            assert!(refused.contains("cwd must be inside"), "{cwd}: {refused}");
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
+
+        for cwd in [
+            "/repo/comet",
+            "/repo/comet/packages/app",
+            "/repo/comet/./a/../b",
+        ] {
+            tools
+                .call("create_chat", json!({ "project": "space-1", "cwd": cwd }))
+                .await
+                .unwrap();
+        }
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 3);
+        assert_eq!(writes[1].1["cwd"], "/repo/comet/packages/app");
+    }
+
+    #[tokio::test]
+    async fn a_plain_chats_cwd_is_not_restricted() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "cwd": "/elsewhere" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(world.writes.lock().unwrap()[0].1["cwd"], "/elsewhere");
+    }
+
+    #[tokio::test]
+    async fn the_role_is_not_resolved_when_everything_it_would_fill_is_explicit() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        tools
+            .call(
+                "create_chat",
+                json!({ "role": "executor", "model": "opus", "reasoning": "low", "sandbox": "read-only" }),
+            )
+            .await
+            .unwrap();
+        tools
+            .call(
+                "create_chat",
+                json!({ "role": "executor", "model": "opus" }),
+            )
+            .await
+            .unwrap();
+        let reads = world.reads.lock().unwrap();
+        let resolves = reads
+            .iter()
+            .filter(|(method, _)| method == methods::RESOLVE_ROLE_MODEL)
+            .count();
+        assert_eq!(resolves, 1);
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["config"]["role"], "executor");
+        assert_eq!(writes[0].1["config"]["sandbox"], "read-only");
+    }
+
+    #[tokio::test]
+    async fn create_chats_from_an_orchestrator_enforces_project_scope() {
+        let world = orchestrated();
+        let tools = tools(world.clone(), origin("chat-orch-5"));
+        let batch = tools
+            .call(
+                "create_chats",
+                json!({ "requests": [
+                    { "project": "space-unique" },
+                    { "project": "space-1", "kind": "chat" },
+                    { "project": "space-1", "role": "executor" }
+                ]}),
+            )
+            .await
+            .unwrap();
+        let results = batch["results"].as_array().unwrap();
+        assert_eq!(results[0]["isError"], true);
+        assert!(
+            results[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("is not associated"),
+            "{batch}"
+        );
+        assert_eq!(results[1]["isError"], true);
+        assert_eq!(results[2]["isError"], false, "{batch}");
+        assert_eq!(results[2]["result"]["parentChatId"], "chat-orch-5");
+        assert_eq!(world.writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_scope_lookup_does_not_hide_orchestration_tools() {
+        let world = Arc::new(World::default());
+        let ghost = tools(world, origin("chat-missing-9"));
+        assert!(ghost.has("write_spec").await);
+        assert!(!ghost.has("no_such_tool").await);
+        let err = ghost
+            .call("write_spec", json!({ "demand": "d", "text": "t" }))
+            .await
+            .unwrap_err();
+        assert!(!err.contains("unknown tool"), "{err}");
     }
 
     #[tokio::test]
