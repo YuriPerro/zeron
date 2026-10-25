@@ -79,6 +79,7 @@ mod harness_updates;
 mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
+mod new_orchestrator;
 mod orchestrators;
 mod panel_layout;
 use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_tween};
@@ -2160,6 +2161,7 @@ pub struct Shell {
     rename_space_dialog: Option<RenameSpaceDialog>,
     sidebar_section_migration: Option<(String, crate::state::EngineHandle)>,
     section_dialog: Option<sidebar_sections::SectionDialog>,
+    new_orchestrator: crate::orchestration::new_dialog::NewOrchestratorDialog,
     section_menu: Option<(String, Point<Pixels>)>,
     section_header_hover: Option<String>,
     section_menu_focus: FocusHandle,
@@ -2701,6 +2703,7 @@ impl Shell {
             rename_space_dialog: None,
             sidebar_section_migration: None,
             section_dialog: None,
+            new_orchestrator: Default::default(),
             section_menu: None,
             section_header_hover: None,
             section_menu_focus: cx.focus_handle(),
@@ -6430,6 +6433,7 @@ impl Shell {
         self.command_palette.is_some()
             || self.voice.read(cx).stage_open
             || self.section_dialog.is_some()
+            || self.new_orchestrator.open.is_some()
             || self.section_menu.is_some()
             || self.add_space.is_some()
             || self.composer.read(cx).pickers().read(cx).is_open()
@@ -11192,6 +11196,7 @@ impl Shell {
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         overlays.extend(self.render_section_overlays(viewport, window, cx));
+        overlays.extend(self.render_new_orchestrator_overlay(viewport, window, cx));
         if let Some(overlay) = self.render_command_palette(viewport, window, cx) {
             overlays.push(overlay);
         }

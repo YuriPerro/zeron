@@ -62,8 +62,6 @@ fn stacked_height(heights: impl Iterator<Item = f32>) -> f32 {
 }
 
 impl Shell {
-    pub(super) fn open_new_orchestrator(&mut self, _cx: &mut Context<Self>) {}
-
     pub(super) fn orchestrator_row_visible(&self, chat_id: &str, cx: &App) -> bool {
         let state = self.state.read(cx);
         let Some(chat) = state.chats.iter().find(|chat| chat.id == chat_id) else {
@@ -447,12 +445,15 @@ mod tests {
     struct SidebarHost(Entity<Shell>);
 
     impl Render for SidebarHost {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.0.update(cx, |shell, cx| {
+                let viewport = window.viewport_size();
+                let overlay = shell.render_new_orchestrator_overlay(viewport, window, cx);
                 div()
                     .w(px(280.0))
                     .h(px(800.0))
                     .child(shell.render_chat_sidebar(&Theme::default(), cx))
+                    .children(overlay)
             })
         }
     }
@@ -771,17 +772,228 @@ mod tests {
         });
     }
 
+    fn open_dialog(shell: &Entity<Shell>, cx: &mut gpui::VisualTestContext) {
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.local_device_id = Some("dev".into());
+                state.spaces = vec![
+                    space("api", "dev", "/work/api"),
+                    space("web", "dev", "/work/web"),
+                    space("far", "other", "/work/far"),
+                ];
+            });
+            shell.open_new_orchestrator(cx);
+            let dialog = shell.new_orchestrator.open.as_mut().unwrap();
+            dialog
+                .state
+                .set_providers(&[provider(HarnessId::ClaudeCode, "Claude Code")]);
+            dialog.state.set_models(
+                HarnessId::ClaudeCode,
+                crate::popover::Loadable::Ready(vec![zeron_proto::Model {
+                    id: "opus".into(),
+                    label: "Opus".into(),
+                    description: None,
+                    reasoning_levels: vec![zeron_proto::ReasoningLevel::High],
+                    options: Vec::new(),
+                }]),
+            );
+        });
+        redraw(cx);
+    }
+
+    fn space(id: &str, device: &str, path: &str) -> zeron_proto::Space {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "deviceId": device, "path": path,
+            "createdAt": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn provider(id: HarnessId, name: &str) -> zeron_engine::registry::HarnessDescriptor {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": name, "supportsSteering": true,
+            "steeringMode": "step-boundary", "reasoningLevels": []
+        }))
+        .unwrap()
+    }
+
     #[gpui::test]
-    fn add_action_is_inert_until_the_dialog_lands(cx: &mut gpui::TestAppContext) {
+    fn add_action_opens_the_dialog_with_this_devices_projects(cx: &mut gpui::TestAppContext) {
         let (shell, cx) = sidebar(
             cx,
             SidebarOrganization::InOneList,
             fixture(),
             working_fixture(),
         );
-        click(cx, "orchestrators-add");
-        shell.read_with(cx, |shell, _| {
-            assert!(!shell.sidebar_collapsed_groups.contains("orchestrators"));
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.local_device_id = Some("dev".into());
+                state.spaces = vec![
+                    space("web", "dev", "/work/web"),
+                    space("api", "dev", "/work/api"),
+                    space("far", "other", "/work/far"),
+                ];
+            });
         });
+        click(cx, "orchestrators-add");
+        redraw(cx);
+        shell.read_with(cx, |shell, _| {
+            let dialog = shell.new_orchestrator.open.as_ref().expect("dialog opened");
+            let labels: Vec<_> = dialog
+                .state
+                .projects
+                .iter()
+                .map(|project| project.label.as_str())
+                .collect();
+            assert_eq!(labels, vec!["api", "web"]);
+        });
+        assert!(cx.debug_bounds("new-orchestrator-create").is_some());
+        assert!(cx.debug_bounds("new-orchestrator-project-api").is_some());
+        assert!(cx.debug_bounds("new-orchestrator-project-far").is_none());
+    }
+
+    #[gpui::test]
+    fn empty_name_shows_the_message_and_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        click(cx, "new-orchestrator-project-api");
+        click(cx, "new-orchestrator-create");
+        redraw(cx);
+        shell.read_with(cx, |shell, _| {
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            assert_eq!(state.checked, vec!["api".to_owned()]);
+            assert_eq!(state.error.as_deref(), Some("Name is required."));
+            assert!(!state.submitting);
+        });
+        assert!(cx.debug_bounds("new-orchestrator-notice").is_some());
+    }
+
+    #[gpui::test]
+    fn escape_and_cancel_close_the_dialog(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        cx.simulate_keystrokes("escape");
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.new_orchestrator.open.is_none())
+        });
+
+        open_dialog(&shell, cx);
+        click(cx, "new-orchestrator-project-api");
+        cx.simulate_keystrokes("escape");
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.new_orchestrator.open.is_none())
+        });
+
+        open_dialog(&shell, cx);
+        click(cx, "new-orchestrator-cancel");
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.new_orchestrator.open.is_none())
+        });
+    }
+
+    #[gpui::test]
+    fn created_orchestrator_closes_the_dialog_and_opens_its_chat(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        shell.update(cx, |shell, cx| {
+            let session = shell.new_orchestrator.open.as_ref().unwrap().session;
+            shell.land_new_orchestrator(session, Ok("orch".into()), cx);
+            assert!(shell.new_orchestrator.open.is_none());
+            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("orch"));
+            assert!(matches!(shell.route, Route::Chat));
+        });
+    }
+
+    #[gpui::test]
+    fn engine_refusal_keeps_the_dialog_and_its_inputs(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        shell.update(cx, |shell, cx| {
+            let dialog = shell.new_orchestrator.open.as_mut().unwrap();
+            dialog
+                .name
+                .update(cx, |input, cx| input.set_text("Plataforma", cx));
+            dialog.state.toggle_project("web");
+            let session = dialog.session;
+            assert!(dialog.state.begin_submit("Plataforma").is_some());
+            shell.land_new_orchestrator(session, Err("unknown project id `web`".into()), cx);
+            let dialog = shell.new_orchestrator.open.as_ref().unwrap();
+            assert_eq!(
+                dialog.state.error.as_deref(),
+                Some("unknown project id `web`")
+            );
+            assert_eq!(dialog.state.checked, vec!["web".to_owned()]);
+            assert!(!dialog.state.submitting);
+            assert_eq!(dialog.name.read(cx).text(), "Plataforma");
+            assert_eq!(shell.state.read(cx).selected_chat, None);
+        });
+    }
+
+    #[gpui::test]
+    fn a_result_for_a_closed_dialog_opens_nothing(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        shell.update(cx, |shell, cx| {
+            let session = shell.new_orchestrator.open.as_ref().unwrap().session;
+            shell.close_new_orchestrator(cx);
+            shell.land_new_orchestrator(session, Ok("orch".into()), cx);
+            assert_eq!(shell.state.read(cx).selected_chat, None);
+        });
+    }
+
+    #[gpui::test]
+    fn enter_in_the_name_field_submits(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        cx.update(|_, cx| crate::composer::init(cx, Default::default()));
+        open_dialog(&shell, cx);
+        shell.update(cx, |shell, cx| {
+            let dialog = shell.new_orchestrator.open.as_mut().unwrap();
+            dialog.state.toggle_project("api");
+            dialog
+                .name
+                .update(cx, |input, cx| input.set_text("Plataforma", cx));
+        });
+        redraw(cx);
+        cx.simulate_keystrokes("enter");
+        shell.read_with(cx, |shell, _| {
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            assert_eq!(state.error.as_deref(), Some("Engine not connected"));
+            assert!(!state.submitting);
+        });
+    }
+
+    #[gpui::test]
+    fn dialog_shows_provider_model_reasoning_and_children(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        for selector in [
+            "new-orchestrator-provider",
+            "new-orchestrator-model",
+            "new-orchestrator-reasoning",
+            "new-orchestrator-children",
+        ] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector}");
+        }
+    }
+
+    #[gpui::test]
+    fn without_a_connected_provider_create_is_off_and_says_why(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        shell.update(cx, |shell, _| {
+            let dialog = shell.new_orchestrator.open.as_mut().unwrap();
+            dialog.state.set_providers(&[]);
+        });
+        redraw(cx);
+        shell.read_with(cx, |shell, _| {
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            assert_eq!(
+                state.notice().as_deref(),
+                Some("Connect Claude Code or Codex first.")
+            );
+            assert!(!state.can_submit());
+        });
+        assert!(cx.debug_bounds("new-orchestrator-notice").is_some());
+        assert!(cx.debug_bounds("new-orchestrator-provider").is_none());
     }
 }
