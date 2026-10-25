@@ -1235,7 +1235,18 @@ impl DocHost {
                 host.drain_queue(&handle).await;
             });
         }
+        self.spawn_orchestrator_wake_watcher(statuses.clone());
         self.spawn_queue_flush_watcher(statuses);
+    }
+
+    fn spawn_orchestrator_wake_watcher(
+        &self,
+        statuses: watch::Receiver<Vec<zeron_proto::Session>>,
+    ) {
+        self.spawn_worker(crate::orchestration::wake::watch_children(
+            self.clone(),
+            statuses,
+        ));
     }
 
     /// The turn-end hook for held messages. Doc changes drive `drain_queue` for

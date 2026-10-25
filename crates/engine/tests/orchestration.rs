@@ -1,16 +1,22 @@
 //! Orchestration RPCs against a real engine: the store, roles and model
 //! resolution that the MCP server and CLI call.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 
+use zeron_doc::{MessagePart, MessageRole};
+use zeron_engine::orchestration::wake::{ChildStop, wake_message};
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel, SteeringMode,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
+    SteeringMode, UserInputQuestion,
 };
 use zeron_rpc::{RpcClient, methods};
 
@@ -58,9 +64,13 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(Arc::new(CatalogHarness)).await
+}
+
+async fn fixture_with(harness: Arc<dyn Harness>) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let registry = HarnessRegistry::new();
-    registry.register(Arc::new(CatalogHarness));
+    registry.register(harness);
     let core = EngineCore::assemble(
         &tmp.path().join("data"),
         Arc::new(registry),
@@ -410,5 +420,344 @@ async fn resolve_role_model_loads_the_role_locally_before_asking_a_target_for_it
         offline.to_string().contains("remote routing unavailable"),
         "{offline}"
     );
+    fx.core.shutdown().await;
+}
+
+/// Runs hold until the test releases them by prompt, so which chat is busy
+/// and which has stopped is always the test's call. Wake prompts finish at once.
+struct GatedHarness {
+    gates: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    prompts: Mutex<Vec<String>>,
+    ask: Mutex<Option<String>>,
+}
+
+impl GatedHarness {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gates: Mutex::new(HashMap::new()),
+            prompts: Mutex::new(Vec::new()),
+            ask: Mutex::new(None),
+        })
+    }
+
+    fn gate(&self, prompt: &str) -> Arc<tokio::sync::Notify> {
+        self.gates
+            .lock()
+            .unwrap()
+            .entry(prompt.to_string())
+            .or_default()
+            .clone()
+    }
+
+    fn release(&self, prompt: &str) {
+        self.gate(prompt).notify_one();
+    }
+
+    fn started(&self, prompt: &str) -> bool {
+        self.prompts.lock().unwrap().iter().any(|p| p == prompt)
+    }
+
+    fn wakes(&self) -> Vec<String> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|prompt| prompt.starts_with("[Zeron:"))
+            .cloned()
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Harness for GatedHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Gated"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let prompt = request
+            .prompt
+            .split_once("</instructions>\n\n")
+            .map_or(request.prompt.as_str(), |(_, rest)| rest)
+            .to_string();
+        self.prompts.lock().unwrap().push(prompt.clone());
+        let asks = self.ask.lock().unwrap().as_deref() == Some(prompt.as_str());
+        let answer = asks.then(|| {
+            (controls.request_input)(vec![UserInputQuestion {
+                id: "q1".into(),
+                header: "Choose".into(),
+                question: "which one?".into(),
+                options: vec!["a".into(), "b".into()],
+                prefill: None,
+                multiline: false,
+                multi_select: false,
+            }])
+        });
+        let immediate = prompt.starts_with("[Zeron:");
+        let gate = self.gate(&prompt);
+        let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: request.cwd.clone(),
+            session_id: "sess-gated".to_string(),
+            assistant_message_id: format!("a-{prompt}"),
+        })]);
+        let done = futures::stream::once(async move {
+            if !immediate {
+                gate.notified().await;
+            }
+            Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("sess-gated".to_string()),
+            })
+        });
+        Ok(started
+            .chain(done)
+            .inspect(move |_| {
+                let _ = &answer;
+            })
+            .boxed())
+    }
+}
+
+async fn wait_for<F>(mut predicate: F, what: &str)
+where
+    F: FnMut() -> bool,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !predicate() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+async fn create_child(fx: &Fixture, id: &str, parent: &str) {
+    fx.client
+        .call(
+            methods::MUTATE,
+            json!({
+                "op": "createChat", "chatId": id, "parentChatId": parent,
+                "deviceId": fx.core.device_id,
+            }),
+        )
+        .await
+        .expect("createChat");
+    fx.core.workspace.rename_chat(id, id).expect("rename chat");
+}
+
+fn start(fx: &Fixture, chat: &str, prompt: &str) {
+    fx.core
+        .doc_host
+        .queue_message(chat, prompt, Vec::new())
+        .expect("queue message");
+}
+
+fn wakes_in(fx: &Fixture, chat_id: &str) -> Vec<String> {
+    user_texts(fx, chat_id)
+        .into_iter()
+        .filter(|text| text.starts_with("[Zeron:"))
+        .collect()
+}
+
+fn user_texts(fx: &Fixture, chat_id: &str) -> Vec<String> {
+    fx.core
+        .doc_host
+        .open(chat_id)
+        .ok()
+        .and_then(|h| h.doc().read_entries().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.role == MessageRole::User)
+        .map(|entry| {
+            entry
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn child_turn_end_queues_one_message_to_orchestrator() {
+    let harness = GatedHarness::new();
+    let fx = fixture_with(harness.clone()).await;
+    let orchestrator = create_orchestrator(&fx, "Loja", &[]).await["chatId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    create_child(&fx, "child-a", &orchestrator).await;
+
+    start(&fx, "child-a", "work a");
+    wait_for(|| harness.started("work a"), "the child turn to start").await;
+    assert!(wakes_in(&fx, &orchestrator).is_empty());
+
+    harness.release("work a");
+    let expected = wake_message("child-a", "child-a", ChildStop::Finished);
+    wait_for(
+        || wakes_in(&fx, &orchestrator) == [expected.clone()],
+        "the orchestrator to be woken",
+    )
+    .await;
+
+    create_child(&fx, "child-b", &orchestrator).await;
+    start(&fx, "child-b", "work b");
+    harness.release("work b");
+    let expected_b = wake_message("child-b", "child-b", ChildStop::Finished);
+    wait_for(
+        || wakes_in(&fx, &orchestrator).contains(&expected_b),
+        "the sentinel wake",
+    )
+    .await;
+    assert_eq!(
+        wakes_in(&fx, &orchestrator),
+        [expected, expected_b],
+        "one wake per completed child turn"
+    );
+    wait_for(
+        || harness.wakes().len() == 2,
+        "both wakes to reach the harness",
+    )
+    .await;
+    fx.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn child_of_plain_chat_wakes_nobody() {
+    let harness = GatedHarness::new();
+    let fx = fixture_with(harness.clone()).await;
+    let orchestrator = create_orchestrator(&fx, "Loja", &[]).await["chatId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.client
+        .call(
+            methods::MUTATE,
+            json!({ "op": "createChat", "chatId": "plain", "deviceId": fx.core.device_id }),
+        )
+        .await
+        .unwrap();
+    fx.core.workspace.rename_chat("plain", "plain").unwrap();
+    create_child(&fx, "plain-child", "plain").await;
+    create_child(&fx, "sentinel", &orchestrator).await;
+
+    start(&fx, "plain-child", "plain work");
+    wait_for(|| harness.started("plain work"), "the plain child to start").await;
+    harness.release("plain work");
+    wait_for(
+        || {
+            fx.core
+                .sessions
+                .session_status("plain-child")
+                .is_some_and(|s| s.last_completed_turn.is_some())
+        },
+        "the plain child to complete",
+    )
+    .await;
+
+    start(&fx, "sentinel", "sentinel work");
+    harness.release("sentinel work");
+    wait_for(
+        || !wakes_in(&fx, &orchestrator).is_empty(),
+        "the sentinel wake",
+    )
+    .await;
+    assert_eq!(
+        wakes_in(&fx, &orchestrator),
+        [wake_message("sentinel", "sentinel", ChildStop::Finished)]
+    );
+    assert!(wakes_in(&fx, "plain").is_empty());
+    assert!(wakes_in(&fx, "plain-child").is_empty());
+    fx.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_turn_end_wakes_nobody() {
+    let harness = GatedHarness::new();
+    let fx = fixture_with(harness.clone()).await;
+    let orchestrator = create_orchestrator(&fx, "Loja", &[]).await["chatId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    create_child(&fx, "sentinel", &orchestrator).await;
+
+    start(&fx, &orchestrator, "plan it");
+    wait_for(
+        || harness.started("plan it"),
+        "the orchestrator turn to start",
+    )
+    .await;
+    harness.release("plan it");
+    wait_for(
+        || {
+            fx.core
+                .sessions
+                .session_status(&orchestrator)
+                .is_some_and(|s| s.last_completed_turn.is_some())
+        },
+        "the orchestrator turn to complete",
+    )
+    .await;
+
+    start(&fx, "sentinel", "sentinel work");
+    harness.release("sentinel work");
+    wait_for(
+        || !wakes_in(&fx, &orchestrator).is_empty(),
+        "the sentinel wake",
+    )
+    .await;
+    assert_eq!(
+        wakes_in(&fx, &orchestrator),
+        [wake_message("sentinel", "sentinel", ChildStop::Finished)]
+    );
+    fx.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn child_waiting_for_an_answer_wakes_the_orchestrator() {
+    let harness = GatedHarness::new();
+    *harness.ask.lock().unwrap() = Some("ask me".into());
+    let fx = fixture_with(harness.clone()).await;
+    let orchestrator = create_orchestrator(&fx, "Loja", &[]).await["chatId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    create_child(&fx, "child-a", &orchestrator).await;
+
+    start(&fx, "child-a", "ask me");
+    let expected = wake_message("child-a", "child-a", ChildStop::WaitingForAnswer);
+    wait_for(
+        || wakes_in(&fx, &orchestrator) == [expected.clone()],
+        "the awaiting-input wake",
+    )
+    .await;
+    harness.release("ask me");
     fx.core.shutdown().await;
 }
