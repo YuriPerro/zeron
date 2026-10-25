@@ -2432,6 +2432,7 @@ impl Shell {
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
+            this.open_pending_orchestrator(cx);
             cx.notify();
         });
         // A reopened window reuses AppState, so the engine may already be

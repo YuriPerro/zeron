@@ -185,9 +185,17 @@ impl Shell {
                 .map_err(|error| error.to_string())
                 .and_then(parse_created);
             this.update(cx, |this, cx| {
-                if this.orchestrator_dialog_mut(session, &engine, cx).is_some() {
-                    this.land_new_orchestrator(session, created, cx);
-                }
+                let current = this
+                    .state
+                    .read(cx)
+                    .engine()
+                    .is_some_and(|current| current.same_connection(&engine));
+                let created = if current {
+                    created
+                } else {
+                    Err("The connection changed. Try again.".to_owned())
+                };
+                this.land_new_orchestrator(session, created, cx);
             })
             .ok();
         })
@@ -211,11 +219,54 @@ impl Shell {
         match created {
             Ok(chat_id) => {
                 self.new_orchestrator.open = None;
-                self.open_chat(chat_id, cx);
+                self.open_created_orchestrator(chat_id, cx);
             }
             Err(message) => dialog.state.finish_submit(Err(message)),
         }
         cx.notify();
+    }
+
+    fn open_created_orchestrator(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let known = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .any(|chat| chat.id == chat_id);
+        if known {
+            self.new_orchestrator.pending_chat = None;
+            self.reveal_orchestrator_row(&chat_id, cx);
+            self.open_chat(chat_id, cx);
+            return;
+        }
+        self.new_orchestrator.pending_chat = Some(chat_id.clone());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(30))
+                .await;
+            this.update(cx, |this, _| {
+                if this.new_orchestrator.pending_chat.as_ref() == Some(&chat_id) {
+                    this.new_orchestrator.pending_chat = None;
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn open_pending_orchestrator(&mut self, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.new_orchestrator.pending_chat.clone() else {
+            return;
+        };
+        if self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .any(|chat| chat.id == chat_id)
+        {
+            self.open_created_orchestrator(chat_id, cx);
+        }
     }
 
     fn edit_orchestrator_dialog(
@@ -339,6 +390,13 @@ impl Shell {
             }));
 
         let providers = state.provider_list();
+        let provider_loading = state.providers.is_loading().then(|| {
+            div().child(Self::orchestrator_label_row(
+                &theme,
+                "Provider",
+                muted_note(&theme, "Loading…"),
+            ))
+        });
         let host_rows = (!providers.is_empty()).then(|| {
             let ids: Vec<HarnessId> = providers.iter().map(|choice| choice.id).collect();
             let selected = ids
@@ -432,8 +490,7 @@ impl Shell {
                         .children(reasoning)
                         .into_any_element()
                 }
-                Some(Loadable::Error(_)) => muted_note(&theme, "Default"),
-                _ => muted_note(&theme, "Loading…"),
+                _ => muted_note(&theme, state.model_note().unwrap_or("Default")),
             };
 
             let options = state.child_options();
@@ -521,6 +578,7 @@ impl Shell {
                 popover::dialog_field(dialog.name.clone().into_any_element()),
             ))
             .child(Self::orchestrator_label_row(&theme, "Projects", projects))
+            .children(provider_loading)
             .children(host_rows)
             .children(notice)
             .child(

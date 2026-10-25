@@ -263,7 +263,20 @@ impl DialogState {
     pub(crate) fn notice(&self) -> Option<String> {
         self.error
             .clone()
+            .or_else(|| match &self.providers {
+                Loadable::Error(message) => Some(message.clone()),
+                _ => None,
+            })
             .or_else(|| self.disabled_reason().map(str::to_owned))
+    }
+
+    /// What the Model row says when it has no list to pick from.
+    pub(crate) fn model_note(&self) -> Option<&'static str> {
+        match self.current_models() {
+            Some(Loadable::Ready(models)) if !models.is_empty() => None,
+            Some(Loadable::Ready(_) | Loadable::Error(_)) => Some("Default"),
+            _ => Some("Loading…"),
+        }
     }
 
     pub(crate) fn can_submit(&self) -> bool {
@@ -346,12 +359,16 @@ pub(crate) struct NewOrchestratorDialog {
     pub open: Option<OpenDialog>,
     pub selects: DialogSelects,
     pub sessions: u64,
+    pub pending_chat: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::popover::Loadable;
     use serde_json::json;
+    use zeron_engine::registry::HarnessDescriptor;
+    use zeron_proto::{HarnessId, Model, ReasoningLevel, SteeringMode};
 
     fn form() -> NewOrchestratorForm {
         NewOrchestratorForm {
@@ -410,10 +427,6 @@ mod tests {
             }))
         );
     }
-
-    use crate::popover::Loadable;
-    use zeron_engine::registry::HarnessDescriptor;
-    use zeron_proto::{HarnessId, Model, ReasoningLevel, SteeringMode};
 
     fn descriptor(id: HarnessId, name: &str, installed: bool) -> HarnessDescriptor {
         HarnessDescriptor {
@@ -651,5 +664,30 @@ mod tests {
             Ok("c1".to_owned())
         );
         assert!(parse_created(json!({"orchestratorId": "plataforma"})).is_err());
+    }
+
+    #[test]
+    fn provider_load_failure_becomes_the_notice_and_blocks_create() {
+        let mut state = DialogState::new(projects());
+        assert!(matches!(state.providers, Loadable::Loading));
+        assert_eq!(state.notice(), None);
+        assert!(!state.can_submit());
+        state.set_providers_error("engine offline".into());
+        assert_eq!(state.notice().as_deref(), Some("engine offline"));
+        assert!(!state.can_submit());
+        assert!(state.begin_submit("Plataforma").is_none());
+    }
+
+    #[test]
+    fn model_note_follows_the_catalog_state() {
+        let mut state = DialogState::new(projects());
+        state.set_providers(&both());
+        assert_eq!(state.model_note(), Some("Loading…"));
+        state.set_models(HarnessId::ClaudeCode, Loadable::Ready(Vec::new()));
+        assert_eq!(state.model_note(), Some("Default"));
+        state.set_models(HarnessId::ClaudeCode, Loadable::Error("x".into()));
+        assert_eq!(state.model_note(), Some("Default"));
+        state.set_models(HarnessId::ClaudeCode, Loadable::Ready(catalog()));
+        assert_eq!(state.model_note(), None);
     }
 }

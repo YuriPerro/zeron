@@ -897,7 +897,11 @@ mod tests {
         open_dialog(&shell, cx);
         shell.update(cx, |shell, cx| {
             let session = shell.new_orchestrator.open.as_ref().unwrap().session;
+            shell
+                .sidebar_collapsed_groups
+                .insert("orchestrators".into());
             shell.land_new_orchestrator(session, Ok("orch".into()), cx);
+            assert!(!shell.sidebar_collapsed_groups.contains("orchestrators"));
             assert!(shell.new_orchestrator.open.is_none());
             assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("orch"));
             assert!(matches!(shell.route, Route::Chat));
@@ -995,5 +999,51 @@ mod tests {
         });
         assert!(cx.debug_bounds("new-orchestrator-notice").is_some());
         assert!(cx.debug_bounds("new-orchestrator-provider").is_none());
+    }
+
+    #[gpui::test]
+    fn a_chat_not_synced_yet_is_selected_when_it_appears(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        shell.update(cx, |shell, cx| {
+            let session = shell.new_orchestrator.open.as_ref().unwrap().session;
+            shell.land_new_orchestrator(session, Ok("fresh".into()), cx);
+            assert!(shell.new_orchestrator.open.is_none());
+            assert_eq!(shell.state.read(cx).selected_chat, None);
+            assert_eq!(
+                shell.new_orchestrator.pending_chat.as_deref(),
+                Some("fresh")
+            );
+            shell.state.update(cx, |state, cx| {
+                state.chats.push(chat("fresh", None, true, 9));
+                cx.notify();
+            });
+        });
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("fresh"));
+            assert_eq!(shell.new_orchestrator.pending_chat, None);
+        });
+    }
+
+    #[gpui::test]
+    fn a_connection_change_mid_submit_does_not_leave_the_dialog_disabled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, fixture(), Vec::new());
+        open_dialog(&shell, cx);
+        shell.update(cx, |shell, cx| {
+            let dialog = shell.new_orchestrator.open.as_mut().unwrap();
+            dialog.state.toggle_project("api");
+            let session = dialog.session;
+            assert!(dialog.state.begin_submit("Plataforma").is_some());
+            shell.land_new_orchestrator(
+                session,
+                Err("The connection changed. Try again.".into()),
+                cx,
+            );
+            let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
+            assert!(!state.submitting);
+            assert!(state.can_submit());
+        });
     }
 }
