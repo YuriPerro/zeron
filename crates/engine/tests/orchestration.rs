@@ -761,3 +761,50 @@ async fn child_waiting_for_an_answer_wakes_the_orchestrator() {
     harness.release("ask me");
     fx.core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wake_queued_while_the_orchestrator_works_is_delivered_after_its_turn_ends() {
+    let harness = GatedHarness::new();
+    let fx = fixture_with(harness.clone()).await;
+    let orchestrator = create_orchestrator(&fx, "Loja", &[]).await["chatId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    create_child(&fx, "child-a", &orchestrator).await;
+
+    start(&fx, &orchestrator, "plan it");
+    wait_for(
+        || harness.started("plan it"),
+        "the orchestrator turn to start",
+    )
+    .await;
+    start(&fx, "child-a", "work a");
+    harness.release("work a");
+
+    let expected = wake_message("child-a", "child-a", ChildStop::Finished);
+    let queued = || {
+        fx.core
+            .doc_host
+            .open(&orchestrator)
+            .ok()
+            .and_then(|handle| handle.doc().read_queue().ok())
+            .unwrap_or_default()
+    };
+    wait_for(
+        || queued().iter().any(|row| row.text == expected),
+        "the wake to be queued",
+    )
+    .await;
+    assert!(queued().iter().all(|row| row.hold_for_turn_end));
+    assert!(harness.wakes().is_empty());
+    assert!(wakes_in(&fx, &orchestrator).is_empty());
+
+    harness.release("plan it");
+    wait_for(
+        || wakes_in(&fx, &orchestrator) == [expected.clone()],
+        "the wake to be delivered after the turn",
+    )
+    .await;
+    assert!(queued().is_empty());
+    fx.core.shutdown().await;
+}

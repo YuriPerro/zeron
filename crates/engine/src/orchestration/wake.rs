@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use tokio::sync::watch;
-use zeron_proto::{Session, SessionStatus};
+use zeron_proto::{DoneStatus, NativeTurnOutcome, Session, SessionStatus};
 
 use crate::doc_host::DocHost;
 
@@ -56,10 +56,10 @@ impl Seen {
 
 /// Turns successive session snapshots into child stops. Seeded from the first
 /// snapshot without reporting anything, so a restart or a late subscribe never
-/// replays turns that ended before it started looking.
+/// replays turns that ended before it started looking. A stop is a change
+/// between two observed snapshots, so a repeated snapshot never repeats it.
 pub(crate) struct StopTracker {
     seen: HashMap<String, Seen>,
-    last_fired: HashMap<String, String>,
 }
 
 impl StopTracker {
@@ -69,7 +69,6 @@ impl StopTracker {
                 .iter()
                 .map(|session| (session.chat_id.clone(), Seen::of(session)))
                 .collect(),
-            last_fired: HashMap::new(),
         }
     }
 
@@ -80,24 +79,20 @@ impl StopTracker {
                 .seen
                 .insert(session.chat_id.clone(), Seen::of(session))
                 .unwrap_or_else(Seen::baseline);
-            for (stop, key) in transitions(&previous, session) {
-                let key = format!("{}:{key}", session.chat_id);
-                if self.last_fired.get(&session.chat_id) == Some(&key) {
-                    continue;
-                }
-                self.last_fired.insert(session.chat_id.clone(), key);
-                stops.push(ObservedStop {
-                    child_id: session.chat_id.clone(),
-                    stop,
-                });
-            }
+            stops.extend(
+                transitions(&previous, session)
+                    .into_iter()
+                    .map(|stop| ObservedStop {
+                        child_id: session.chat_id.clone(),
+                        stop,
+                    }),
+            );
         }
         stops
     }
 }
 
-fn transitions(previous: &Seen, session: &Session) -> Vec<(ChildStop, String)> {
-    let change = session.updated_at.timestamp_millis();
+fn transitions(previous: &Seen, session: &Session) -> Vec<ChildStop> {
     let turn_advanced = session
         .last_completed_turn
         .as_ref()
@@ -106,56 +101,99 @@ fn transitions(previous: &Seen, session: &Session) -> Vec<(ChildStop, String)> {
         previous.status,
         SessionStatus::Working | SessionStatus::AwaitingInput
     );
+    let interrupted = session
+        .last_turn_outcome
+        .is_some_and(|outcome| outcome.status == DoneStatus::Interrupted);
     let mut found = Vec::new();
-    if let Some(turn) = session
-        .last_completed_turn
-        .as_ref()
-        .filter(|_| turn_advanced)
-    {
-        found.push((ChildStop::Finished, format!("finished:{turn}")));
-    } else if session.status == SessionStatus::Idle && was_active {
-        found.push((ChildStop::Finished, format!("finished:{change}")));
+    if turn_advanced || (session.status == SessionStatus::Idle && was_active && interrupted) {
+        found.push(ChildStop::Finished);
     }
     match session.status {
         SessionStatus::AwaitingInput if previous.status != SessionStatus::AwaitingInput => {
-            found.push((ChildStop::WaitingForAnswer, format!("awaiting:{change}")));
+            found.push(ChildStop::WaitingForAnswer);
         }
         SessionStatus::Errored if previous.status != SessionStatus::Errored => {
-            found.push((ChildStop::Failed, format!("failed:{change}")));
+            found.push(ChildStop::Failed);
         }
         _ => {}
     }
     found
 }
 
-pub(crate) async fn watch_children(host: DocHost, mut statuses: watch::Receiver<Vec<Session>>) {
-    let mut tracker = StopTracker::seeded(&statuses.borrow_and_update());
-    while statuses.changed().await.is_ok() {
-        let snapshot = statuses.borrow_and_update().clone();
-        for stop in tracker.observe(&snapshot) {
-            wake_parent(&host, &stop);
+enum Delivery {
+    Done,
+    ChildMissing,
+}
+
+/// Keeps stops whose child row had not synced yet for exactly one more
+/// attempt on the next snapshot.
+#[derive(Default)]
+struct Retries {
+    pending: Vec<ObservedStop>,
+}
+
+impl Retries {
+    fn deliver(
+        &mut self,
+        fresh: Vec<ObservedStop>,
+        mut attempt: impl FnMut(&ObservedStop) -> Delivery,
+    ) {
+        for stop in std::mem::take(&mut self.pending) {
+            if let Delivery::ChildMissing = attempt(&stop) {
+                tracing::warn!(child = %stop.child_id, "orchestrator wake dropped: child row never appeared");
+            }
+        }
+        for stop in fresh {
+            if let Delivery::ChildMissing = attempt(&stop) {
+                self.pending.push(stop);
+            }
         }
     }
 }
 
-fn wake_parent(host: &DocHost, stop: &ObservedStop) {
+pub(crate) async fn watch_children(host: DocHost, mut statuses: watch::Receiver<Vec<Session>>) {
+    let mut tracker = StopTracker::seeded(&statuses.borrow_and_update());
+    let mut retries = Retries::default();
+    while statuses.changed().await.is_ok() {
+        let snapshot = statuses.borrow_and_update().clone();
+        retries.deliver(tracker.observe(&snapshot), |stop| wake_parent(&host, stop));
+    }
+}
+
+fn wake_parent(host: &DocHost, stop: &ObservedStop) -> Delivery {
     let Some(workspace) = host.workspace() else {
-        return;
+        return Delivery::Done;
     };
-    let Ok(Some(child)) = workspace.chat(&stop.child_id) else {
-        return;
+    let child = match workspace.chat(&stop.child_id) {
+        Ok(Some(child)) => child,
+        Ok(None) => {
+            tracing::debug!(child = %stop.child_id, "orchestrator wake waiting: child row not synced yet");
+            return Delivery::ChildMissing;
+        }
+        Err(error) => {
+            tracing::warn!(child = %stop.child_id, %error, "orchestrator wake dropped: child lookup failed");
+            return Delivery::Done;
+        }
     };
     let Some(parent_id) = child.parent_chat_id.as_deref() else {
-        return;
+        return Delivery::Done;
     };
-    let Ok(Some(parent)) = workspace.chat(parent_id) else {
-        return;
+    let parent = match workspace.chat(parent_id) {
+        Ok(Some(parent)) => parent,
+        Ok(None) => {
+            tracing::debug!(child = %child.id, parent = %parent_id, "orchestrator wake skipped: parent row missing");
+            return Delivery::Done;
+        }
+        Err(error) => {
+            tracing::warn!(child = %child.id, parent = %parent_id, %error, "orchestrator wake dropped: parent lookup failed");
+            return Delivery::Done;
+        }
     };
     if parent
         .config
         .is_none_or(|config| config.orchestrator.is_none())
     {
-        return;
+        return Delivery::Done;
     }
     if parent.device_id != host.device_id() {
         tracing::debug!(
@@ -167,9 +205,10 @@ fn wake_parent(host: &DocHost, stop: &ObservedStop) {
     }
     let title = child.title.as_deref().unwrap_or(&child.id);
     let text = wake_message(title, &child.id, stop.stop);
-    if let Err(error) = host.queue_message(parent_id, &text, Vec::new()) {
+    if let Err(error) = host.queue_message_with_behavior(parent_id, &text, Vec::new(), true) {
         tracing::warn!(parent = %parent_id, child = %child.id, %error, "orchestrator wake failed");
     }
+    Delivery::Done
 }
 
 #[cfg(test)]
@@ -251,12 +290,99 @@ mod tests {
         assert_eq!(stops[0].stop, ChildStop::Finished);
     }
 
+    fn settled_with(mut row: Session, outcome: DoneStatus) -> Session {
+        row.last_turn_outcome = Some(NativeTurnOutcome {
+            status: outcome,
+            finished_at: row.updated_at,
+        });
+        row
+    }
+
     #[test]
-    fn an_interrupt_wakes_as_finished_without_a_turn_marker() {
+    fn an_interrupt_wakes_once_as_finished_without_a_turn_marker() {
         let mut tracker = StopTracker::seeded(&[session("c", SessionStatus::Working, None, 1)]);
-        let stops = tracker.observe(&[session("c", SessionStatus::Idle, None, 2)]);
+        let interrupted = settled_with(
+            session("c", SessionStatus::Idle, None, 2),
+            DoneStatus::Interrupted,
+        );
+        let stops = tracker.observe(&[interrupted.clone()]);
         assert_eq!(stops.len(), 1);
         assert_eq!(stops[0].stop, ChildStop::Finished);
+        assert!(tracker.observe(&[interrupted]).is_empty());
+    }
+
+    #[test]
+    fn a_handoff_is_not_a_stop_and_its_continuation_wakes_once() {
+        let mut tracker = StopTracker::seeded(&[session("c", SessionStatus::Working, None, 1)]);
+        let handoff = settled_with(
+            session("c", SessionStatus::Idle, None, 2),
+            DoneStatus::Completed,
+        );
+        assert!(tracker.observe(&[handoff]).is_empty());
+        assert!(
+            tracker
+                .observe(&[session("c", SessionStatus::Working, None, 3)])
+                .is_empty()
+        );
+        let done = settled_with(
+            session("c", SessionStatus::Idle, Some("t1"), 4),
+            DoneStatus::Completed,
+        );
+        assert_eq!(tracker.observe(&[done]).len(), 1);
+    }
+
+    #[test]
+    fn an_error_wakes_again_after_the_child_recovers_and_fails_anew() {
+        let mut tracker = StopTracker::seeded(&[session("c", SessionStatus::Working, None, 1)]);
+        let failed = |at| session("c", SessionStatus::Errored, None, at);
+        assert_eq!(tracker.observe(&[failed(2)])[0].stop, ChildStop::Failed);
+        assert!(
+            tracker
+                .observe(&[session("c", SessionStatus::Working, None, 3)])
+                .is_empty()
+        );
+        assert_eq!(tracker.observe(&[failed(4)])[0].stop, ChildStop::Failed);
+    }
+
+    fn stop(child: &str) -> ObservedStop {
+        ObservedStop {
+            child_id: child.into(),
+            stop: ChildStop::Finished,
+        }
+    }
+
+    #[test]
+    fn a_stop_whose_child_row_is_missing_retries_once_on_the_next_snapshot() {
+        let mut retries = Retries::default();
+        let mut attempts = 0;
+        retries.deliver(vec![stop("c")], |_| {
+            attempts += 1;
+            Delivery::ChildMissing
+        });
+        assert_eq!(attempts, 1);
+        retries.deliver(vec![], |_| {
+            attempts += 1;
+            Delivery::Done
+        });
+        assert_eq!(attempts, 2);
+        retries.deliver(vec![], |_| {
+            attempts += 1;
+            Delivery::Done
+        });
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn a_stop_whose_child_row_never_appears_is_dropped_after_one_retry() {
+        let mut retries = Retries::default();
+        let mut attempts = 0;
+        for fresh in [vec![stop("c")], vec![], vec![]] {
+            retries.deliver(fresh, |_| {
+                attempts += 1;
+                Delivery::ChildMissing
+            });
+        }
+        assert_eq!(attempts, 2);
     }
 
     #[test]
