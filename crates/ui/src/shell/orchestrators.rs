@@ -100,11 +100,12 @@ impl Shell {
             .find(|chat| chat.id == chat_id)
             .is_some_and(|chat| {
                 is_orchestrator(chat)
-                    || chat.parent_chat_id.as_deref().is_some_and(|parent| {
-                        chats
-                            .iter()
-                            .any(|candidate| candidate.id == parent && is_orchestrator(candidate))
-                    })
+                    || !chat.archived
+                        && chat.parent_chat_id.as_deref().is_some_and(|parent| {
+                            chats.iter().any(|candidate| {
+                                candidate.id == parent && is_orchestrator(candidate)
+                            })
+                        })
             })
     }
 
@@ -1230,6 +1231,21 @@ mod tests {
         shell.read_with(cx, |shell, cx| {
             assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("plain"));
             assert_eq!(shell.new_orchestrator.pending_chat, None);
+        });
+    }
+
+    #[gpui::test]
+    fn archived_child_renames_outside_the_orchestrators_section(cx: &mut gpui::TestAppContext) {
+        let mut archived = chat("old", Some("orch"), false, 5);
+        archived.archived = true;
+        let mut chats = fixture();
+        chats.push(archived);
+        let (shell, cx) = sidebar(cx, SidebarOrganization::InOneList, chats, working_fixture());
+        shell.update(cx, |shell, cx| {
+            assert!(!shell.in_orchestrator_section("old", cx));
+            assert!(shell.in_orchestrator_section("work", cx));
+            shell.open_rename_chat("old".into(), cx);
+            assert!(shell.chat_rename.is_none());
         });
     }
 }

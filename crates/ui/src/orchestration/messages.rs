@@ -229,6 +229,34 @@ mod tests {
     }
 
     #[test]
+    fn empty_bodies_still_classify() {
+        let reply = "Reply to it with the Zeron `send_message` tool, chat";
+        for (text, demand) in [
+            (
+                format!("[Message from Zeron chat Plataforma (9db29bd0). {reply} {ID}.]\n\n"),
+                None,
+            ),
+            (
+                format!("[Contract change requested by Kid ({ID}) for demand d-1]\n\n"),
+                Some("d-1".to_owned()),
+            ),
+        ] {
+            let MessageOrigin::FromChat {
+                chat_id,
+                body,
+                contract_demand,
+                ..
+            } = classify_message(&text)
+            else {
+                panic!("not classified: {text:?}");
+            };
+            assert_eq!(chat_id, ID);
+            assert_eq!(body, "");
+            assert_eq!(contract_demand, demand);
+        }
+    }
+
+    #[test]
     fn child_event_text_matches_copy() {
         assert_eq!(
             child_event_text("api", ChildEventKind::Failed),
