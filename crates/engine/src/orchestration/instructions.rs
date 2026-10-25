@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use zeron_proto::Chat;
+use zeron_proto::{Chat, HarnessId, RunRequest};
 
 use super::roles::load_roles;
 use super::store::Store;
@@ -62,9 +62,18 @@ fn orchestrator_instructions(id: &str, data_dir: &Path) -> Option<String> {
     Some(text)
 }
 
-/// Folds run instructions into the first prompt for harnesses that have no
-/// system-prompt channel of their own.
-pub fn prefix_first_prompt(instructions: &str, prompt: &str) -> String {
+/// Folds run instructions into the first prompt of a fresh session on harnesses
+/// that have no system-prompt channel of their own.
+pub fn fold_into_first_prompt(harness: HarnessId, request: &mut RunRequest) {
+    if matches!(harness, HarnessId::ClaudeCode | HarnessId::Codex) || request.resume.is_some() {
+        return;
+    }
+    if let Some(instructions) = &request.instructions {
+        request.prompt = prefix_first_prompt(instructions, &request.prompt);
+    }
+}
+
+fn prefix_first_prompt(instructions: &str, prompt: &str) -> String {
     format!("<instructions>\n{instructions}\n</instructions>\n\n{prompt}")
 }
 
@@ -72,7 +81,7 @@ pub fn prefix_first_prompt(instructions: &str, prompt: &str) -> String {
 mod tests {
     use super::*;
     use crate::orchestration::store::{OrchestratorConfig, Store};
-    use zeron_proto::{ChatConfig, HarnessId, SandboxLevel};
+    use zeron_proto::{ChatConfig, SandboxLevel};
 
     fn chat(id: &str, role: Option<&str>, orchestrator: Option<&str>) -> Chat {
         let mut chat: Chat = serde_json::from_value(serde_json::json!({
@@ -237,6 +246,44 @@ mod tests {
             instructions_for(&chat("c2", None, Some("ghost")), None, dir.path()),
             None
         );
+    }
+
+    fn request(resume: Option<&str>) -> RunRequest {
+        RunRequest {
+            instructions: Some("A".into()),
+            mcp: None,
+            prompt: "B".into(),
+            harness: None,
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            cwd: "/tmp".into(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            resume: resume.map(str::to_owned),
+            attachments: Vec::new(),
+            worktree: None,
+            env: Default::default(),
+        }
+    }
+
+    #[test]
+    fn instructions_fold_into_a_fresh_prompt_only_where_the_harness_has_no_channel() {
+        let folded = "<instructions>\nA\n</instructions>\n\nB";
+
+        let mut hermes = request(None);
+        fold_into_first_prompt(HarnessId::Hermes, &mut hermes);
+        assert_eq!(hermes.prompt, folded);
+
+        let mut resumed = request(Some("thread"));
+        fold_into_first_prompt(HarnessId::Hermes, &mut resumed);
+        assert_eq!(resumed.prompt, "B");
+
+        for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
+            let mut native = request(None);
+            fold_into_first_prompt(harness, &mut native);
+            assert_eq!(native.prompt, "B");
+        }
     }
 
     #[test]

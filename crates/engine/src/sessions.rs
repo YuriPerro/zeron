@@ -406,12 +406,12 @@ impl SessionsEngine {
         let _ = self.inner.data_dir.set(dir);
     }
 
+    /// Bind generated-image intake to the same profile store used by attachment RPCs.
     /// Where projectless chats' scratch folders resolve (set once at boot).
     pub(crate) fn set_scratch_root(&self, root: std::path::PathBuf) {
         let _ = self.inner.scratch_root.set(root);
     }
 
-    /// Bind generated-image intake to the same profile store used by attachment RPCs.
     pub fn set_generated_images(
         &self,
         uploads: crate::uploads::Uploads,
@@ -3557,17 +3557,10 @@ async fn drive_run(
                     wire_request.prompt =
                         zeron_proto::invocation::harness_prompt(&wire_request.prompt, harness_id);
                 }
-                if !matches!(harness_id, HarnessId::ClaudeCode | HarnessId::Codex)
-                    && wire_request.resume.is_none()
-                {
-                    if let Some(instructions) = &wire_request.instructions {
-                        wire_request.prompt =
-                            crate::orchestration::instructions::prefix_first_prompt(
-                                instructions,
-                                &wire_request.prompt,
-                            );
-                    }
-                }
+                crate::orchestration::instructions::fold_into_first_prompt(
+                    harness_id,
+                    &mut wire_request,
+                );
                 // Host-resolved spawn env (a Cloud device's credential broker);
                 // `RunRequest::env` is serde-skipped, never persisted.
                 match inner
