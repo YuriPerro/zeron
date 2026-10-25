@@ -187,6 +187,48 @@ mod tests {
     }
 
     #[test]
+    fn edge_cases_classify_as_expected() {
+        let verb = CHILD_EVENT_VERBS[0].0;
+        let reply = "Reply to it with the Zeron `send_message` tool, chat";
+        let finished = |title: &str| MessageOrigin::ChildEvent {
+            chat_id: "abc".into(),
+            title: title.into(),
+            kind: ChildEventKind::Finished,
+        };
+        let from_chat = |label: &str, body: &str, demand: Option<&str>| MessageOrigin::FromChat {
+            chat_id: ID.into(),
+            label: label.into(),
+            body: body.into(),
+            contract_demand: demand.map(str::to_owned),
+        };
+        let cases: Vec<(String, MessageOrigin)> = vec![
+            (
+                event(") finished its turn. Read it with read_chat.", "abc", verb),
+                finished(") finished its turn. Read it with read_chat."),
+            ),
+            (event("two\nlines", "abc", verb), finished("two\nlines")),
+            (format!("{}\n", event("api", "abc", verb)), finished("api")),
+            (
+                format!(
+                    "[Message from Zeron chat Plataforma (9db29bd0). {reply} {ID}.]\n\nsee [a]\n\nand ]\n\nmore"
+                ),
+                from_chat("Plataforma", "see [a]\n\nand ]\n\nmore", None),
+            ),
+            (
+                format!("[Message from Zeron chat 9db29bd0. {reply} {ID}.]\n\nhi"),
+                from_chat("9db29bd0", "hi", None),
+            ),
+            (
+                format!("[Contract change requested by 9db29bd0 ({ID}) for demand d-1]\n\nwhy"),
+                from_chat("9db29bd0", "why", Some("d-1")),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(classify_message(&text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
     fn child_event_text_matches_copy() {
         assert_eq!(
             child_event_text("api", ChildEventKind::Failed),

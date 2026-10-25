@@ -37,10 +37,12 @@ pub(crate) fn orchestrator_groups(chats: &[(Chat, ChatIndicator)]) -> Vec<Orches
     let mut children_of: HashMap<&str, Vec<&(Chat, ChatIndicator)>> = HashMap::new();
     for entry in chats {
         let chat = &entry.0;
-        if chat.archived {
+        if chat.archived || is_orchestrator(chat) {
             continue;
         }
-        if let Some(parent) = chat.parent_chat_id.as_deref() {
+        if let Some(parent) = chat.parent_chat_id.as_deref()
+            && parent != chat.id
+        {
             children_of.entry(parent).or_default().push(entry);
         }
     }
@@ -202,6 +204,21 @@ mod tests {
             (child("side", "plain", 2), Working),
         ];
         assert!(orchestrator_groups(&chats).is_empty());
+    }
+
+    #[test]
+    fn orchestrator_is_never_listed_as_a_child() {
+        let chats = vec![
+            (orch("o", 1), Idle),
+            (chat("nested", Some("o"), true, 2), Working),
+            (chat("selfie", Some("selfie"), true, 3), Working),
+            (child("real", "o", 4), Working),
+        ];
+        let groups = orchestrator_groups(&chats);
+        let by_id = |id: &str| groups.iter().find(|g| g.chat_id == id).unwrap();
+        assert_eq!(by_id("o").active_children, ["real"]);
+        assert!(by_id("selfie").active_children.is_empty());
+        assert!(by_id("selfie").done_children.is_empty());
     }
 
     #[test]
