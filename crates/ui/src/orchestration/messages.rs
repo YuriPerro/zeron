@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChildEventKind {
+pub enum ChildEventKind {
     Finished,
     WaitingForAnswer,
     Failed,

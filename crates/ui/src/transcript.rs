@@ -1115,6 +1115,12 @@ pub enum RowKind {
         from_harness: Option<HarnessId>,
         to_harness: Option<HarnessId>,
     },
+    /// An engine wake notice about an orchestrator's child, as a compact line.
+    ChildEvent {
+        chat_id: SharedString,
+        title: SharedString,
+        kind: crate::orchestration::messages::ChildEventKind,
+    },
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1370,6 +1376,11 @@ pub fn rows_for_entry(
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
+        if let Some(row) =
+            crate::orchestration::transcript_rows::row_for_message(entry, &body, raw.len(), pending)
+        {
+            return vec![row];
+        }
         let body = agent_message_display(&body);
         // Chips stand in for their attachments: those leave the strip, and a
         // chip carries its upload's path for its progress and, for an image,
@@ -7665,6 +7676,19 @@ impl Transcript {
                 from_harness,
                 to_harness,
             } => switch_marker(from.clone(), to.clone(), *from_harness, *to_harness, &theme),
+            RowKind::ChildEvent {
+                chat_id,
+                title,
+                kind,
+            } => crate::orchestration::transcript_rows::child_event_line(
+                &row.id,
+                chat_id,
+                title,
+                *kind,
+                &self.state,
+                &theme,
+                cx,
+            ),
         };
         // Diagram fences this row just requested start rendering after layout.
         self.ensure_diagram_worker(cx);
