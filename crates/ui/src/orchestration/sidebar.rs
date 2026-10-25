@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
 
 use gpui::AnyElement;
@@ -45,10 +46,12 @@ fn is_active(indicator: ChatIndicator) -> bool {
     )
 }
 
-pub(crate) fn orchestrator_groups(chats: &[(Chat, ChatIndicator)]) -> Vec<OrchestratorGroup> {
-    let mut children_of: HashMap<&str, Vec<&(Chat, ChatIndicator)>> = HashMap::new();
+pub(crate) fn orchestrator_groups<C: Borrow<Chat>>(
+    chats: &[(C, ChatIndicator)],
+) -> Vec<OrchestratorGroup> {
+    let mut children_of: HashMap<&str, Vec<&(C, ChatIndicator)>> = HashMap::new();
     for entry in chats {
-        let chat = &entry.0;
+        let chat = entry.0.borrow();
         if chat.archived || is_orchestrator(chat) {
             continue;
         }
@@ -59,17 +62,18 @@ pub(crate) fn orchestrator_groups(chats: &[(Chat, ChatIndicator)]) -> Vec<Orches
         }
     }
 
-    let mut orchestrators: Vec<&(Chat, ChatIndicator)> = chats
+    let mut orchestrators: Vec<&(C, ChatIndicator)> = chats
         .iter()
-        .filter(|(chat, _)| is_orchestrator(chat))
+        .filter(|(chat, _)| is_orchestrator(chat.borrow()))
         .collect();
-    orchestrators.sort_by_key(|(chat, _)| std::cmp::Reverse(recency(chat)));
+    orchestrators.sort_by_key(|(chat, _)| std::cmp::Reverse(recency(chat.borrow())));
 
     orchestrators
         .into_iter()
         .map(|(chat, indicator)| {
+            let chat = chat.borrow();
             let mut children = children_of.remove(chat.id.as_str()).unwrap_or_default();
-            children.sort_by_key(|(child, _)| std::cmp::Reverse(recency(child)));
+            children.sort_by_key(|(child, _)| std::cmp::Reverse(recency(child.borrow())));
             let (active, done): (Vec<_>, Vec<_>) = children
                 .into_iter()
                 .partition(|(_, indicator)| is_active(*indicator));
@@ -78,8 +82,14 @@ pub(crate) fn orchestrator_groups(chats: &[(Chat, ChatIndicator)]) -> Vec<Orches
                 name: display_name(chat).to_owned(),
                 indicator: *indicator,
                 needs_you: *indicator == ChatIndicator::AwaitingInput,
-                active_children: active.into_iter().map(|(c, _)| c.id.clone()).collect(),
-                done_children: done.into_iter().map(|(c, _)| c.id.clone()).collect(),
+                active_children: active
+                    .into_iter()
+                    .map(|(c, _)| c.borrow().id.clone())
+                    .collect(),
+                done_children: done
+                    .into_iter()
+                    .map(|(c, _)| c.borrow().id.clone())
+                    .collect(),
             }
         })
         .collect()

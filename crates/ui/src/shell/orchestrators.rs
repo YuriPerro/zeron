@@ -6,7 +6,7 @@ use spaces::{
     ActiveChatRow, SIDEBAR_DISCLOSURE_BODY_INSET, SIDEBAR_DISCLOSURE_HEADER_HEIGHT,
     SIDEBAR_SECTION_GAP,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use zeron_proto::ChatIndicator;
 
 const ORCHESTRATORS_KEY: &str = "orchestrators";
@@ -14,28 +14,68 @@ const CHILD_INDENT: f32 = 16.0;
 
 type SectionRow = (f32, AnyElement);
 
+fn done_key(chat_id: &str) -> String {
+    format!("orchestrator-done:{chat_id}")
+}
+
+fn orchestrator_entries<'a>(
+    state: &'a AppState,
+    now: chrono::DateTime<Utc>,
+) -> Vec<(&'a zeron_proto::Chat, ChatIndicator)> {
+    let orchestrators: std::collections::HashSet<&str> = state
+        .chats
+        .iter()
+        .filter(|chat| is_orchestrator(chat))
+        .map(|chat| chat.id.as_str())
+        .collect();
+    if orchestrators.is_empty() {
+        return Vec::new();
+    }
+    state
+        .chats
+        .iter()
+        .filter(|chat| {
+            orchestrators.contains(chat.id.as_str())
+                || chat
+                    .parent_chat_id
+                    .as_deref()
+                    .is_some_and(|parent| orchestrators.contains(parent))
+        })
+        .map(|chat| (chat, state.display_status_for(chat, now)))
+        .collect()
+}
+
+fn row_height(settings: &UiSettings, row: &ActiveChatRow) -> f32 {
+    sidebar_row_height(
+        settings.sidebar_compact,
+        settings.sidebar_show_project_label,
+        row.branch.is_some(),
+        row.change_request.is_some(),
+    )
+}
+
+fn stacked_height(heights: impl Iterator<Item = f32>) -> f32 {
+    let (total, count) = heights.fold((0.0, 0usize), |(total, count), height| {
+        (total + height, count + 1)
+    });
+    total + SIDEBAR_LIST_GAP * count.saturating_sub(1) as f32
+}
+
 impl Shell {
     pub(super) fn open_new_orchestrator(&mut self, _cx: &mut Context<Self>) {}
 
-    fn orchestrator_entries(
-        &self,
-        now: chrono::DateTime<Utc>,
-        cx: &App,
-    ) -> Vec<(zeron_proto::Chat, ChatIndicator)> {
-        let state = self.state.read(cx);
-        state
-            .chats
-            .iter()
-            .filter(|chat| is_orchestrator(chat) || chat.parent_chat_id.is_some())
-            .map(|chat| (chat.clone(), state.display_status_for(chat, now)))
-            .collect()
-    }
-
     pub(super) fn orchestrator_row_visible(&self, chat_id: &str, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        let Some(chat) = state.chats.iter().find(|chat| chat.id == chat_id) else {
+            return false;
+        };
+        if !is_orchestrator(chat) && chat.parent_chat_id.is_none() {
+            return false;
+        }
         if self.sidebar_collapsed_groups.contains(ORCHESTRATORS_KEY) {
             return false;
         }
-        let entries = self.orchestrator_entries(Utc::now(), cx);
+        let entries = orchestrator_entries(state, Utc::now());
         orchestrator_groups(&entries).iter().any(|group| {
             let done_shown = self.orchestrator_done_open.contains(&group.chat_id);
             group.chat_id == chat_id
@@ -44,32 +84,44 @@ impl Shell {
         })
     }
 
+    pub(super) fn reveal_orchestrator_row(&mut self, chat_id: &str, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        let entries = orchestrator_entries(state, Utc::now());
+        let groups = orchestrator_groups(&entries);
+        let Some(group) = groups.iter().find(|group| {
+            group.chat_id == chat_id
+                || group.active_children.iter().any(|id| id == chat_id)
+                || group.done_children.iter().any(|id| id == chat_id)
+        }) else {
+            return false;
+        };
+        let in_done = group.done_children.iter().any(|id| id == chat_id);
+        let group_id = group.chat_id.clone();
+        if self.sidebar_collapsed_groups.remove(ORCHESTRATORS_KEY) {
+            self.queue_sidebar_reveal(ORCHESTRATORS_KEY);
+        }
+        if in_done && self.orchestrator_done_open.insert(group_id.clone()) {
+            self.queue_sidebar_reveal(&done_key(&group_id));
+        }
+        true
+    }
+
     fn orchestrator_row_data(
         &self,
         now: chrono::DateTime<Utc>,
         cx: &App,
     ) -> (Vec<OrchestratorGroup>, HashMap<String, ActiveChatRow>) {
-        let entries = self.orchestrator_entries(now, cx);
         let state = self.state.read(cx);
+        let entries = orchestrator_entries(state, now);
         let groups = orchestrator_groups(&entries);
-        let shown: HashSet<&str> = groups
-            .iter()
-            .flat_map(|group| {
-                let done: &[String] = if self.orchestrator_done_open.contains(&group.chat_id) {
-                    &group.done_children
-                } else {
-                    &[]
-                };
-                std::iter::once(&group.chat_id)
-                    .chain(&group.active_children)
-                    .chain(done)
-            })
-            .map(String::as_str)
-            .collect();
         let rows = entries
             .into_iter()
-            .filter(|(chat, _)| shown.contains(chat.id.as_str()))
-            .map(|(chat, status)| (chat.id.clone(), self.sidebar_chat_data(status, chat, state)))
+            .map(|(chat, status)| {
+                (
+                    chat.id.clone(),
+                    self.sidebar_chat_data(status, chat.clone(), state),
+                )
+            })
             .collect();
         (groups, rows)
     }
@@ -83,6 +135,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> SectionRow {
+        let height = row_height(&self.settings, &row);
         let ActiveChatRow {
             status,
             chat,
@@ -97,12 +150,6 @@ impl Shell {
             .sidebar_show_harness
             .then(|| chat.config.as_ref().map(|config| config.harness))
             .flatten();
-        let height = sidebar_row_height(
-            self.settings.sidebar_compact,
-            self.settings.sidebar_show_project_label,
-            branch.is_some(),
-            change_request.is_some(),
-        );
         let element = self.render_chat_row(
             chat.id.clone(),
             transcript::single_line(&title).into(),
@@ -130,22 +177,60 @@ impl Shell {
         (height, element)
     }
 
-    fn render_orchestrator_done_header(
-        &self,
-        chat_id: &str,
-        count: usize,
-        open: bool,
+    fn render_orchestrator_done(
+        &mut self,
+        group: &OrchestratorGroup,
+        data: &mut HashMap<String, ActiveChatRow>,
+        now: chrono::DateTime<Utc>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> SectionRow {
-        let key = format!("orchestrator-done:{chat_id}");
+        let key = done_key(&group.chat_id);
+        let open = self.orchestrator_done_open.contains(&group.chat_id);
+        let rows: Vec<ActiveChatRow> = group
+            .done_children
+            .iter()
+            .filter_map(|id| data.remove(id))
+            .collect();
+        let list_height = SIDEBAR_LIST_GAP
+            + stacked_height(rows.iter().map(|row| row_height(&self.settings, row)));
+        self.begin_queued_sidebar_reveal(&key, open, list_height);
+        let animating = self
+            .sidebar_disclosure_motion
+            .get(&key)
+            .is_some_and(|motion| motion.animating());
+
+        let body = (open || animating).then(|| {
+            let items: Vec<AnyElement> = rows
+                .into_iter()
+                .map(|row| {
+                    let title = row
+                        .chat
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "New session".into());
+                    self.render_orchestrator_chat_row(row, title, true, now, theme, cx)
+                        .1
+                })
+                .collect();
+            let list = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_LIST_GAP))
+                .gap(px(SIDEBAR_LIST_GAP))
+                .children(items);
+            self.render_sidebar_disclosure_body(&key, open, list_height, list.into_any_element())
+        });
+
         let chevron = self.sidebar_disclosure_chevron(&key, open, theme);
-        let toggled = chat_id.to_owned();
-        let selector = format!("orchestrator-done-{chat_id}");
+        let toggled = group.chat_id.clone();
+        let motion_key = key.clone();
+        let selector = format!("orchestrator-done-{}", group.chat_id);
         let header = spaces::sidebar_disclosure_header(
             theme,
             None,
-            format!("{count} done").into(),
+            format!("{} done", group.done_children.len()).into(),
             None,
             None,
             chevron,
@@ -154,12 +239,26 @@ impl Shell {
         .id(SharedString::from(key))
         .debug_selector(move || selector.clone())
         .on_click(cx.listener(move |this, _, _, cx| {
-            if !this.orchestrator_done_open.remove(&toggled) {
+            let was_open = this.orchestrator_done_open.remove(&toggled);
+            if !was_open {
                 this.orchestrator_done_open.insert(toggled.clone());
             }
+            this.begin_sidebar_disclosure_motion(
+                &motion_key,
+                if was_open { list_height } else { 0.0 },
+                if was_open { 0.0 } else { list_height },
+            );
             cx.notify();
         }));
-        (SIDEBAR_DISCLOSURE_HEADER_HEIGHT, header.into_any_element())
+        let height = SIDEBAR_DISCLOSURE_HEADER_HEIGHT + if open { list_height } else { 0.0 };
+        let element = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .children(body)
+            .into_any_element();
+        (height, element)
     }
 
     fn render_orchestrators_add(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -212,22 +311,7 @@ impl Shell {
                     cx,
                 ));
             }
-            let done_open = self.orchestrator_done_open.contains(&group.chat_id);
-            let mut children: Vec<&String> = group.active_children.iter().collect();
-            let done_at = children.len();
-            if done_open {
-                children.extend(&group.done_children);
-            }
-            for (index, child_id) in children.into_iter().enumerate() {
-                if index == done_at {
-                    items.push(self.render_orchestrator_done_header(
-                        &group.chat_id,
-                        group.done_children.len(),
-                        true,
-                        theme,
-                        cx,
-                    ));
-                }
+            for child_id in &group.active_children {
                 if let Some(row) = data.remove(child_id) {
                     let title = row
                         .chat
@@ -237,22 +321,16 @@ impl Shell {
                     items.push(self.render_orchestrator_chat_row(row, title, true, now, theme, cx));
                 }
             }
-            if !done_open && !group.done_children.is_empty() {
-                items.push(self.render_orchestrator_done_header(
-                    &group.chat_id,
-                    group.done_children.len(),
-                    false,
-                    theme,
-                    cx,
-                ));
+            if !group.done_children.is_empty() {
+                items.push(self.render_orchestrator_done(group, &mut data, now, theme, cx));
             }
         }
 
         let collapsed = self.sidebar_collapsed_groups.contains(ORCHESTRATORS_KEY);
         let has_rows = !items.is_empty();
-        let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
-            + items.iter().map(|(height, _)| *height).sum::<f32>()
-            + SIDEBAR_LIST_GAP * items.len().saturating_sub(1) as f32;
+        let body_height =
+            SIDEBAR_DISCLOSURE_BODY_INSET + stacked_height(items.iter().map(|(height, _)| *height));
+        self.begin_queued_sidebar_reveal(ORCHESTRATORS_KEY, !collapsed, body_height);
         let summary = collapsed
             .then(|| need_you_summary(needing_you(&groups)))
             .flatten();
@@ -321,13 +399,23 @@ impl Shell {
                 list.into_any_element(),
             )
         });
+        let painted_height = self.orchestrators_height.clone();
         div()
             .id("sidebar-orchestrators-section")
+            .relative()
             .flex()
             .flex_col()
             .when(gap_below, |el| el.pb(px(SIDEBAR_SECTION_GAP)))
             .child(header)
             .children(body)
+            .child(
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |bounds, _, _, _| painted_height.set(f32::from(bounds.size.height)),
+                )
+                .absolute()
+                .inset_0(),
+            )
             .into_any_element()
     }
 }
@@ -443,7 +531,7 @@ mod tests {
 
     #[gpui::test]
     fn section_nests_active_children_and_folds_done(cx: &mut gpui::TestAppContext) {
-        let (_, cx) = sidebar(
+        let (shell, cx) = sidebar(
             cx,
             SidebarOrganization::InOneList,
             fixture(),
@@ -468,7 +556,9 @@ mod tests {
         assert!(cx.debug_bounds("chat-idle").is_some());
         click(cx, "orchestrator-done-orch");
         redraw(cx);
-        assert!(cx.debug_bounds("chat-idle").is_none());
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.orchestrator_done_open.contains("orch"));
+        });
     }
 
     #[gpui::test]

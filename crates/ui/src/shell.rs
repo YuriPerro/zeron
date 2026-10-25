@@ -2207,6 +2207,8 @@ pub struct Shell {
     sidebar_section_drag: Option<SidebarSectionDragState>,
     /// Each custom section's painted bounds, measured every frame.
     sidebar_section_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<Pixels>>>>,
+    /// Painted height of the Orchestrators section stacked above Pinned.
+    orchestrators_height: std::rc::Rc<std::cell::Cell<f32>>,
     /// Pending pin intents are scoped to the active profile and engine attachment.
     sidebar_pin_write: Option<sidebar_pins::PendingSidebarPins>,
     sidebar_pin_write_generation: u64,
@@ -2726,6 +2728,7 @@ impl Shell {
             sidebar_session_return: None,
             sidebar_section_drag: None,
             sidebar_section_bounds: Default::default(),
+            orchestrators_height: Default::default(),
             sidebar_pin_write: None,
             sidebar_pin_write_generation: 0,
             sidebar_pin_write_notice: None,
@@ -8640,13 +8643,15 @@ impl Shell {
         } else {
             format!("chat-{id}")
         };
-        let pr_device = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .map(|chat| chat.device_id.clone());
+        let (pr_device, orchestrator_name) = {
+            let state = self.state.read(cx);
+            let chat = state.chats.iter().find(|chat| chat.id == id);
+            (
+                chat.map(|chat| chat.device_id.clone()),
+                chat.filter(|chat| crate::orchestration::sidebar::is_orchestrator(chat))
+                    .map(|chat| crate::orchestration::sidebar::display_name(chat).to_owned()),
+            )
+        };
         let compact = search_query.is_none() && self.settings.sidebar_compact;
         let pr_surface = if search_query.is_some() {
             crate::change_requests::ChangeRequestBadgeSurface::Sidebar
@@ -8676,25 +8681,15 @@ impl Shell {
         };
         let project_icon = (project_icon && search_query.is_none())
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
-        let orchestrator_avatar = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .filter(|chat| crate::orchestration::sidebar::is_orchestrator(chat))
-            .map(|chat| {
-                div()
-                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                    .flex_none()
-                    .child(crate::orchestration::sidebar::orchestrator_avatar(
-                        crate::orchestration::sidebar::display_name(chat),
-                        &chat.id,
-                        selected,
-                        theme,
-                    ))
-                    .into_any_element()
-            });
+        let orchestrator_avatar = orchestrator_name.as_deref().map(|name| {
+            div()
+                .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                .flex_none()
+                .child(crate::orchestration::sidebar::orchestrator_avatar(
+                    name, &id, selected, theme,
+                ))
+                .into_any_element()
+        });
         let is_orchestrator = orchestrator_avatar.is_some();
         let harness = harness.filter(|_| !is_orchestrator);
         let project_icon = orchestrator_avatar.or(project_icon);
@@ -11062,6 +11057,9 @@ impl Shell {
                     .iter()
                     .any(|chat| chat.id == chat_id && chat.parent_chat_id.is_some());
             let is_pinned = self.active_sidebar_pins(cx).contains(&chat_id);
+            let is_orchestrator = self.state.read(cx).chats.iter().any(|chat| {
+                chat.id == chat_id && crate::orchestration::sidebar::is_orchestrator(chat)
+            });
             let rename_id = chat_id.clone();
             let pin_id = chat_id.clone();
             let archive_id = chat_id.clone();
@@ -11117,8 +11115,12 @@ impl Shell {
                             )
                             .child(SharedString::from("Archive"));
                     let copy = self.render_chat_copy_trigger(&chat_id, copy_open, &theme, cx);
-                    menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_PIN, pin, cx))
-                        .child(self.chat_menu_hover_row(CHAT_MENU_ROW_ARCHIVE, archive, cx))
+                    let menu = if is_orchestrator {
+                        menu
+                    } else {
+                        menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_PIN, pin, cx))
+                    };
+                    menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_ARCHIVE, archive, cx))
                         .child(self.chat_menu_hover_row(CHAT_MENU_ROW_COPY, copy, cx))
                 };
                 let delete = popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
