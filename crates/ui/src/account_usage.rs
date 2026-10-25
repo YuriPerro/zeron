@@ -28,6 +28,31 @@ const FORCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// Background re-probe while a composer is alive: usage moves as turns run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+const RESET_WIDTH: f32 = 112.0;
+
+/// When a usage window resets: a countdown within a day ("resets in 2h 14m"),
+/// weekday and time within a week ("resets Thu 2:00 PM"), else the date. Pure.
+fn reset_label(
+    resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let at = resets_at?;
+    let left = at.signed_duration_since(now);
+    let local = at.with_timezone(&chrono::Local);
+    Some(if left.num_minutes() < 1 {
+        "resets now".to_owned()
+    } else if left.num_hours() < 24 {
+        match (left.num_hours(), left.num_minutes() % 60) {
+            (0, minutes) => format!("resets in {minutes}m"),
+            (hours, minutes) => format!("resets in {hours}h {minutes}m"),
+        }
+    } else if left.num_days() < 7 {
+        format!("resets {}", local.format("%a %-I:%M %p"))
+    } else {
+        format!("resets {}", local.format("%b %-d"))
+    })
+}
+
 /// The binding limit: the most-used window of the account. Pure.
 pub fn used_fraction(account: &AgentAccount) -> Option<f32> {
     account
@@ -314,7 +339,7 @@ impl AccountUsage {
             harness.map_or("Agent", accounts::provider_name)
         );
         popover::popover_card(theme)
-            .w(px(400.0))
+            .w(px(400.0 + RESET_WIDTH + 8.0))
             .flex()
             .flex_col()
             .child(popover::menu_heading(theme, &title))
@@ -386,13 +411,25 @@ impl AccountUsage {
                                     now,
                                 )))
                             })
-                            .children(
-                                account
-                                    .usage_windows
-                                    .iter()
-                                    .take(2)
-                                    .map(|window| render_usage_meter(window, theme)),
-                            ),
+                            .children(account.usage_windows.iter().take(2).map(|window| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(render_usage_meter(window, theme))
+                                    .child(
+                                        div()
+                                            .w(px(RESET_WIDTH))
+                                            .flex_none()
+                                            .truncate()
+                                            .text_size(crate::typography::ui_rems(11.5))
+                                            .text_color(theme.text_muted)
+                                            .children(
+                                                reset_label(window.resets_at, now)
+                                                    .map(SharedString::from),
+                                            ),
+                                    )
+                            })),
                     )
             }))
             .children(self.error.clone().map(|error| {
@@ -494,6 +531,23 @@ mod tests {
                 .collect::<Vec<_>>(),
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn reset_label_counts_down_within_a_day() {
+        let now = chrono::Utc::now();
+        let at = |minutes: i64| Some(now + chrono::Duration::minutes(minutes));
+        assert_eq!(reset_label(None, now), None);
+        assert_eq!(reset_label(at(0), now).as_deref(), Some("resets now"));
+        assert_eq!(reset_label(at(42), now).as_deref(), Some("resets in 42m"));
+        assert_eq!(
+            reset_label(at(2 * 60 + 14), now).as_deref(),
+            Some("resets in 2h 14m")
+        );
+        let in_three_days = reset_label(at(3 * 24 * 60), now).unwrap();
+        assert!(in_three_days.starts_with("resets ") && in_three_days.contains(':'));
+        let in_a_month = reset_label(at(30 * 24 * 60), now).unwrap();
+        assert!(!in_a_month.contains(':'));
     }
 
     #[test]
