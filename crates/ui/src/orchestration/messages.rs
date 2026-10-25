@@ -53,6 +53,25 @@ pub(crate) fn child_event_text(title: &str, kind: ChildEventKind) -> String {
     }
 }
 
+/// One-line label for a queued chat-to-chat message, or `None` for user text.
+pub(crate) fn queue_label(text: &str) -> Option<String> {
+    match classify_message(text) {
+        MessageOrigin::Plain => None,
+        MessageOrigin::ChildEvent { title, kind, .. } => Some(child_event_text(&title, kind)),
+        MessageOrigin::FromChat {
+            label,
+            body,
+            contract_demand: None,
+            ..
+        } => Some(format!("{label}: {body}")),
+        MessageOrigin::FromChat {
+            label,
+            contract_demand: Some(demand),
+            ..
+        } => Some(format!("{label}: contract change · {demand}")),
+    }
+}
+
 fn title_and_id(head: &str) -> Option<(&str, &str)> {
     let head = head.strip_suffix(')')?;
     let (title, id) = head.rsplit_once(" (")?;
@@ -115,6 +134,22 @@ mod tests {
 
     fn event(title: &str, id: &str, verb: &str) -> String {
         format!("[Zeron: {title} ({id}){verb}]")
+    }
+
+    #[test]
+    fn queue_labels_read_like_the_transcript() {
+        assert_eq!(
+            queue_label(&event("investiga: kit-ui", ID, CHILD_EVENT_VERBS[0].0)).as_deref(),
+            Some("investiga: kit-ui finished")
+        );
+        assert_eq!(
+            queue_label(&format!(
+                "[Message from Zeron chat api (9db29bd0). Reply to it with the Zeron `send_message` tool, chat {ID}.]\n\nDone."
+            ))
+            .as_deref(),
+            Some("api: Done.")
+        );
+        assert_eq!(queue_label("fix the build"), None);
     }
 
     #[test]
