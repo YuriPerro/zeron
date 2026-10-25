@@ -6,6 +6,7 @@
 
 mod auth_cli;
 mod daemon;
+mod orchestrator_cli;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -62,6 +63,16 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Create and list orchestrators.
+    Orchestrator {
+        #[command(subcommand)]
+        command: orchestrator_cli::OrchestratorCommand,
+    },
+    /// Inspect the roles orchestrators delegate to.
+    Roles {
+        #[command(subcommand)]
+        command: orchestrator_cli::RolesCommand,
     },
     /// Check for a newer release and apply it (download → verify → swap →
     /// service restart). `--check` only reports (exits 1 when one is available).
@@ -152,6 +163,24 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             let config = engine_config_from_env();
             runtime.block_on(quiesce_cli(config.ipc_port, &config.data_dir))
+        }
+        Some(Command::Orchestrator { command }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let config = engine_config_from_env();
+            runtime.block_on(orchestrator_cli::orchestrator(
+                command,
+                config.ipc_port,
+                config.data_dir,
+            ))
+        }
+        Some(Command::Roles { command }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let config = engine_config_from_env();
+            runtime.block_on(orchestrator_cli::roles(
+                command,
+                config.ipc_port,
+                config.data_dir,
+            ))
         }
         Some(Command::Mcp) => zeron_app::run_mcp(),
         Some(Command::Engine) => zeron_app::background::run(),
@@ -363,4 +392,80 @@ async fn sync_cli(ipc_port: u16, data_dir: &std::path::Path) -> anyhow::Result<(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_orchestrator_create_with_projects() {
+        let cli = Cli::try_parse_from([
+            "zeron",
+            "orchestrator",
+            "create",
+            "--name",
+            "Loja Online",
+            "--project",
+            "web",
+            "--project",
+            "/work/api",
+            "--harness",
+            "codex",
+            "--model",
+            "gpt-5",
+            "--reasoning",
+            "high",
+            "--child-harness",
+            "claude-code",
+        ])
+        .unwrap();
+        let Some(Command::Orchestrator {
+            command:
+                orchestrator_cli::OrchestratorCommand::Create {
+                    name,
+                    project,
+                    harness,
+                    model,
+                    reasoning,
+                    child_harness,
+                },
+        }) = cli.command
+        else {
+            panic!("expected orchestrator create");
+        };
+        assert_eq!(name, "Loja Online");
+        assert_eq!(project, ["web", "/work/api"]);
+        assert_eq!(harness.as_deref(), Some("codex"));
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+        assert_eq!(reasoning.as_deref(), Some("high"));
+        assert_eq!(child_harness.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn orchestrator_create_requires_a_project() {
+        assert!(Cli::try_parse_from(["zeron", "orchestrator", "create", "--name", "X"]).is_err());
+    }
+
+    #[test]
+    fn parses_orchestrator_list() {
+        let cli = Cli::try_parse_from(["zeron", "orchestrator", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Orchestrator {
+                command: orchestrator_cli::OrchestratorCommand::List
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_roles_check() {
+        let cli = Cli::try_parse_from(["zeron", "roles", "check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Roles {
+                command: orchestrator_cli::RolesCommand::Check
+            })
+        ));
+    }
 }

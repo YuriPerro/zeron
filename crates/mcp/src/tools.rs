@@ -1702,7 +1702,7 @@ fn harness_label(id: HarnessId) -> String {
 
 /// claude-code when it is ready here, else the first ready harness — a
 /// provider that is installed but signed out only when nothing else is.
-fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
+pub fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
     let real = |h: &&HarnessInfo| h.id != HarnessId::Mock;
     harnesses
         .iter()
