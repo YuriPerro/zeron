@@ -10,9 +10,14 @@ use std::collections::HashMap;
 use zeron_proto::ChatIndicator;
 
 const ORCHESTRATORS_KEY: &str = "orchestrators";
-const CHILD_INDENT: f32 = 16.0;
+const CHEVRON_COLUMN: f32 = 16.0;
+const CHILD_INDENT: f32 = 32.0;
 
 type SectionRow = (f32, AnyElement);
+
+fn fold_key(chat_id: &str) -> String {
+    format!("orchestrator-fold:{chat_id}")
+}
 
 fn done_key(chat_id: &str) -> String {
     format!("orchestrator-done:{chat_id}")
@@ -75,6 +80,12 @@ impl Shell {
         }
         let entries = orchestrator_entries(state, Utc::now());
         orchestrator_groups(&entries).iter().any(|group| {
+            let folded = self
+                .sidebar_collapsed_groups
+                .contains(&fold_key(&group.chat_id));
+            if folded && group.chat_id != chat_id {
+                return false;
+            }
             let done_shown = self.orchestrator_done_open.contains(&group.chat_id);
             group.chat_id == chat_id
                 || group.active_children.iter().any(|id| id == chat_id)
@@ -110,8 +121,12 @@ impl Shell {
         };
         let in_done = group.done_children.iter().any(|id| id == chat_id);
         let group_id = group.chat_id.clone();
+        let is_child = group_id != chat_id;
         if self.sidebar_collapsed_groups.remove(ORCHESTRATORS_KEY) {
             self.queue_sidebar_reveal(ORCHESTRATORS_KEY);
+        }
+        if is_child && self.sidebar_collapsed_groups.remove(&fold_key(&group_id)) {
+            self.queue_sidebar_reveal(&fold_key(&group_id));
         }
         if in_done && self.orchestrator_done_open.insert(group_id.clone()) {
             self.queue_sidebar_reveal(&done_key(&group_id));
@@ -277,6 +292,109 @@ impl Shell {
         (height, element)
     }
 
+    fn render_orchestrator_group(
+        &mut self,
+        group: &OrchestratorGroup,
+        data: &mut HashMap<String, ActiveChatRow>,
+        now: chrono::DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<SectionRow> {
+        let mut head_row = data.remove(&group.chat_id)?;
+        head_row.status = group.indicator;
+        let (head_height, head) =
+            self.render_orchestrator_chat_row(head_row, group.name.clone(), false, now, theme, cx);
+        let mut children: Vec<SectionRow> = Vec::new();
+        for child_id in &group.active_children {
+            if let Some(row) = data.remove(child_id) {
+                let title = row
+                    .chat
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "New session".into());
+                children.push(self.render_orchestrator_chat_row(row, title, true, now, theme, cx));
+            }
+        }
+        if !group.done_children.is_empty() {
+            children.push(self.render_orchestrator_done(group, data, now, theme, cx));
+        }
+
+        let key = fold_key(&group.chat_id);
+        let open = !self.sidebar_collapsed_groups.contains(&key);
+        let has_children = !children.is_empty();
+        let list_height =
+            SIDEBAR_LIST_GAP + stacked_height(children.iter().map(|(height, _)| *height));
+        self.begin_queued_sidebar_reveal(&key, open, list_height);
+        let motion = self
+            .sidebar_disclosure_motion
+            .get(&key)
+            .copied()
+            .filter(|motion| motion.animating());
+        let animating = motion.is_some();
+        let list_now = motion.map_or(if open { list_height } else { 0.0 }, |m| m.current());
+        let body = (has_children && (open || animating)).then(|| {
+            let list = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_LIST_GAP))
+                .gap(px(SIDEBAR_LIST_GAP))
+                .children(children.into_iter().map(|(_, element)| element));
+            self.render_sidebar_disclosure_body(&key, open, list_height, list.into_any_element())
+        });
+
+        let chevron_cell = div()
+            .w(px(CHEVRON_COLUMN))
+            .flex_none()
+            .flex()
+            .justify_center();
+        let chevron_cell = if has_children {
+            let toggled = key.clone();
+            let selector = format!("orchestrator-fold-{}", group.chat_id);
+            chevron_cell
+                .id(SharedString::from(key.clone()))
+                .debug_selector(move || selector.clone())
+                .cursor_pointer()
+                .role(gpui::Role::Button)
+                .aria_label("Fold orchestrator")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    let was_open = !this.sidebar_collapsed_groups.contains(&toggled);
+                    this.begin_sidebar_disclosure_motion(
+                        &toggled,
+                        if was_open { list_height } else { 0.0 },
+                        if was_open { 0.0 } else { list_height },
+                    );
+                    if was_open {
+                        this.sidebar_collapsed_groups.insert(toggled.clone());
+                    } else {
+                        this.sidebar_collapsed_groups.remove(&toggled);
+                    }
+                    cx.notify();
+                }))
+                .child(self.sidebar_disclosure_chevron(&key, open, theme))
+                .into_any_element()
+        } else {
+            chevron_cell.into_any_element()
+        };
+        let head = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(chevron_cell)
+            .child(div().flex_1().min_w_0().child(head));
+        let element = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(head)
+            .children(body)
+            .into_any_element();
+        let height = head_height + if has_children { list_now } else { 0.0 };
+        Some((height, element))
+    }
+
     fn render_orchestrators_add(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("orchestrators-add")
@@ -316,29 +434,8 @@ impl Shell {
         let (groups, mut data) = self.orchestrator_row_data(now, cx);
         let mut items: Vec<SectionRow> = Vec::new();
         for group in &groups {
-            if let Some(mut row) = data.remove(&group.chat_id) {
-                row.status = group.indicator;
-                items.push(self.render_orchestrator_chat_row(
-                    row,
-                    group.name.clone(),
-                    false,
-                    now,
-                    theme,
-                    cx,
-                ));
-            }
-            for child_id in &group.active_children {
-                if let Some(row) = data.remove(child_id) {
-                    let title = row
-                        .chat
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| "New session".into());
-                    items.push(self.render_orchestrator_chat_row(row, title, true, now, theme, cx));
-                }
-            }
-            if !group.done_children.is_empty() {
-                items.push(self.render_orchestrator_done(group, &mut data, now, theme, cx));
+            if let Some(item) = self.render_orchestrator_group(group, &mut data, now, theme, cx) {
+                items.push(item);
             }
         }
 
@@ -1044,6 +1141,74 @@ mod tests {
             let state = &shell.new_orchestrator.open.as_ref().unwrap().state;
             assert!(!state.submitting);
             assert!(state.can_submit());
+        });
+    }
+
+    #[gpui::test]
+    fn folding_an_orchestrator_hides_its_children_and_keeps_its_row(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            fixture(),
+            working_fixture(),
+        );
+        assert!(cx.debug_bounds("chat-work").is_some());
+        assert!(cx.debug_bounds("orchestrator-done-orch").is_some());
+        let unfolded = shell.read_with(cx, |shell, _| shell.orchestrators_height.get());
+        click(cx, "orchestrator-fold-orch");
+        redraw(cx);
+        redraw(cx);
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .sidebar_collapsed_groups
+                    .contains("orchestrator-fold:orch")
+            );
+            assert!(!shell.sidebar_collapsed_groups.contains("orchestrators"));
+        });
+        shell.update(cx, |shell, _| shell.sidebar_disclosure_motion.clear());
+        redraw(cx);
+        assert!(cx.debug_bounds("chat-orch").is_some());
+        let folded = shell.read_with(cx, |shell, _| shell.orchestrators_height.get());
+        assert!(folded < unfolded);
+        shell.update(cx, |shell, cx| {
+            assert!(shell.orchestrator_row_visible("orch", cx));
+            assert!(!shell.orchestrator_row_visible("work", cx));
+        });
+        click(cx, "orchestrator-fold-orch");
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                !shell
+                    .sidebar_collapsed_groups
+                    .contains("orchestrator-fold:orch")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reveal_expands_a_folded_parent(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = sidebar(
+            cx,
+            SidebarOrganization::InOneList,
+            fixture(),
+            working_fixture(),
+        );
+        shell.update(cx, |shell, cx| {
+            shell
+                .sidebar_collapsed_groups
+                .insert("orchestrator-fold:orch".into());
+            assert!(shell.reveal_sidebar_chat("orch", cx));
+            assert!(
+                shell
+                    .sidebar_collapsed_groups
+                    .contains("orchestrator-fold:orch")
+            );
+            assert!(shell.reveal_sidebar_chat("work", cx));
+            assert!(
+                !shell
+                    .sidebar_collapsed_groups
+                    .contains("orchestrator-fold:orch")
+            );
         });
     }
 }
