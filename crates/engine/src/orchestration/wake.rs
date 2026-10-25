@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use tokio::sync::watch;
-use zeron_proto::{DoneStatus, NativeTurnOutcome, Session, SessionStatus};
+use zeron_proto::{DoneStatus, Session, SessionStatus};
 
 use crate::doc_host::DocHost;
 
@@ -215,6 +215,7 @@ fn wake_parent(host: &DocHost, stop: &ObservedStop) -> Delivery {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use zeron_proto::NativeTurnOutcome;
 
     fn session(id: &str, status: SessionStatus, turn: Option<&str>, at: i64) -> Session {
         Session {
