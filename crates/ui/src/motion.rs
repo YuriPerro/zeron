@@ -189,6 +189,22 @@ pub fn spin_phase(view: EntityId, period: Duration, cx: &mut App) -> Option<f32>
     Some((clock.epoch.elapsed().as_secs_f32() / period.as_secs_f32()).fract())
 }
 
+/// Ambient decoration steps at a quarter of the loader rate (~7.5Hz): slow
+/// drift reads the same, and the window redraws a fraction as often.
+const AMBIENT_STRIDE: u64 = 4;
+
+/// Seconds on the shared pulse clock for slow ambient decoration, keeping
+/// `view` repainting at [`AMBIENT_STRIDE`] while it stays mounted. `None` when
+/// motion is reduced or paused in the background: the caller holds its frame.
+pub fn ambient_time(view: EntityId, cx: &mut App) -> Option<f32> {
+    if cx.reduce_motion() {
+        return None;
+    }
+    schedule_pulse_every(view, AMBIENT_STRIDE, cx);
+    let clock = cx.default_global::<PulseClock>();
+    Some(clock.epoch.elapsed().as_secs_f32())
+}
+
 /// Schedule cosmetic animation through the same bounded clock as loaders.
 /// Renew only while painting an active animation; the clock parks after the
 /// last lease expires, including when a view is hidden or removed.
@@ -1453,6 +1469,41 @@ mod tests {
                         clock.leases.contains_key(&decorative_view.entity_id())
                     }));
                 }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn ambient_time_parks_under_reduced_motion_and_background_pause(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+
+        cx.update(|cx| {
+            for (preference, system, pause_in_background, active, animates) in [
+                (ReduceMotion::System, false, false, true, true),
+                (ReduceMotion::System, true, false, true, false),
+                (ReduceMotion::On, false, false, true, false),
+                (ReduceMotion::Off, false, true, false, false),
+            ] {
+                cx.set_global(MotionState {
+                    preference,
+                    pause_in_background,
+                    system,
+                    active,
+                });
+                apply(cx);
+                let view = cx.new(|_| ());
+                let time = ambient_time(view.entity_id(), cx);
+                let lease = cx
+                    .try_global::<PulseClock>()
+                    .and_then(|clock| clock.leases.get(&view.entity_id()))
+                    .map(|lease| lease.stride);
+                let case = format!(
+                    "{preference:?}, system={system}, pause={pause_in_background}, active={active}"
+                );
+                assert_eq!(time.is_some(), animates, "{case}");
+                assert_eq!(lease, animates.then_some(AMBIENT_STRIDE), "{case}");
             }
         });
     }

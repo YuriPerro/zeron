@@ -11567,6 +11567,23 @@ impl Shell {
                     dock_frame.dissolve(),
                     artwork_frame.mix * opacity,
                 ))
+                .when(new_thread_background_setting.is_none(), |layer| {
+                    layer.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(width))
+                            .h_full()
+                            .overflow_hidden()
+                            .opacity((1.0 - dock_frame.dissolve()) * opacity)
+                            .child(crate::new_thread_ascii::backdrop(
+                                "new-thread-ascii",
+                                theme,
+                                self.composer.read(cx).surface_bounds(),
+                            )),
+                    )
+                })
                 .into_any_element()
         });
 
