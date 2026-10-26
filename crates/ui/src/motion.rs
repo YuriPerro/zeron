@@ -196,6 +196,15 @@ pub fn pulse_lease(view: EntityId, cx: &mut App) {
     pulse_lease_every(view, 1, cx);
 }
 
+/// Ambient backdrops drift slower than a glyph cell per tick, so ~5Hz shows
+/// every step they take. Each tick still re-renders the views above the
+/// caller, which is why this is a sixth of the loader clock. Same lease rules
+/// as [`pulse_lease`]: nothing is scheduled under reduced motion or once
+/// unmounted.
+pub fn ambient_lease(view: EntityId, cx: &mut App) {
+    pulse_lease_every(view, 6, cx);
+}
+
 fn pulse_lease_every(view: EntityId, stride: u64, cx: &mut App) {
     if cx.reduce_motion() {
         return;

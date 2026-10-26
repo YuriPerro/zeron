@@ -11546,9 +11546,22 @@ impl Shell {
             let width = (self.viewport_width - self.sidebar_now()).max(0.0);
             let bounds = self.composer.read(cx).surface_bounds();
             let opacity = new_thread_background_opacity(theme.is_frost());
+            // Without artwork the canvas draws its glyph field, fading back in
+            // as a removed wallpaper fades out.
+            let glyph_opacity = artwork_frame
+                .current
+                .is_none()
+                .then(|| (1.0 - dock_frame.dissolve()) * artwork_frame.mix * opacity)
+                .filter(|opacity| *opacity > 0.001);
+            let focus = bounds.get();
             div()
                 .absolute()
                 .inset_0()
+                .children(glyph_opacity.map(|opacity| {
+                    crate::new_thread_background_glyphs::glyph_field(
+                        crate::new_thread_background_glyphs::FieldSpec::new(theme, focus, opacity),
+                    )
+                }))
                 .child(new_thread_background(
                     artwork_frame.previous,
                     artwork_frame.previous_adjustment,

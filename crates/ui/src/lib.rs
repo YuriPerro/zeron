@@ -47,6 +47,7 @@ pub mod loaders;
 pub mod markdown;
 pub mod motion;
 mod new_thread_background_effects;
+mod new_thread_background_glyphs;
 mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
