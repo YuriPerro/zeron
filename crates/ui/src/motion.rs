@@ -189,6 +189,18 @@ pub fn spin_phase(view: EntityId, period: Duration, cx: &mut App) -> Option<f32>
     Some((clock.epoch.elapsed().as_secs_f32() / period.as_secs_f32()).fract())
 }
 
+/// Seconds on the loader clock for slow ambient scenes, keeping `view`
+/// repainting every third tick (~10Hz). `None` when motion is reduced: the
+/// scene rests on one frame and schedules nothing.
+pub fn ambient_seconds(view: EntityId, cx: &mut App) -> Option<f64> {
+    if cx.reduce_motion() {
+        return None;
+    }
+    schedule_pulse_every(view, 3, cx);
+    let clock = cx.default_global::<PulseClock>();
+    Some(clock.epoch.elapsed().as_secs_f64())
+}
+
 /// Schedule cosmetic animation through the same bounded clock as loaders.
 /// Renew only while painting an active animation; the clock parks after the
 /// last lease expires, including when a view is hidden or removed.

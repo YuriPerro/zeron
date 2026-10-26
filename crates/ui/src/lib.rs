@@ -49,6 +49,7 @@ pub mod motion;
 mod new_thread_background_effects;
 mod new_thread_background_image;
 mod new_thread_background_mask;
+mod new_thread_sky;
 mod notice;
 mod orchestration;
 pub use zeron_notify as notify;

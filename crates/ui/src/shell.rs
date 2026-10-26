@@ -11539,6 +11539,12 @@ impl Shell {
                 ),
             )));
         let term_h = self.terminal_geometry.get().height;
+        let sky_presence = crate::new_thread_sky::presence(
+            new_thread_background_setting.is_some(),
+            artwork_frame.previous.is_some(),
+            artwork_frame.current.is_some(),
+            artwork_frame.mix,
+        );
         let new_thread_background_layer = (!has_selection || dock_frame.active).then(|| {
             if artwork_frame.active {
                 window.request_animation_frame();
@@ -11549,6 +11555,22 @@ impl Shell {
             div()
                 .absolute()
                 .inset_0()
+                .when(has_spaces || no_project, |layer| {
+                    layer.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(width))
+                            .h(px(self.viewport_height))
+                            .overflow_hidden()
+                            .child(crate::new_thread_sky::new_thread_sky(
+                                theme,
+                                sky_presence * (1.0 - dock_frame.dissolve()),
+                                bounds.get(),
+                            )),
+                    )
+                })
                 .child(new_thread_background(
                     artwork_frame.previous,
                     artwork_frame.previous_adjustment,
