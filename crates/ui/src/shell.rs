@@ -11539,6 +11539,9 @@ impl Shell {
                 ),
             )));
         let term_h = self.terminal_geometry.get().height;
+        // The glyph sky is the default backdrop: a chosen wallpaper replaces
+        // it, and the onboarding card has no composer for it to frame.
+        let ascii_sky = new_thread_background_setting.is_none() && (has_spaces || no_project);
         let new_thread_background_layer = (!has_selection || dock_frame.active).then(|| {
             if artwork_frame.active {
                 window.request_animation_frame();
@@ -11549,6 +11552,12 @@ impl Shell {
             div()
                 .absolute()
                 .inset_0()
+                .when(ascii_sky, |el| {
+                    el.child(crate::new_thread_ascii_sky::ascii_sky(
+                        bounds.clone(),
+                        1.0 - dock_frame.dissolve().clamp(0.0, 1.0),
+                    ))
+                })
                 .child(new_thread_background(
                     artwork_frame.previous,
                     artwork_frame.previous_adjustment,

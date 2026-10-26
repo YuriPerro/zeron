@@ -196,7 +196,8 @@ pub fn pulse_lease(view: EntityId, cx: &mut App) {
     pulse_lease_every(view, 1, cx);
 }
 
-fn pulse_lease_every(view: EntityId, stride: u64, cx: &mut App) {
+/// [`pulse_lease`] repainting every `stride` ticks of the 30Hz clock.
+pub(crate) fn pulse_lease_every(view: EntityId, stride: u64, cx: &mut App) {
     if cx.reduce_motion() {
         return;
     }
