@@ -14,13 +14,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
-    DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, KeyBinding, KeyDownEvent, KeyUpEvent, Keystroke, LayoutId,
+    AnyTooltip, App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, DispatchPhase,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, KeyBinding, KeyDownEvent, KeyUpEvent, Keystroke, LayoutId,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     PaintQuad, PathPromptOptions, Pixels, Point, Role, ScrollWheelEvent, SharedString, Style,
     StyledImage as _, Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle,
-    Window, WrappedLine, actions, div, fill, img, point, prelude::*, px, quad, relative, size,
+    Window, WrappedLine, actions, div, fill, img, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1931,6 +1931,7 @@ struct InputLayoutKey {
     color: gpui::Hsla,
     chip_family: SharedString,
     chip_color: gpui::Hsla,
+    mention_color: gpui::Hsla,
     syntax: crate::theme::SyntaxPalette,
     marked_range: Option<Range<usize>>,
     placeholder: SharedString,
@@ -4243,6 +4244,7 @@ impl ComposerInput {
             color: style.color,
             chip_family: theme.font_mono.clone(),
             chip_color: theme.code_text,
+            mention_color: theme.accent,
             syntax: theme.syntax.clone(),
             marked_range: self.marked_range.clone(),
             placeholder: self.placeholder.clone(),
@@ -4395,7 +4397,9 @@ impl ComposerInput {
                 }) {
                     run.font.family = CHIP_PAD_FAMILY.into();
                 }
-                if !chip {
+                if chip {
+                    run.color = theme.accent;
+                } else {
                     if face_depth[composer_markdown::Face::Bold as usize] > 0 {
                         run.font.weight = gpui::FontWeight::BOLD;
                     }

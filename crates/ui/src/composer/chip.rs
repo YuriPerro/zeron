@@ -1,4 +1,4 @@
-//! What a chip looks like: its pill, icon and hover preview.
+//! What a chip looks like: its tinted label, icon and hover preview.
 use super::*;
 
 /// A staged attachment an attachment chip can refer to; an image chip opens
@@ -181,8 +181,8 @@ pub(crate) fn chip_icon(
     }
 }
 
-/// Paint a chip like the transcript's file badges: a soft rounded pill whose
-/// first row starts with the icon on a small well. Callers center `chip` on
+/// Paint a chip's icon in the slot at the start of its first row; the label
+/// itself is tinted text, with no pill behind it. Callers center `chip` on
 /// the label's cap height: the row's middle moved by [`chip_label_offset`],
 /// which is zero for Geist (ascent 1005, descent 295, cap 710 per 1000 units)
 /// and corrects for other interface fonts.
@@ -193,27 +193,11 @@ pub(crate) fn paint_chip(
     theme: &Theme,
     cx: &App,
 ) {
-    window.paint_quad(quad(
-        chip,
-        px(5.0),
-        theme.ink(0.09),
-        px(0.0),
-        gpui::transparent_black(),
-        BorderStyle::default(),
-    ));
     let Some(icon) = icon else {
         return;
     };
     let well = chip.size.height - px(2.0);
     let well_bounds = Bounds::new(chip.origin + point(px(1.0), px(1.0)), size(well, well));
-    window.paint_quad(quad(
-        well_bounds,
-        px(4.0),
-        crate::file_icons::well_bg(theme),
-        px(0.0),
-        gpui::transparent_black(),
-        BorderStyle::default(),
-    ));
     // The icon follows the chip's size, so chips on a small line stay tidy.
     let side = px(CHIP_ICON_SIZE).min(well - px(4.0));
     let bounds = Bounds::new(
@@ -227,7 +211,7 @@ pub(crate) fn paint_chip(
                 (*path).into(),
                 None,
                 gpui::TransformationMatrix::default(),
-                theme.text_muted,
+                theme.accent,
                 cx,
             );
         }
@@ -250,14 +234,21 @@ pub(crate) fn chip_text(
     if spans.is_empty() {
         return text.into_any_element();
     }
-    // Split runs at the padding (a default highlight changes nothing else),
-    // so the family override lands on whole runs over the inherited style.
+    // Tint each chip in pieces split at its padding, so the family override
+    // lands on whole runs over the inherited style.
     let pads = chip_pad_overrides(&spans);
+    let tint = gpui::HighlightStyle {
+        color: Some(theme.accent),
+        ..Default::default()
+    };
     let styled = gpui::StyledText::new(text)
-        .with_highlights(
-            pads.iter()
-                .map(|range| (range.clone(), gpui::HighlightStyle::default())),
-        )
+        .with_highlights(spans.iter().flat_map(|span| {
+            let [lead, trail] = chip_pad_ranges(&span.range);
+            [lead.clone(), lead.end..trail.start, trail]
+                .into_iter()
+                .filter(|range| !range.is_empty())
+                .map(move |range| (range, tint))
+        }))
         .with_font_family_overrides(
             pads.into_iter()
                 .map(|range| (range, SharedString::from(CHIP_PAD_FAMILY))),

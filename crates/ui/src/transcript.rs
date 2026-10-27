@@ -8863,6 +8863,7 @@ fn user_bubble_runs(
         ] {
             if len > 0 {
                 let mut run = body_run(len);
+                run.color = theme.accent;
                 if pad {
                     run.font.family = crate::composer::CHIP_PAD_FAMILY.into();
                 }
