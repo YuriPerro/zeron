@@ -3348,8 +3348,8 @@ impl AppState {
     }
 
     /// The earliest moment after `now` at which a clock-derived value flips
-    /// with no frame to announce it: a Working/AwaitingInput session going
-    /// stale ([`SESSION_STALE_MS`]), a remote device leaving its online window
+    /// with no frame to announce it: a Working/AwaitingInput session, or one
+    /// listing background tasks, going stale ([`SESSION_STALE_MS`]), a remote device leaving its online window
     /// (offline glyphs, unreachable hosts, Queued badges), a pending send's
     /// grace expiring into "Not delivered", or a syncing chat's caption
     /// showing or its room stalling. Each deadline is the first instant
@@ -3375,10 +3375,12 @@ impl AppState {
             .sessions
             .iter()
             .filter(|session| {
-                matches!(
-                    session.activity_status(),
-                    zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput
-                )
+                !session.background_tasks.is_empty()
+                    || matches!(
+                        session.activity_status(),
+                        zeron_proto::SessionStatus::Working
+                            | zeron_proto::SessionStatus::AwaitingInput
+                    )
             })
             // `age_ms > SESSION_STALE_MS` first holds one millisecond past it.
             .map(|session| {
@@ -7303,6 +7305,31 @@ mod tests {
             Indicator::Working
         );
         assert_eq!(probe.indicator_for("row", cutoff), Indicator::None);
+        assert_state_notifies_at(cx, now, cutoff, |state| state.sessions = vec![row]);
+    }
+
+    #[gpui::test]
+    fn idle_row_with_background_tasks_notifies_when_they_go_stale(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let now = clock_epoch();
+        let mut row = session("row", SessionStatus::Idle, 10, now);
+        row.background_tasks = vec![zeron_proto::BackgroundTask {
+            id: "b1".into(),
+            kind: zeron_proto::BackgroundTaskKind::Shell,
+            description: "watch ci".into(),
+            started_at: now,
+        }];
+        let cutoff = row.updated_at + TimeDelta::milliseconds(SESSION_STALE_MS + 1);
+        let mut probe = AppState::new();
+        probe.sessions = vec![row.clone()];
+        assert_eq!(
+            probe
+                .background_tasks_for("row", cutoff - TimeDelta::milliseconds(1))
+                .len(),
+            1
+        );
+        assert!(probe.background_tasks_for("row", cutoff).is_empty());
         assert_state_notifies_at(cx, now, cutoff, |state| state.sessions = vec![row]);
     }
 
