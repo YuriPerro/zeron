@@ -6421,8 +6421,9 @@ pub struct Composer {
     /// The subagent and background pills: per-chat open tray and the stops
     /// in flight (in memory, like the checklist's state).
     pub(crate) running_trays: HashMap<String, crate::running_trays::RunningTrayState>,
+    pub(crate) running_rows_cache: crate::running_trays::SubagentRowsCache,
     /// Re-renders once a second while an open tray counts elapsed time.
-    pub(crate) running_tick: Option<Task<()>>,
+    pub(crate) running_clock: crate::shell::ClockRedraw,
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
@@ -6723,7 +6724,8 @@ impl Composer {
             todo_panels: HashMap::new(),
             todo_scroll: gpui::ScrollHandle::new(),
             running_trays: HashMap::new(),
-            running_tick: None,
+            running_rows_cache: Default::default(),
+            running_clock: Default::default(),
             queue_shortcut_revealed: false,
             annotation_marks: Vec::new(),
             expanded_mode: false,

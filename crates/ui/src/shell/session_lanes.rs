@@ -38,9 +38,6 @@ pub(super) struct LaneState {
     /// Background tasks whose stop is in flight. An id leaves once its task
     /// leaves the chat's set, or when the stop fails.
     stopping: HashSet<String>,
-    /// Elapsed times only move with the clock: while the background lane
-    /// shows them, the card re-renders once a second.
-    tick: Option<Task<()>>,
 }
 
 impl LaneState {
@@ -426,7 +423,14 @@ impl Shell {
                         .into_any_element(),
                 );
             }
-            self.tick_background_lane(cx);
+            // Elapsed times only move with the clock: while the lane shows
+            // them, the card re-renders once a second.
+            self.clock.arm(
+                now + chrono::TimeDelta::seconds(1),
+                now,
+                |shell: &mut Shell| &mut shell.clock,
+                cx,
+            );
         }
 
         let body = div()
@@ -650,20 +654,6 @@ impl Shell {
             .ok();
         })
         .detach();
-    }
-
-    fn tick_background_lane(&mut self, cx: &mut Context<Self>) {
-        if self.session_lanes.tick.is_some() {
-            return;
-        }
-        self.session_lanes.tick = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            this.update(cx, |this, cx| {
-                this.session_lanes.tick = None;
-                cx.notify();
-            })
-            .ok();
-        }));
     }
 
     /// The settled subagents' fold, with their count.

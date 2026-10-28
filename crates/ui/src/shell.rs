@@ -1744,8 +1744,10 @@ enum ShellEscapeOutcome {
 /// timer and its 7s flavour word), else the next wall-clock minute for
 /// relative "5m"/"2h" labels. State transitions (staleness, device presence,
 /// send grace) arrive as AppState notifications instead — see
-/// [`AppState::watch_clock_transitions`]. Nothing else ticks: AwaitingInput
-/// and Errored show no clock, and the connection pill has no countdown (its
+/// [`AppState::watch_clock_transitions`]. Besides this, only the running
+/// work's elapsed times tick (the session card's background lane, and the
+/// composer's open pill tray on its own [`ClockRedraw`]): AwaitingInput and
+/// Errored show no clock, and the connection pill has no countdown (its
 /// spinner animates itself).
 fn shell_clock_wake(state: &AppState, now: DateTime<Utc>) -> DateTime<Utc> {
     let working = state
@@ -1763,7 +1765,7 @@ fn shell_clock_wake(state: &AppState, now: DateTime<Utc>) -> DateTime<Utc> {
 /// clock-driven change. Idle views sleep until that deadline instead of
 /// polling.
 #[derive(Default)]
-struct ClockRedraw {
+pub(crate) struct ClockRedraw {
     wake_at: Option<DateTime<Utc>>,
     task: Option<Task<()>>,
 }
@@ -1771,7 +1773,7 @@ struct ClockRedraw {
 impl ClockRedraw {
     /// Notify the view at `wake` unless a redraw is already due no later.
     /// `slot` finds this timer on the view so the firing task can clear it.
-    fn arm<V: 'static>(
+    pub(crate) fn arm<V: 'static>(
         &mut self,
         wake: DateTime<Utc>,
         now: DateTime<Utc>,

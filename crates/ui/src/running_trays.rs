@@ -7,7 +7,6 @@
 //! with nothing to list is absent, and its open tray closes with it.
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -23,7 +22,7 @@ use crate::running_work::{
     STOP_SIZE, SubagentRow, background_stop_button, background_task_title, elapsed_label,
     running_subagent_rows, stop_background_task,
 };
-use crate::state::clock_now;
+use crate::state::{AppState, clock_now};
 use crate::theme::Theme;
 
 /// One of the two pills, and the tray it opens.
@@ -67,27 +66,51 @@ const LOADER_DOT: f32 = 2.0;
 /// so its corners are concentric with the row's.
 const STOP_INSET: f32 = (ROW_HEIGHT - STOP_SIZE) / 2.0;
 
-impl Composer {
-    /// The pills that render for the selected chat, left to right: one per
-    /// non-empty list.
-    pub(crate) fn running_pills(&self, cx: &App) -> Vec<RunningTray> {
-        let (subagents, tasks) = self.running_work(cx);
-        [
-            (!subagents.is_empty()).then_some(RunningTray::Subagents),
-            (!tasks.is_empty()).then_some(RunningTray::Background),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
+/// The selected chat's running subagents, rewalked only when its transcript
+/// changes, like the checklist's `TodoCache`: the composer renders on every
+/// keystroke, and the walk scans and sorts every spawn chip. It holds rows,
+/// not labels, so elapsed times still render fresh.
+#[derive(Debug, Default)]
+pub(crate) struct SubagentRowsCache {
+    key: Option<(String, u64, usize)>,
+    rows: Vec<SubagentRow>,
+}
 
-    fn running_work(&self, cx: &App) -> (Vec<SubagentRow>, Vec<BackgroundTask>) {
+impl SubagentRowsCache {
+    fn rows(&mut self, state: &AppState, chat_id: &str) -> &[SubagentRow] {
+        let key = (
+            chat_id.to_owned(),
+            state.transcript_revision,
+            state.transcript.len(),
+        );
+        if self.key.as_ref() != Some(&key) {
+            self.rows = running_subagent_rows(state, chat_id);
+            self.key = Some(key);
+        }
+        &self.rows
+    }
+}
+
+/// The pills that render, left to right: one per non-empty list.
+fn pills(subagents: &[SubagentRow], tasks: &[BackgroundTask]) -> Vec<RunningTray> {
+    [
+        (!subagents.is_empty()).then_some(RunningTray::Subagents),
+        (!tasks.is_empty()).then_some(RunningTray::Background),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+impl Composer {
+    /// The selected chat's running subagents and background tasks.
+    fn running_work(&mut self, cx: &App) -> (Vec<SubagentRow>, Vec<BackgroundTask>) {
         let state = self.state.read(cx);
         let Some(chat_id) = state.selected_chat.as_deref() else {
             return Default::default();
         };
         (
-            running_subagent_rows(state, chat_id),
+            self.running_rows_cache.rows(state, chat_id).to_vec(),
             state.background_tasks_for(chat_id, clock_now()).to_vec(),
         )
     }
@@ -122,7 +145,7 @@ impl Composer {
         if entry.open.is_some_and(|tray| len(tray) == 0) {
             entry.open = None;
         }
-        let pills = self.running_pills(cx);
+        let pills = pills(&subagents, &tasks);
         if pills.is_empty() {
             return None;
         }
@@ -206,8 +229,16 @@ impl Composer {
             )
         });
         let trays: Vec<_> = trays.collect();
+        // Elapsed times only move with the clock: while a tray shows them,
+        // re-render once a second.
         if any_revealed {
-            self.tick_running_trays(cx);
+            let now = chrono::Utc::now();
+            self.running_clock.arm(
+                now + chrono::TimeDelta::seconds(1),
+                now,
+                |composer: &mut Composer| &mut composer.running_clock,
+                cx,
+            );
         }
         Some(
             div()
@@ -217,22 +248,6 @@ impl Composer {
                 .children(trays)
                 .into_any_element(),
         )
-    }
-
-    /// Elapsed times only move with the clock: while a tray shows them,
-    /// re-render once a second.
-    fn tick_running_trays(&mut self, cx: &mut Context<Self>) {
-        if self.running_tick.is_some() {
-            return;
-        }
-        self.running_tick = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            this.update(cx, |composer, cx| {
-                composer.running_tick = None;
-                cx.notify();
-            })
-            .ok();
-        }));
     }
 
     /// `● 2 subagents ⌃`: the loader, the count, the noun and a chevron that
@@ -609,7 +624,10 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) -> Vec<RunningTray> {
         handle
-            .update(cx, |composer, _, cx| composer.running_pills(cx))
+            .update(cx, |composer, _, cx| {
+                let (subagents, tasks) = composer.running_work(cx);
+                super::pills(&subagents, &tasks)
+            })
             .unwrap()
     }
 
@@ -633,6 +651,25 @@ mod tests {
         handle
             .update(cx, |composer, _, cx| composer.toggle_running_tray(tray, cx))
             .unwrap();
+    }
+
+    #[test]
+    fn subagent_rows_rewalk_only_when_the_transcript_changes() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("a".into());
+        state.transcript = vec![running_spawn("t1")];
+        let mut cache = SubagentRowsCache::default();
+        assert_eq!(cache.rows(&state, "a").len(), 1);
+        // Same chat, revision and length: served from the cache.
+        state.transcript[0].parts.clear();
+        assert_eq!(cache.rows(&state, "a").len(), 1);
+        state.transcript_revision += 1;
+        assert!(cache.rows(&state, "a").is_empty());
+        // Another chat never reuses the first chat's rows.
+        state.transcript = vec![running_spawn("t2")];
+        state.transcript_revision += 1;
+        assert_eq!(cache.rows(&state, "a").len(), 1);
+        assert!(cache.rows(&state, "b").is_empty());
     }
 
     #[gpui::test]
