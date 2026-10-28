@@ -1,9 +1,11 @@
 //! Frame → [`AgentEvent`] normalization (init dedupe, subagent tagging, tool
 //! decoding, error-code mapping).
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use zeron_proto::{
-    AgentEvent, CompactionPhase, DoneStatus, HarnessId, TodoItem, TodoStatus, ToolCall,
+    AgentEvent, BackgroundTask, BackgroundTaskKind, CompactionPhase, DoneStatus, HarnessId,
+    TodoItem, TodoStatus, ToolCall,
 };
 
 use super::wire::{ContentBlock, Frame, MessageFrame, ResultFrame};
@@ -901,6 +903,36 @@ impl Normalizer {
                     }
                     return out;
                 }
+                // The session's whole background set, not a delta. A
+                // subagent's own frame must not replace the root's set.
+                if f.subtype == "background_tasks_changed" {
+                    if f.parent_tool_use_id.is_some() {
+                        return Vec::new();
+                    }
+                    let tasks = f
+                        .tasks
+                        .iter()
+                        .flatten()
+                        .filter_map(|entry| {
+                            let id = entry.get("task_id").and_then(Value::as_str)?;
+                            let kind = entry
+                                .get("task_type")
+                                .and_then(Value::as_str)
+                                .and_then(BackgroundTaskKind::from_wire)?;
+                            Some(BackgroundTask {
+                                id: id.to_owned(),
+                                kind,
+                                description: entry
+                                    .get("description")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                started_at: DateTime::<Utc>::UNIX_EPOCH,
+                            })
+                        })
+                        .collect();
+                    return vec![AgentEvent::BackgroundTasks { tasks }];
+                }
                 // Compaction runs a whole model call with nothing streamed.
                 if f.subtype == "status" && f.status.as_deref() == Some("compacting") {
                     return vec![
@@ -1415,6 +1447,65 @@ mod tests {
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
         Normalizer::new().normalize(frame, false)
+    }
+
+    #[test]
+    fn background_tasks_changed_keeps_shells_and_drops_agents() {
+        let events = normalize_one(
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[
+                {"task_id":"a1","task_type":"local_agent","description":"scout"},
+                {"task_id":"b1","task_type":"local_bash","description":"watch ci"},
+                {"task_id":"m1","task_type":"monitor","description":"tail log"}]}"#,
+        );
+        let [AgentEvent::BackgroundTasks { tasks }] = events.as_slice() else {
+            panic!("expected one BackgroundTasks, got {events:?}");
+        };
+        let ids: Vec<_> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["b1", "m1"]);
+        assert_eq!(tasks[0].kind, BackgroundTaskKind::Shell);
+        assert_eq!(tasks[1].kind, BackgroundTaskKind::Other("monitor".into()));
+        assert_eq!(tasks[0].description, "watch ci");
+        assert_eq!(tasks[0].started_at, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn background_tasks_changed_skips_entries_without_an_id_and_reads_absent_as_empty() {
+        let absent = normalize_one(r#"{"type":"system","subtype":"background_tasks_changed"}"#);
+        assert!(matches!(
+            absent.as_slice(),
+            [AgentEvent::BackgroundTasks { tasks }] if tasks.is_empty()
+        ));
+        let keyless = normalize_one(
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[
+                {"task_type":"local_bash","description":"no id"},
+                {"task_id":"b2","task_type":"local_bash"}]}"#,
+        );
+        let [AgentEvent::BackgroundTasks { tasks }] = keyless.as_slice() else {
+            panic!("expected one BackgroundTasks, got {keyless:?}");
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "b2");
+        assert_eq!(tasks[0].description, "");
+    }
+
+    #[test]
+    fn a_subagent_tagged_background_tasks_frame_is_not_decoded() {
+        let events = normalize_one(
+            r#"{"type":"system","subtype":"background_tasks_changed","parent_tool_use_id":"toolu_1","tasks":[{"task_id":"b1","task_type":"local_bash"}]}"#,
+        );
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_background_subagent_replay_yields_an_empty_set() {
+        let fixture =
+            include_str!("../../tests/fixtures/claude/live-2.1.228-background-subagent.jsonl");
+        let line = fixture.lines().nth(36).expect("line 37");
+        let events = normalize_one(line);
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::BackgroundTasks { tasks }] if tasks.is_empty()
+        ));
     }
 
     #[test]

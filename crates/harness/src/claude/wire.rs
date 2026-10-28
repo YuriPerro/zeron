@@ -110,6 +110,9 @@ pub(crate) struct SystemFrame {
     /// A `Value`: a shape we don't expect must not cost the frame.
     #[serde(default)]
     pub prompt: Option<Value>,
+    /// Set on a frame a subagent emitted, absent on the root session's.
+    #[serde(default)]
+    pub parent_tool_use_id: Option<String>,
     /// `background_tasks_changed`: every background task the session holds
     /// now (agents and shells) — the authoritative set, not a delta.
     #[serde(default)]
