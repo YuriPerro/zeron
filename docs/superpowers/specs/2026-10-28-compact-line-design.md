@@ -48,7 +48,7 @@ Conferido no registro do Claude Code 2.1.311: o compact automático traz `preTok
 Regra geral do motor:
 - Quando o fim chega sem "antes", o motor usa a última leitura de contexto do chat.
 - Quando o fim chega sem "depois", o motor guarda essa linha como pendente. A primeira leitura de contexto com tokens que chegar depois preenche o "depois". No `/compact` manual do Claude isso acontece quando o chat responde à próxima mensagem.
-- A pendência fica só em memória. Se o motor reiniciar antes da próxima leitura, a linha fica em "from 224K tokens".
+- A pendência não precisa de estado extra. No início de cada execução, o motor considera pendente a linha `Done` sem "depois" que estiver na última resposta do chat. Assim a pendência sobrevive a um reinício do motor.
 - Quando o fim chega sem um início (o frame de status pode não vir), a linha nasce já concluída.
 
 ## 5. Dados
