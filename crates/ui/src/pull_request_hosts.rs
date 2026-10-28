@@ -5,7 +5,8 @@ use gpui::{App, Global, Task};
 use std::collections::HashMap;
 use zeron_rpc::methods;
 
-const DEFAULT_HOST: &str = "github.com";
+/// The host a board and a pull request link use when they name none.
+pub(crate) const DEFAULT_HOST: &str = "github.com";
 
 /// Signed-in hosts by device (`None` is the local device).
 #[derive(Default)]
@@ -18,10 +19,14 @@ impl Global for PullRequestHosts {}
 impl PullRequestHosts {
     /// The device's hosts, or just `github.com` until they are known.
     pub(crate) fn hosts(cx: &App, device: Option<&str>) -> Vec<String> {
+        Self::known(cx, device).unwrap_or_else(|| vec![DEFAULT_HOST.to_owned()])
+    }
+
+    /// The device's hosts once it has reported them; `None` before that.
+    pub(crate) fn known(cx: &App, device: Option<&str>) -> Option<Vec<String>> {
         cx.try_global::<Self>()
             .and_then(|hosts| hosts.by_device.get(&device.map(str::to_owned)))
             .cloned()
-            .unwrap_or_else(|| vec![DEFAULT_HOST.to_owned()])
     }
 
     pub(crate) fn set(cx: &mut App, device: Option<String>, hosts: Vec<String>) {

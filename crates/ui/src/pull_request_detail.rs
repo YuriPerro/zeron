@@ -6,7 +6,7 @@ mod handoff;
 #[path = "pull_request_interactions.rs"]
 mod interactions;
 use crate::{
-    pull_request_hosts::PullRequestHosts,
+    pull_request_hosts::{DEFAULT_HOST, PullRequestHosts},
     settings::{self, PullRequestDestination, widgets},
     state::AppState,
     theme::Theme,
@@ -21,8 +21,6 @@ use std::{borrow::Cow, cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 use zeron_proto::change_request_assessment::{CiState, Facts, check_failed, check_status};
 use zeron_proto::{ChangeRequestDetail, ChangeRequestListItem, RepositoryRef};
 use zeron_rpc::methods;
-
-const DEFAULT_HOST: &str = "github.com";
 
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = shell, no_json)]

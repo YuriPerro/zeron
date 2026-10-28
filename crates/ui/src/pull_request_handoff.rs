@@ -98,11 +98,20 @@ pub(super) fn repository(url: &str) -> String {
     url.split('/').skip(3).take(2).collect::<Vec<_>>().join("/")
 }
 
+/// The `--repo` value `gh` needs: `owner/name` on github.com and
+/// `host/owner/name` on any other host.
+fn gh_repository(url: &str) -> String {
+    match super::pull_request_repository(url) {
+        Some(link) if link.host != DEFAULT_HOST => format!("{}/{}", link.host, link.repository),
+        _ => repository(url),
+    }
+}
+
 pub(super) fn checkout_command(detail: &ChangeRequestDetail, url: &str) -> String {
     format!(
         "gh pr checkout {} --repo {}",
         detail.number,
-        repository(url)
+        gh_repository(url)
     )
 }
 
@@ -161,6 +170,7 @@ pub(super) fn prompt(
     platform: VerificationPlatform,
 ) -> String {
     let repo = repository(url);
+    let gh_repo = gh_repository(url);
     let number = detail.number;
     let head = ref_name(&detail.head_ref_name);
     let mut prompt = format!(
@@ -171,7 +181,7 @@ pub(super) fn prompt(
     );
     let assessment = Facts::from_detail(detail).assess();
     if zeron_proto::change_request_assessment::valid_head_oid(&detail.head_ref_oid) {
-        prompt.push_str(&format!("Observed source commit: {}\nAfter checkout, verify `git rev-parse HEAD` equals this commit. Check the current head with `gh pr view {number} --repo {repo} --json headRefOid`. If it changed, refresh the assessment before working.\n", detail.head_ref_oid));
+        prompt.push_str(&format!("Observed source commit: {}\nAfter checkout, verify `git rev-parse HEAD` equals this commit. Check the current head with `gh pr view {number} --repo {gh_repo} --json headRefOid`. If it changed, refresh the assessment before working.\n", detail.head_ref_oid));
     } else {
         prompt.push_str("Observed source commit: unavailable. Resolve and record the current head before working; this assessment cannot attest to an exact revision.\n");
     }
@@ -191,13 +201,13 @@ pub(super) fn prompt(
     prompt.push_str("\n");
     match kind {
         Handoff::Review => prompt.push_str(&format!(
-            "Review this pull request. Read the description with `gh pr view {number} --repo {repo}` and the diff with `gh pr diff {number} --repo {repo}`. Look for correctness bugs, regressions, and missing tests. Report findings by severity with file:line references. Don't push changes or post comments."
+            "Review this pull request. Read the description with `gh pr view {number} --repo {gh_repo}` and the diff with `gh pr diff {number} --repo {gh_repo}`. Look for correctness bugs, regressions, and missing tests. Report findings by severity with file:line references. Don't push changes or post comments."
         )),
         Handoff::AddressFeedback => prompt.push_str(&format!(
-            "Address the open review feedback. Read conversation comments with `gh pr view {number} --repo {repo} --comments`. This command excludes inline review comments. Retrieve all inline comment bodies and replies with `gh api --paginate repos/{repo}/pulls/{number}/comments`. Fetch reviewThreads through the GitHub GraphQL API (repository → pullRequest → reviewThreads), including isResolved, isOutdated, path, line, originalLine, and comments with id, replyTo, body, author, url and createdAt. Paginate BOTH reviewThreads and each thread’s comments using pageInfo.hasNextPage/endCursor and after; do not assume the first 100 entries are complete. Prioritize unresolved threads, including outdated ones, and retain resolved threads and replies as context. Make the requested changes on `{head}`, run the relevant tests, and summarize what changed for each comment. Ask before pushing."
+            "Address the open review feedback. Read conversation comments with `gh pr view {number} --repo {gh_repo} --comments`. This command excludes inline review comments. Retrieve all inline comment bodies and replies with `gh api --paginate repos/{repo}/pulls/{number}/comments`. Fetch reviewThreads through the GitHub GraphQL API (repository → pullRequest → reviewThreads), including isResolved, isOutdated, path, line, originalLine, and comments with id, replyTo, body, author, url and createdAt. Paginate BOTH reviewThreads and each thread’s comments using pageInfo.hasNextPage/endCursor and after; do not assume the first 100 entries are complete. Prioritize unresolved threads, including outdated ones, and retain resolved threads and replies as context. Make the requested changes on `{head}`, run the relevant tests, and summarize what changed for each comment. Ask before pushing."
         )),
         Handoff::ResolveConflicts => prompt.push_str(&format!(
-            "Inspect merge conflicts against the current base with `gh pr view {number} --repo {repo} --json baseRefName,mergeable`. Resolve them on `{head}`, preserve both sides' intended behavior, and test the resulting combination. Ask before pushing."
+            "Inspect merge conflicts against the current base with `gh pr view {number} --repo {gh_repo} --json baseRefName,mergeable`. Resolve them on `{head}`, preserve both sides' intended behavior, and test the resulting combination. Ask before pushing."
         )),
         Handoff::FixChecks => {
             prompt.push_str("These checks are failing:\n");
@@ -217,7 +227,7 @@ pub(super) fn prompt(
                 }
             }
             prompt.push_str(&format!(
-                "\nInspect them with `gh pr checks {number} --repo {repo}` and the failed logs with `gh run view <run-id> --repo {repo} --log-failed`. Reproduce each failure locally, fix the root cause on `{head}`, and verify the fix. Ask before pushing."
+                "\nInspect them with `gh pr checks {number} --repo {gh_repo}` and the failed logs with `gh run view <run-id> --repo {gh_repo} --log-failed`. Reproduce each failure locally, fix the root cause on `{head}`, and verify the fix. Ask before pushing."
             ));
         }
     }
@@ -725,6 +735,19 @@ mod tests {
             checkout_command(&detail, url),
             "gh pr checkout 591 --repo acme/zeron"
         );
+        let enterprise = "https://acme.ghe.com/infra/app/pull/591";
+        assert_eq!(
+            checkout_command(&detail, enterprise),
+            "gh pr checkout 591 --repo acme.ghe.com/infra/app"
+        );
+        let enterprise_review = prompt(
+            Handoff::Review,
+            &detail,
+            enterprise,
+            VerificationPlatform::Relevant,
+        );
+        assert!(enterprise_review.starts_with("Pull request #591 in infra/app: "));
+        assert!(enterprise_review.contains("gh pr diff 591 --repo acme.ghe.com/infra/app"));
         let checks = prompt(
             Handoff::FixChecks,
             &detail,

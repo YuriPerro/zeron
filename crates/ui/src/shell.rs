@@ -16213,7 +16213,9 @@ mod exit_regressions {
                         settings.open_web_links_in_zeron = open_links_in_zeron;
                         settings.pull_request_destination =
                             settings::PullRequestDestination::External;
-                        settings.last_pull_request_repository = Some("acme/zeron".into());
+                        settings.last_pull_request_host = Some("acme.ghe.com".into());
+                        settings.last_pull_request_repositories =
+                            [("acme.ghe.com".to_owned(), vec!["infra/a".to_owned()])].into();
                         settings.last_pull_request_device = Some("remote-pr-device".into());
                         settings.terminal_font_family = terminal_family.clone();
                         settings.terminal_font_size = terminal_size;
@@ -16247,8 +16249,12 @@ mod exit_regressions {
                             Some(dir.path().join("wallpapers/current.png"))
                         );
                         assert_eq!(
-                            current.last_pull_request_repository.as_deref(),
-                            Some("acme/zeron")
+                            current.last_pull_request_host.as_deref(),
+                            Some("acme.ghe.com")
+                        );
+                        assert_eq!(
+                            current.last_pull_request_repositories["acme.ghe.com"],
+                            ["infra/a"]
                         );
                         assert_eq!(
                             current.last_pull_request_device.as_deref(),
@@ -16281,8 +16287,12 @@ mod exit_regressions {
                     settings::flush(cx);
                     let loaded = settings::UiSettings::load(dir.path());
                     assert_eq!(
-                        loaded.last_pull_request_repository.as_deref(),
-                        Some("acme/zeron")
+                        loaded.last_pull_request_host.as_deref(),
+                        Some("acme.ghe.com")
+                    );
+                    assert_eq!(
+                        loaded.last_pull_request_repositories["acme.ghe.com"],
+                        ["infra/a"]
                     );
                     assert_eq!(
                         loaded.last_pull_request_device.as_deref(),
