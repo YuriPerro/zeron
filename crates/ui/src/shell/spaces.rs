@@ -8,8 +8,8 @@
 //! management (add via the palette; rename/delete via row context menus).
 //! Child module of `shell` so it renders straight off `Shell`'s private state.
 
-use super::*;
 use super::sidebar_order::compare_sidebar_chats;
+use super::*;
 use crate::pickers::{
     breadcrumbs, browser_rows, completion_prefix_len, folder_path_key, parent_path,
     same_folder_path,
@@ -930,6 +930,154 @@ mod pinned_session_tests {
             })
             .unwrap();
         cx.run_until_parked();
+    }
+
+    /// Projects a and b; "pin" (a) is pinned, then b-new, a-new, b-old from
+    /// newest to oldest. Returns the project keys of a and b.
+    fn project_order_fixture(
+        shell: &mut super::Shell,
+        cx: &mut gpui::Context<super::Shell>,
+    ) -> (String, String) {
+        use super::*;
+        shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+        shell
+            .settings
+            .sidebar_pins_mut("local".into())
+            .push("pin".into());
+        shell.state.update(cx, |state, _| {
+            state.workspace_scope = Some(WorkspaceScope::Local);
+            state.spaces = ["a", "b"].into_iter().map(|id| serde_json::from_value(serde_json::json!({
+                "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+            })).unwrap()).collect();
+            state.chats = [("pin", "a"), ("b-new", "b"), ("a-new", "a"), ("b-old", "b")]
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (id, project))| {
+                    let mut chat = pin_test_chat(id);
+                    chat.space_id = Some(project.into());
+                    chat.created_at = Utc::now() - chrono::Duration::minutes(ix as i64);
+                    chat
+                })
+                .collect();
+        });
+        let state = shell.state.read(cx);
+        let key = |id: &str| zeron_proto::view::project_key(state.space_row(id).unwrap());
+        (key("a"), key("b"))
+    }
+
+    #[gpui::test]
+    fn manual_project_order_holds_when_a_lower_project_gets_a_newer_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                let (a, b) = project_order_fixture(shell, cx);
+                shell.settings.sidebar_project_order = SidebarProjectOrder::Manual;
+                shell.settings.space_order = vec![a, b];
+                assert_eq!(
+                    shell.sidebar_visible_order(cx),
+                    ids(&["pin", "a-new", "b-new", "b-old"])
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn filter_keeps_pins_and_the_open_chat(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                project_order_fixture(shell, cx);
+                shell.settings.sidebar_status_filter = SidebarStatusFilter::NeedsMe;
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("b-old".into());
+                });
+                assert_eq!(shell.sidebar_visible_order(cx), ids(&["pin", "b-old"]));
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn keyboard_order_matches_drawn_order_for_every_view_combination(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        let (a, _) = window
+            .update(cx, |shell, _, cx| {
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, true);
+                project_order_fixture(shell, cx)
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        let every = [
+            ("pin", "session-slot-pin"),
+            ("b-new", "session-slot-b-new"),
+            ("a-new", "session-slot-a-new"),
+            ("b-old", "session-slot-b-old"),
+        ];
+        for organization in [
+            SidebarOrganization::ByProject,
+            SidebarOrganization::ByDevice,
+            SidebarOrganization::InOneList,
+        ] {
+            for projects in [
+                SidebarProjectOrder::Recent,
+                SidebarProjectOrder::Manual,
+                SidebarProjectOrder::Name,
+            ] {
+                for sort in [
+                    SidebarSort::LastUpdated,
+                    SidebarSort::Created,
+                    SidebarSort::Name,
+                    SidebarSort::Status,
+                ] {
+                    for filter in [
+                        SidebarStatusFilter::All,
+                        SidebarStatusFilter::Active,
+                        SidebarStatusFilter::NeedsMe,
+                    ] {
+                        window
+                            .update(&mut cx, |shell, _, cx| {
+                                shell.settings.sidebar_organization = organization;
+                                shell.settings.sidebar_project_order = projects;
+                                shell.settings.sidebar_sort = sort;
+                                shell.settings.sidebar_status_filter = filter;
+                                shell.settings.space_order = vec![a.clone()];
+                                cx.notify();
+                            })
+                            .unwrap();
+                        cx.run_until_parked();
+                        let mut drawn: Vec<(gpui::Pixels, String)> = every
+                            .iter()
+                            .filter_map(|(id, selector)| {
+                                cx.debug_bounds(selector)
+                                    .map(|bounds| (bounds.top(), id.to_string()))
+                            })
+                            .collect();
+                        drawn.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
+                        let drawn: Vec<String> = drawn.into_iter().map(|(_, id)| id).collect();
+                        let keyboard = window
+                            .update(&mut cx, |shell, _, cx| shell.sidebar_visible_order(cx))
+                            .unwrap();
+                        assert_eq!(
+                            keyboard, drawn,
+                            "{organization:?} {projects:?} {sort:?} {filter:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[gpui::test]
@@ -2216,7 +2364,7 @@ const ARCHIVED_PAGE_ROWS: usize = 25;
 /// Put this machine's device group first without disturbing the recency-based
 /// order of any remote groups. A targeted promotion is more truthful than a
 /// full name sort: local context leads, then the user's chosen chat sort wins.
-fn promote_local_device_group<T>(
+pub(super) fn promote_local_device_group<T>(
     groups: &mut Vec<(Option<(String, String)>, Vec<T>)>,
     local_device_id: Option<&str>,
 ) {
@@ -4991,12 +5139,11 @@ impl Shell {
             .as_ref()
             .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let state = self.state.read(cx);
-        let mut chats: Vec<_> = state.sidebar_chats(Utc::now(), filter.as_deref());
-        chats.sort_by(|left, right| {
-            compare_sidebar_chats(self.settings.sidebar_sort, *left, *right)
-        });
-        let chats: Vec<zeron_proto::Chat> =
-            chats.into_iter().map(|(_, chat)| chat.clone()).collect();
+        let chats: Vec<zeron_proto::Chat> = self
+            .sidebar_sorted_chats(state, Utc::now(), pinned_order)
+            .into_iter()
+            .map(|(_, chat)| chat)
+            .collect();
         let (pinned_chats, chats): (Vec<_>, Vec<_>) = chats
             .into_iter()
             .partition(|chat| pinned_order.contains(&chat.id));
@@ -5025,23 +5172,20 @@ impl Shell {
         let ordered = if self.settings.sidebar_organization != SidebarOrganization::InOneList {
             let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
             for chat in chats {
-                let key = Some((
+                let key = Some(
                     if self.settings.sidebar_organization == SidebarOrganization::ByProject {
-                        sidebar_project_group(state, &chat).0
+                        sidebar_project_group(state, &chat)
                     } else {
-                        chat.device_id.clone()
+                        (chat.device_id.clone(), String::new())
                     },
-                    String::new(),
-                ));
+                );
                 if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
                     existing.push(chat);
                 } else {
                     groups.push((key, vec![chat]));
                 }
             }
-            if self.settings.sidebar_organization == SidebarOrganization::ByDevice {
-                promote_local_device_group(&mut groups, state.local_device_id.as_deref());
-            }
+            self.order_sidebar_groups(state, &mut groups);
             groups
                 .into_iter()
                 .flat_map(|(_, rows)| rows)
@@ -5307,28 +5451,16 @@ impl Shell {
                 drag.filter == filter && profile_key.as_deref() == Some(&drag.profile_key)
             })
             .map(|drag| drag.visible_ids.clone());
+        let pinned_order = frozen_pinned
+            .as_ref()
+            .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let mut rows: Vec<ActiveChatRow> = {
             let state = self.state.read(cx);
-            let mut chats: Vec<_> = state
-                .sidebar_chats(now, filter.as_deref())
-                .into_iter()
-                .map(|(status, chat)| (status, chat.clone()))
-                .collect();
-            chats.sort_by(|left, right| {
-                compare_sidebar_chats(
-                    self.settings.sidebar_sort,
-                    (left.0, &left.1),
-                    (right.0, &right.1),
-                )
-            });
-            chats
+            self.sidebar_sorted_chats(state, now, pinned_order)
                 .into_iter()
                 .map(|(status, chat)| self.sidebar_chat_data(status, chat, state))
                 .collect()
         };
-        let pinned_order = frozen_pinned
-            .as_ref()
-            .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let base_ids: Vec<String> = rows.iter().map(|row| row.chat.id.clone()).collect();
         let ordered_ids = project_pinned_first(&base_ids, pinned_order);
         let rank: std::collections::HashMap<&str, usize> = ordered_ids
@@ -5414,10 +5546,7 @@ impl Shell {
                     .position(|id| id == &row.chat.id)
             });
         }
-        if self.settings.sidebar_organization == SidebarOrganization::ByDevice {
-            let local_device_id = self.state.read(cx).local_device_id.clone();
-            promote_local_device_group(&mut regular_groups, local_device_id.as_deref());
-        }
+        self.order_sidebar_groups(self.state.read(cx), &mut regular_groups);
         let mut sections = Vec::with_capacity(regular_groups.len() + usize::from(pinned_count > 0));
         if !pinned_rows.is_empty() {
             sections.push((None, pinned_rows));
@@ -8211,8 +8340,8 @@ mod tests {
     use chrono::{TimeZone as _, Utc};
 
     use super::promote_local_device_group;
-    use crate::shell::sidebar_order::compare_sidebar_chats;
     use crate::settings::SidebarSort;
+    use crate::shell::sidebar_order::compare_sidebar_chats;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])

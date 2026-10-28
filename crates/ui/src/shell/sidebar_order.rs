@@ -4,7 +4,60 @@ use std::cmp::Ordering;
 
 use zeron_proto::ChatIndicator;
 
-use crate::settings::{SidebarProjectOrder, SidebarSort, SidebarStatusFilter};
+use crate::settings::{SidebarOrganization, SidebarProjectOrder, SidebarSort, SidebarStatusFilter};
+use crate::state::AppState;
+
+use super::Shell;
+
+impl Shell {
+    /// The sidebar's active chats under the project and status filters, in
+    /// the chosen sort. Pinned chats and the open chat pass any status
+    /// filter. Both the drawn list and the keyboard order start here.
+    pub(super) fn sidebar_sorted_chats(
+        &self,
+        state: &AppState,
+        now: chrono::DateTime<chrono::Utc>,
+        pinned: &[String],
+    ) -> Vec<(ChatIndicator, zeron_proto::Chat)> {
+        let filter = self.settings.sidebar_status_filter;
+        let selected = state.selected_chat.as_deref();
+        let mut chats: Vec<_> = state
+            .sidebar_chats(now, self.settings.space_filter.as_deref())
+            .into_iter()
+            .filter(|(status, chat)| {
+                status_filter_keeps(filter, *status)
+                    || pinned.contains(&chat.id)
+                    || selected == Some(chat.id.as_str())
+            })
+            .collect();
+        chats.sort_by(|left, right| {
+            compare_sidebar_chats(self.settings.sidebar_sort, *left, *right)
+        });
+        chats
+            .into_iter()
+            .map(|(status, chat)| (status, chat.clone()))
+            .collect()
+    }
+
+    /// Order the device or project groups the way the sidebar draws them.
+    pub(super) fn order_sidebar_groups<T>(
+        &self,
+        state: &AppState,
+        groups: &mut Vec<(Option<(String, String)>, Vec<T>)>,
+    ) {
+        match self.settings.sidebar_organization {
+            SidebarOrganization::ByDevice => {
+                super::spaces::promote_local_device_group(groups, state.local_device_id.as_deref())
+            }
+            SidebarOrganization::ByProject => order_project_groups(
+                groups,
+                self.settings.sidebar_project_order,
+                &self.settings.space_order,
+            ),
+            SidebarOrganization::InOneList => {}
+        }
+    }
+}
 
 /// One chat against another under `sort`, newest first on ties, then by id
 /// so equal rows never swap between renders.
