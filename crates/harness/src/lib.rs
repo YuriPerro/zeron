@@ -81,9 +81,59 @@ impl SteerMessage {
 pub struct TurnControl {
     stop: std::sync::Arc<tokio::sync::Notify>,
     background: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    task_stops: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TaskStop>>>,
+    task_stop_wake: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// One background task the host asked the runtime to stop. The driver
+/// answers `reply` with the agent's verdict; a dropped reply means the
+/// runtime went away before it answered.
+pub struct TaskStop {
+    pub task_id: String,
+    pub reply: oneshot::Sender<Result<(), String>>,
 }
 
 impl TurnControl {
+    /// Host: stop one background task by id, leaving the turn and the
+    /// runtime's other work alone.
+    pub fn stop_task(&self, task_id: String) -> oneshot::Receiver<Result<(), String>> {
+        let (reply, answer) = oneshot::channel();
+        self.task_stops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(TaskStop { task_id, reply });
+        self.task_stop_wake.notify_one();
+        answer
+    }
+
+    /// Driver: the next queued [`Self::stop_task`], oldest first. Cancel-safe:
+    /// a request leaves the queue only when this future returns it.
+    pub async fn task_stop_requested(&self) -> TaskStop {
+        loop {
+            let wake = self.task_stop_wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            if let Some(stop) = self
+                .task_stops
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+            {
+                return stop;
+            }
+            wake.await;
+        }
+    }
+
+    /// Driver: the runtime is gone, so queued task stops will never be
+    /// answered; dropping their replies tells each waiting host so.
+    pub fn drop_task_stops(&self) {
+        self.task_stops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// Host: end the in-flight turn, keeping the runtime and its background work.
     pub fn stop_turn(&self) {
         self.stop.notify_one();
@@ -827,6 +877,22 @@ mod path_tests {
             paths,
             [r"C:\Users\a\AppData\Roaming\npm", r"C:\nvm4w\nodejs"].map(PathBuf::from)
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_control_tests {
+    #[tokio::test]
+    async fn task_stops_queue_in_order() {
+        let turn = super::TurnControl::default();
+        let a = turn.stop_task("a".into());
+        let _b = turn.stop_task("b".into());
+        let first = turn.task_stop_requested().await;
+        let second = turn.task_stop_requested().await;
+        assert_eq!(first.task_id, "a");
+        assert_eq!(second.task_id, "b");
+        first.reply.send(Ok(())).unwrap();
+        assert_eq!(a.await, Ok(Ok(())));
     }
 }
 

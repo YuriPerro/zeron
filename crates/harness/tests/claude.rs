@@ -2154,6 +2154,95 @@ async fn a_stopped_turn_keeps_the_process_and_its_background_work() {
     );
 }
 
+/// Runs `scenario:stop-task`, stops `task_id` once the turn streams, and
+/// returns the stop's reply with every event up to the turn's end.
+async fn stop_one_task(
+    task_id: &str,
+) -> (
+    Result<Result<(), String>, tokio::sync::oneshot::error::RecvError>,
+    Vec<AgentEvent>,
+) {
+    use zeron_harness::TurnControl;
+    let (mut controls, _steer, _token) = controls("A");
+    let turn = TurnControl::default();
+    controls.turn = turn.clone();
+    let mut stream = harness()
+        .run(request("scenario:stop-task"), controls)
+        .await
+        .expect("run starts");
+    async fn next_event(
+        stream: &mut futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>,
+    ) -> Option<AgentEvent> {
+        tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("event in time")
+            .map(|r| r.expect("stream event"))
+    }
+    loop {
+        match next_event(&mut stream).await {
+            Some(AgentEvent::TextDelta { text }) if text == "working" => break,
+            Some(_) => {}
+            None => panic!("stream ended before the turn streamed"),
+        }
+    }
+    let reply = turn.stop_task(task_id.into());
+    let mut events = Vec::new();
+    loop {
+        match next_event(&mut stream).await {
+            Some(done @ AgentEvent::Done { .. }) => {
+                events.push(done);
+                break;
+            }
+            Some(event) => events.push(event),
+            None => panic!("stream ended before the turn finished"),
+        }
+    }
+    let reply = tokio::time::timeout(Duration::from_secs(10), reply)
+        .await
+        .expect("reply in time");
+    (reply, events)
+}
+
+#[tokio::test]
+async fn stopping_a_background_task_sends_stop_task_and_keeps_the_turn() {
+    let (reply, events) = stop_one_task("b1").await;
+    assert_eq!(reply, Ok(Ok(())));
+    let cleared = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::BackgroundTasks { tasks } if tasks.is_empty()))
+        .unwrap_or_else(|| panic!("the stopped task leaves the set: {events:?}"));
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert!(cleared < events.len() - 1);
+}
+
+#[tokio::test]
+async fn stopping_an_unknown_task_reports_the_refusal() {
+    let (reply, events) = stop_one_task("nope").await;
+    match reply {
+        Ok(Err(msg)) => assert!(msg.contains("stop_task_refused"), "{msg}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
 fn done(events: &[AgentEvent]) -> (DoneStatus, Option<String>, Option<String>) {
     match events
         .iter()

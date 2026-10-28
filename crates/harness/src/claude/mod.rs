@@ -1268,6 +1268,14 @@ async fn run_session(session: Session) {
     let mut stops_sent = 0u64;
     let mut stopping: Option<String> = None;
     let mut stop_settle_at: Option<tokio::time::Instant> = None;
+    // Background-task stops in flight (`TurnControl::stop_task`): each
+    // request id and the host waiting on the CLI's verdict. They never touch
+    // the turn stop above — a task stop does not end the turn.
+    let mut task_stops_sent = 0u64;
+    let mut task_stop_replies: std::collections::HashMap<
+        String,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    > = std::collections::HashMap::new();
     // A turn end held for steers when the stop came: that turn's end, sent
     // as stopped once the stop settles — never before. Released early, the
     // host started the replacement prompt while the stopped turn could still
@@ -1390,6 +1398,10 @@ async fn run_session(session: Session) {
                             stop_settle_at = Some(tokio::time::Instant::now() + STOP_SETTLE);
                         }
                         let error = response.error_message();
+                        if let Some(reply) = task_stop_replies.remove(&response.request_id) {
+                            let _ = reply.send(error.map_or(Ok(()), Err));
+                            continue;
+                        }
                         if let Some((what, asked, _)) = pending_controls.remove(&response.request_id) {
                             if let Some(error) = &error {
                                 config_unsure = true;
@@ -1677,6 +1689,18 @@ async fn run_session(session: Session) {
                 }
             },
 
+            // Stop one background task by id; the CLI's control response
+            // carries the verdict back to the host.
+            stop = turn.task_stop_requested(), if !interrupted => {
+                task_stops_sent += 1;
+                let id = format!("zeron_stop_task_{task_stops_sent}");
+                let line = wire::stop_task_request_line(&id, &stop.task_id);
+                task_stop_replies.insert(id, stop.reply);
+                if !stdin.line(line) {
+                    break 'main;
+                }
+            },
+
             // The CLI answered the stop and no turn ended: it was between
             // turns. Settle the stop so the host sees the turn over.
             _ = tokio::time::sleep_until(stop_settle_at.unwrap_or_else(tokio::time::Instant::now)),
@@ -1711,6 +1735,9 @@ async fn run_session(session: Session) {
             _ = interrupt.cancelled(), if !interrupt_sent => {
                 interrupt_sent = true;
                 interrupted = true;
+                // The tasks go with the runtime: no verdict is coming.
+                task_stop_replies.clear();
+                turn.drop_task_stops();
                 // The runtime is going: so is everything it started.
                 #[cfg(unix)]
                 if let Some(pid) = child.id() {
@@ -1770,6 +1797,10 @@ async fn run_session(session: Session) {
             _ = event_tx.closed() => break 'main,
         }
     }
+
+    // The CLI is gone or going: task stops it never answered get no verdict.
+    drop(task_stop_replies);
+    turn.drop_task_stops();
 
     // A turn end still held when the CLI exited is the run's real end.
     if let Some(done) = held_done.take()

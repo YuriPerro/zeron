@@ -601,6 +601,28 @@ case "$first" in
   cat >/dev/null
   ;;
 
+*scenario:stop-task*)
+  # A per-task stop is the `stop_task` control request: the CLI stops that
+  # one background task and the turn runs on. An id it does not hold is
+  # refused with `stop_task_refused`.
+  [ "$initialized" = true ] || exit 7
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-stop-task"}'
+  emit '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash","description":"watch ci"}]}'
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}'
+  read -r line || exit 1
+  case "$line" in *'"subtype":"stop_task"'*) ;; *) exit 8 ;; esac
+  rid=$(printf '%s\n' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  tid=$(printf '%s\n' "$line" | sed 's/.*"task_id":"\([^"]*\)".*/\1/')
+  if [ "$tid" = b1 ]; then
+    emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{}}}"
+    emit '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+  else
+    emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":\"$rid\",\"error\":\"stop_task_refused: not running\"}}"
+  fi
+  emit '{"type":"result","subtype":"success","result":"done","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-stop-task"}'
+  cat >/dev/null
+  ;;
+
 *scenario:interrupt*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-int"}'
   # Wedge without reading stdin — forces the SIGTERM escalation path.

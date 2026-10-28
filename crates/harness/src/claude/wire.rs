@@ -641,6 +641,17 @@ pub(crate) fn stop_turn_request_line(request_id: &str) -> String {
     .to_string()
 }
 
+/// Stop one background task (the SDK's `stopTask`); the turn runs on. An id
+/// the CLI does not hold is refused with `stop_task_refused`.
+pub(crate) fn stop_task_request_line(request_id: &str, task_id: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "stop_task", "task_id": task_id },
+    })
+    .to_string()
+}
+
 /// Success reply to a CLI control request (`can_use_tool` allow/deny payloads).
 pub(crate) fn control_response_line(request_id: &str, response: Value) -> String {
     json!({
@@ -711,6 +722,15 @@ mod tests {
         assert_eq!(now["priority"], "now");
         assert_eq!(next["priority"], "next");
         assert_eq!(next["uuid"], "u2");
+    }
+
+    #[test]
+    fn stop_task_request_line_shape() {
+        let line: Value = serde_json::from_str(&stop_task_request_line("r", "b1")).unwrap();
+        assert_eq!(line["type"], "control_request");
+        assert_eq!(line["request_id"], "r");
+        assert_eq!(line["request"]["subtype"], "stop_task");
+        assert_eq!(line["request"]["task_id"], "b1");
     }
 
     #[test]
