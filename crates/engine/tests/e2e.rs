@@ -3996,6 +3996,111 @@ async fn session_row_counts_running_subagents_until_the_run_ends() {
     );
 }
 
+/// An engine over the fake Claude CLI, and a request that runs `scenario` in
+/// `dir` with its own config root.
+fn fake_claude(dir: &std::path::Path, scenario: &str) -> (EngineCore, RunRequest) {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../harness/tests/fixtures/fake-claude.sh");
+    let core = EngineCore::assemble(
+        dir,
+        registry_with(Arc::new(
+            zeron_harness::ClaudeHarness::new().with_executable(fixture),
+        )),
+        HarnessId::ClaudeCode,
+        None,
+    )
+    .expect("engine core assembles");
+    let mut request = run_request(scenario);
+    request.cwd = dir.display().to_string();
+    request.env = [(
+        "CLAUDE_CONFIG_DIR".to_owned(),
+        dir.join("claude").display().to_string(),
+    )]
+    .into();
+    (core, request)
+}
+
+fn background_tasks(core: &EngineCore) -> Vec<zeron_proto::BackgroundTask> {
+    core.sessions
+        .session_status(CHAT)
+        .map(|s| s.background_tasks)
+        .unwrap_or_default()
+}
+
+/// The session row carries the chat's background tasks, so every device can
+/// show the pills, and an ended run takes them with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_row_lists_background_tasks_until_the_run_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, request) = fake_claude(dir.path(), "scenario:stop-task");
+    core.sessions
+        .dispatch(CHAT, HarnessId::ClaudeCode, request, None)
+        .await
+        .unwrap();
+
+    wait_for(|| !background_tasks(&core).is_empty(), "the reported task").await;
+    let tasks = background_tasks(&core);
+    assert_eq!(tasks.len(), 1, "{tasks:?}");
+    assert_eq!(tasks[0].id, "b1");
+    assert_eq!(tasks[0].kind, zeron_proto::BackgroundTaskKind::Shell);
+    assert_eq!(tasks[0].description, "watch ci");
+
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "background-interrupt",
+        SessionCommandPayload::Interrupt {},
+    );
+    wait_for(
+        || {
+            matches!(
+                core.sessions.session_status(CHAT).map(|s| s.status),
+                Some(SessionStatus::Idle | SessionStatus::Errored)
+            )
+        },
+        "run to end",
+    )
+    .await;
+    assert!(
+        background_tasks(&core).is_empty(),
+        "an ended run leaves no background tasks listed"
+    );
+    core.sessions.shutdown().await;
+}
+
+/// The set the CLI reports while a turn is stopped in place stays on the row,
+/// and the next report (here, the next turn's empty one) replaces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_update_between_turns_reaches_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, request) = fake_claude(dir.path(), "scenario:stop-in-place");
+    core.sessions
+        .dispatch(CHAT, HarnessId::ClaudeCode, request, None)
+        .await
+        .unwrap();
+
+    // `bg-1` is a background agent: a subagent pill, never a task pill.
+    wait_for(|| !background_tasks(&core).is_empty(), "turn 1's set").await;
+    let ids = || -> Vec<String> { background_tasks(&core).into_iter().map(|t| t.id).collect() };
+    assert_eq!(ids(), ["bg-2"]);
+
+    assert!(core.sessions.stop_turn(CHAT).await.unwrap());
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle)
+    );
+    assert_eq!(ids(), ["bg-2"], "the stop spared the background task");
+
+    let mut next = run_request("carry on");
+    next.cwd = dir.path().display().to_string();
+    core.sessions
+        .dispatch(CHAT, HarnessId::ClaudeCode, next, Some("m-2".into()))
+        .await
+        .unwrap();
+    wait_for(|| ids().is_empty(), "turn 2's empty set").await;
+    core.sessions.shutdown().await;
+}
+
 /// A harness whose first turn streams whatever the test sends, so the turn
 /// stays live while the test publishes into it; later turns run the mock.
 struct HoldsTurn {

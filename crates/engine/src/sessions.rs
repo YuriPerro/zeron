@@ -2071,6 +2071,42 @@ impl Inner {
         }
     }
 
+    /// Publish the background tasks `chat_id`'s harness reports, the way
+    /// [`Self::set_running_subagents`] publishes its count. A task keeps the
+    /// start of its first report (the harness gives none), a new one starts
+    /// now, and an unchanged set is a no-op.
+    fn set_background_tasks(&self, chat_id: &str, mut tasks: Vec<zeron_proto::BackgroundTask>) {
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            let now = Utc::now();
+            for task in &mut tasks {
+                task.started_at = entry
+                    .background_tasks
+                    .iter()
+                    .find(|known| known.id == task.id)
+                    .map_or(now, |known| known.started_at);
+            }
+            if entry.background_tasks == tasks {
+                return;
+            }
+            entry.background_tasks = tasks;
+            entry.updated_at = now;
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if self.activity_tx.get().is_none()
+            && let Some(ws) = self.workspace()
+        {
+            ws.record_session(&session);
+        }
+    }
+
     fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
         lock(&self.runs)
             .get(chat_id)
@@ -4475,6 +4511,16 @@ async fn drive_run(
             }
             continue;
         }
+        // The harness's background tasks belong to the session row, never the
+        // transcript. Background shells outlive their turn, so a report must
+        // land whether or not one is running: handled before the parked gate.
+        if let AgentEvent::BackgroundTasks { tasks } = &event {
+            if !tasks.is_empty() {
+                inner.touch_session(&chat_id);
+            }
+            inner.set_background_tasks(&chat_id, tasks.clone());
+            continue;
+        }
         // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
         if let AgentEvent::ContextUsage { tokens, window } = &event {
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
@@ -5015,6 +5061,7 @@ async fn drive_run(
         }
     }
     inner.set_running_subagents(&chat_id, 0);
+    inner.set_background_tasks(&chat_id, Vec::new());
 
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
     // a routed send that raced this exit either finds its entry gone (we own
@@ -6010,6 +6057,54 @@ mod tests {
         );
         feed.send(done(DoneStatus::Completed)).unwrap();
         core.sessions.shutdown().await;
+    }
+
+    /// A pill's elapsed counts from when the engine first saw its task, so a
+    /// fresh report of the same id keeps that start, and an unchanged set
+    /// leaves the row alone.
+    #[test]
+    fn background_tasks_keep_their_first_seen_start() {
+        use super::*;
+        use chrono::DateTime;
+        use zeron_proto::{BackgroundTask, BackgroundTaskKind};
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let task = |id: &str| BackgroundTask {
+            id: id.into(),
+            kind: BackgroundTaskKind::Shell,
+            description: id.into(),
+            started_at: std::time::UNIX_EPOCH.into(),
+        };
+        let row = || sessions.session_status("chat").unwrap();
+        let set = |ids: &[&str]| {
+            let tasks = ids.iter().map(|id| task(id)).collect();
+            sessions.inner.set_background_tasks("chat", tasks);
+        };
+        set(&["b1"]);
+        assert!(sessions.session_status("chat").is_none(), "no row, no set");
+
+        sessions
+            .inner
+            .set_status("chat", SessionStatus::Working, true);
+        set(&["b1"]);
+        let t1 = row().background_tasks[0].started_at;
+        assert!(t1 > DateTime::<Utc>::UNIX_EPOCH, "a new id starts now");
+
+        set(&["b1", "m1"]);
+        let both = row().background_tasks;
+        assert_eq!(both[0].started_at, t1);
+        assert!(both[1].started_at >= t1);
+
+        set(&["m1"]);
+        let only = row();
+        assert_eq!(only.background_tasks.len(), 1);
+        set(&["m1"]);
+        assert_eq!(row().updated_at, only.updated_at);
+        assert_eq!(row().background_tasks, only.background_tasks);
     }
 
     fn done(status: DoneStatus) -> AgentEvent {
