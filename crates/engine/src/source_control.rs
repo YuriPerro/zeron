@@ -440,6 +440,14 @@ impl GitHubCli {
         pending.await
     }
 
+    /// Parses `raw` against the hosts `gh` is signed in to, before any process runs.
+    pub(crate) async fn pull_request_url(
+        &self,
+        raw: &str,
+    ) -> Result<PullRequestUrl, ChangeRequestError> {
+        parse_pull_request_url(raw, &self.known_hosts().await)
+    }
+
     pub async fn detail(
         &self,
         url: &str,
@@ -462,7 +470,7 @@ impl GitHubCli {
         head: Option<&str>,
         base: Option<&str>,
     ) -> Result<serde_json::Value, ChangeRequestError> {
-        let url = validated_pull_request_url(url)?;
+        let url = self.pull_request_url(url).await?;
         for oid in [head, base].into_iter().flatten() {
             if !zeron_proto::change_request_assessment::valid_head_oid(oid) {
                 return Err(ChangeRequestError::Decode);
@@ -472,7 +480,8 @@ impl GitHubCli {
         // A board that observed a new revision must never join an older
         // in-flight read or reuse its five-minute (or refresh) cache entry.
         let key = format!(
-            "{diff}:{url}:{}:{}",
+            "{diff}:{}:{}:{}",
+            url.url,
             head.unwrap_or_default(),
             base.unwrap_or_default()
         );
@@ -494,15 +503,13 @@ impl GitHubCli {
         url: &str,
         body: &str,
     ) -> Result<zeron_proto::ChangeRequestComment, ChangeRequestError> {
-        let url = validated_pull_request_url(url)?;
+        let url = self.pull_request_url(url).await?;
         if body.trim().is_empty() || body.len() > 60_000 {
             return Err(ChangeRequestError::Decode);
         }
-        let parsed = reqwest::Url::parse(&url).map_err(|_| ChangeRequestError::Decode)?;
-        let parts: Vec<_> = parsed.path().trim_matches('/').split('/').collect();
         let endpoint = format!(
             "repos/{}/{}/issues/{}/comments",
-            parts[0], parts[1], parts[3]
+            url.owner, url.name, url.number
         );
         let output = self
             .runner
@@ -521,7 +528,7 @@ impl GitHubCli {
                     serde_json::to_vec(&serde_json::json!({ "body": body }))
                         .map_err(|_| ChangeRequestError::Decode)?,
                 ),
-                ..github_request("github.com")
+                ..github_request(&url.host)
             })
             .await
             .map_err(classify_run_error)?;
@@ -530,7 +537,7 @@ impl GitHubCli {
         }
         // Evict after the server accepted the write, even if its reply cannot
         // be decoded. A read already in flight may predate it: keep it out too.
-        let key = format!("false:{url}:");
+        let key = format!("false:{}:", url.url);
         let mut cache = self.pr_cache.lock().await;
         cache.entries.retain(|entry| !entry.0.starts_with(&key));
         cache.in_flight.retain(|entry, _| !entry.starts_with(&key));
@@ -556,19 +563,17 @@ impl GitHubCli {
         })
     }
 
-    async fn fetch_revision_diff(&self, url: &str, head: &str, base: &str) -> PrResult {
-        let parsed = reqwest::Url::parse(url).map_err(|_| ChangeRequestError::Decode)?;
-        let parts: Vec<_> = parsed.path().trim_matches('/').split('/').collect();
+    async fn fetch_revision_diff(&self, url: &PullRequestUrl, head: &str, base: &str) -> PrResult {
         let output = self
             .runner
             .run(ProcessRequest {
                 args: vec![
                     "api".into(),
-                    format!("repos/{}/{}/compare/{base}...{head}", parts[0], parts[1]),
+                    format!("repos/{}/{}/compare/{base}...{head}", url.owner, url.name),
                     "-H".into(),
                     "Accept: application/vnd.github.diff".into(),
                 ],
-                ..github_request("github.com")
+                ..github_request(&url.host)
             })
             .await
             .map_err(classify_run_error)?;
@@ -586,14 +591,13 @@ impl GitHubCli {
     /// Fetch one PR without requiring a local checkout or executing shell text.
     async fn fetch_detail(
         &self,
-        url: &str,
+        url: &PullRequestUrl,
         diff: bool,
     ) -> Result<serde_json::Value, ChangeRequestError> {
-        let url = validated_pull_request_url(url)?;
         let mut args = vec![
             "pr".into(),
             if diff { "diff".into() } else { "view".into() },
-            url.clone(),
+            url.url.clone(),
         ];
         if diff {
             args.push("--color=never".into());
@@ -604,7 +608,7 @@ impl GitHubCli {
             .runner
             .run(ProcessRequest {
                 args,
-                ..github_request("github.com")
+                ..github_request(&url.host)
             })
             .await
             .map_err(classify_run_error)?;
@@ -632,7 +636,7 @@ impl GitHubCli {
                 );
             }
             if zeron_proto::change_request_assessment::valid_head_oid(&detail.head_ref_oid)
-                && let Ok(metadata) = self.fetch_pr_metadata(&detail.url, &url).await
+                && let Ok(metadata) = self.fetch_pr_metadata(&detail.url, url).await
             {
                 // Who "you" are, so every comment of yours reads as yours,
                 // reviews included, before you've commented here.
@@ -655,7 +659,7 @@ impl GitHubCli {
                     detail.status_check_rollup.clear();
                 }
             }
-            detail.review_threads = self.fetch_review_threads(&url).await.ok();
+            detail.review_threads = self.fetch_review_threads(url).await.ok();
             serde_json::to_value(detail).map_err(|_| ChangeRequestError::Decode)
         }
     }
@@ -663,14 +667,13 @@ impl GitHubCli {
     async fn fetch_pr_metadata(
         &self,
         canonical: &str,
-        requested: &str,
+        requested: &PullRequestUrl,
     ) -> Result<GhPrMetadata, ChangeRequestError> {
-        let url = validated_pull_request_url(if canonical.is_empty() {
-            requested
+        let url = if canonical.is_empty() {
+            requested.clone()
         } else {
-            canonical
-        })?;
-        let parts: Vec<_> = url.split('/').collect();
+            self.pull_request_url(canonical).await?
+        };
         let output = self
             .runner
             .run(ProcessRequest {
@@ -680,13 +683,13 @@ impl GitHubCli {
                     "-f".into(),
                     format!("query={GITHUB_PR_METADATA_QUERY}"),
                     "-f".into(),
-                    format!("owner={}", parts[3]),
+                    format!("owner={}", url.owner),
                     "-f".into(),
-                    format!("name={}", parts[4]),
+                    format!("name={}", url.name),
                     "-F".into(),
-                    format!("number={}", parts[6]),
+                    format!("number={}", url.number),
                 ],
-                ..github_request("github.com")
+                ..github_request(&url.host)
             })
             .await
             .map_err(classify_run_error)?;
@@ -2046,11 +2049,25 @@ fn to_list_item(
     })
 }
 
-fn validated_pull_request_url(raw: &str) -> Result<String, ChangeRequestError> {
+/// A validated pull request address on a host `gh` is signed in to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullRequestUrl {
+    pub host: String,
+    pub owner: String,
+    pub name: String,
+    pub number: u64,
+    pub url: String,
+}
+
+fn parse_pull_request_url(
+    raw: &str,
+    hosts: &[String],
+) -> Result<PullRequestUrl, ChangeRequestError> {
     let url = reqwest::Url::parse(raw).map_err(|_| ChangeRequestError::UnsupportedRepository)?;
     let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     if url.scheme() != "https"
-        || url.host_str() != Some("github.com")
+        || !hosts.contains(&host)
         || !url.username().is_empty()
         || url.password().is_some()
         || url.port().is_some()
@@ -2062,17 +2079,21 @@ fn validated_pull_request_url(raw: &str) -> Result<String, ChangeRequestError> {
             part.chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
         })
-        || parts[3]
-            .parse::<u64>()
-            .ok()
-            .is_none_or(|number| number == 0)
     {
         return Err(ChangeRequestError::UnsupportedRepository);
     }
-    Ok(format!(
-        "https://github.com/{}/{}/pull/{}",
-        parts[0], parts[1], parts[3]
-    ))
+    let number = parts[3]
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number != 0)
+        .ok_or(ChangeRequestError::UnsupportedRepository)?;
+    Ok(PullRequestUrl {
+        url: format!("https://{host}/{}/{}/pull/{number}", parts[0], parts[1]),
+        owner: parts[0].to_owned(),
+        name: parts[1].to_owned(),
+        host,
+        number,
+    })
 }
 
 fn classify_github_failure(stderr: &[u8]) -> ChangeRequestError {
@@ -2843,21 +2864,64 @@ mod tests {
 
     #[test]
     fn pr_detail_rejects_unsafe_or_non_pr_targets() {
+        let hosts = vec!["github.com".to_owned(), "acme.ghe.com".to_owned()];
         for url in [
             "--help",
             "https://example.com/a/b/pull/1",
+            "https://evil.example/a/b/pull/3",
             "http://github.com/a/b/pull/1",
             "https://github.com/a/b/issues/1",
             "https://github.com/a/b/pull/0",
             "https://user@github.com/a/b/pull/1",
             "https://github.com/a/b/pull/1/files",
         ] {
-            assert!(validated_pull_request_url(url).is_err(), "{url}");
+            assert!(parse_pull_request_url(url, &hosts).is_err(), "{url}");
         }
+        let parsed =
+            parse_pull_request_url("https://github.com/a/b/pull/12#discussion", &hosts).unwrap();
+        assert_eq!(parsed.url, "https://github.com/a/b/pull/12");
+        let parsed = parse_pull_request_url("https://ACME.ghe.com/a/b/pull/3#x", &hosts).unwrap();
+        assert_eq!(parsed.url, "https://acme.ghe.com/a/b/pull/3");
+        assert_eq!(parsed.host, "acme.ghe.com");
         assert_eq!(
-            validated_pull_request_url("https://github.com/a/b/pull/12#discussion").unwrap(),
-            "https://github.com/a/b/pull/12"
+            (parsed.owner.as_str(), parsed.name.as_str(), parsed.number),
+            ("a", "b", 3)
         );
+    }
+
+    #[tokio::test]
+    async fn detail_uses_url_host() {
+        let runner = FakeProcessRunner::with_responses([
+            command_success(br#"{"number":1,"title":"A PR"}"#.to_vec()),
+            command_failure("review threads unavailable"),
+        ]);
+        GitHubCli::with_runner(runner.clone())
+            .with_hosts(&["github.com", "acme.ghe.com"])
+            .detail("https://acme.ghe.com/a/b/pull/1", false)
+            .await
+            .unwrap();
+        let requests = runner.requests();
+        assert!(!requests.is_empty());
+        for request in requests {
+            assert!(
+                request
+                    .env
+                    .contains(&("GH_HOST".to_owned(), "acme.ghe.com".to_owned())),
+                "{:?}",
+                request.args
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_refuses_url_on_unknown_host() {
+        let runner = FakeProcessRunner::with_responses([]);
+        let result = GitHubCli::with_runner(runner.clone())
+            .with_hosts(&["github.com"])
+            .detail("https://acme.ghe.com/a/b/pull/1", false)
+            .await;
+        assert_eq!(result, Err(ChangeRequestError::UnsupportedRepository));
+        assert!(runner.requests().is_empty());
     }
 
     #[tokio::test]

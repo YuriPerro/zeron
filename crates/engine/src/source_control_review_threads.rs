@@ -8,7 +8,13 @@ const COMMENT_FIELDS: &str =
 const PAGE_INFO: &str = "pageInfo { hasNextPage endCursor }";
 
 impl GitHubCli {
-    async fn review_query(&self, query: String, variables: Value, budget: &mut usize) -> PrResult {
+    async fn review_query(
+        &self,
+        host: &str,
+        query: String,
+        variables: Value,
+        budget: &mut usize,
+    ) -> PrResult {
         let output = self
             .runner
             .run(ProcessRequest {
@@ -17,7 +23,7 @@ impl GitHubCli {
                     serde_json::to_vec(&json!({"query": query, "variables": variables}))
                         .map_err(|_| ChangeRequestError::Decode)?,
                 ),
-                ..github_request("github.com")
+                ..github_request(host)
             })
             .await
             .map_err(classify_run_error)?;
@@ -42,11 +48,8 @@ impl GitHubCli {
 
     pub(super) async fn fetch_review_threads(
         &self,
-        url: &str,
+        url: &PullRequestUrl,
     ) -> Result<Vec<ChangeRequestReviewThread>, ChangeRequestError> {
-        let url = validated_pull_request_url(url)?;
-        let parts: Vec<_> = url.split('/').collect();
-        let number: u64 = parts[6].parse().map_err(|_| ChangeRequestError::Decode)?;
         let query = format!(
             "query($owner:String!,$name:String!,$number:Int!,$after:String) {{ repository(owner:$owner,name:$name) {{ pullRequest(number:$number) {{ reviewThreads(first:100,after:$after) {{ {PAGE_INFO} nodes {{ id isResolved isOutdated path line startLine originalLine originalStartLine diffSide startDiffSide comments(first:100) {{ {PAGE_INFO} nodes {{ {COMMENT_FIELDS} }} }} }} }} }} }} }}"
         );
@@ -61,9 +64,10 @@ impl GitHubCli {
         loop {
             let value = self
                 .review_query(
+                    &url.host,
                     query.clone(),
                     json!({
-                        "owner": parts[3], "name": parts[4], "number": number, "after": cursor,
+                        "owner": url.owner, "name": url.name, "number": url.number, "after": cursor,
                     }),
                     &mut budget,
                 )
@@ -89,6 +93,7 @@ impl GitHubCli {
                     };
                     let value = self
                         .review_query(
+                            &url.host,
                             replies_query.clone(),
                             json!({"id": thread.id, "after": after}),
                             &mut budget,
