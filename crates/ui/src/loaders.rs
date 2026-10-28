@@ -17,6 +17,7 @@ use gpui::{
 
 use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, ZERON_PULSE};
 use crate::theme::{GlyphPalette, Theme};
+use zeron_proto::motion::{ECHO_CYCLE_MS, HALO_CYCLE_MS, echo_opacity, halo_opacity};
 
 // Shared with the terminal viewport (`zeron_proto::motion`) so both animate the
 // same loaders from the same numbers.
@@ -447,6 +448,121 @@ impl Render for RingSpinnerView {
     }
 }
 
+/// Dots per side of the [`echo_loader`] and [`halo_loader`] grids.
+const GRID_SIDE: usize = 5;
+
+/// Which 5×5 dot-grid animation a [`DotGrid`] plays.
+#[derive(Clone, Copy, PartialEq)]
+enum GridKind {
+    Echo,
+    Halo,
+}
+
+impl GridKind {
+    fn period(self) -> std::time::Duration {
+        std::time::Duration::from_millis(match self {
+            Self::Echo => ECHO_CYCLE_MS,
+            Self::Halo => HALO_CYCLE_MS,
+        })
+    }
+
+    fn opacity(self, phase: f32, row: usize, col: usize) -> Option<f32> {
+        match self {
+            Self::Echo => Some(echo_opacity(phase, row, col)),
+            Self::Halo => halo_opacity(phase, row, col),
+        }
+    }
+}
+
+/// Side of a dot grid: five dots and four gaps of half a dot.
+fn grid_side(dot: f32) -> f32 {
+    dot * (GRID_SIDE as f32 + (GRID_SIDE - 1) as f32 * 0.5)
+}
+
+/// A 5×5 grid of dots whose opacity ripples outward from the centre, ring by
+/// ring. `dot` is the dot diameter, so the grid is `dot × 7` square. It
+/// repaints from its own cached view, so the chrome around it stays still;
+/// with reduced motion it rests.
+pub fn echo_loader(key: impl Into<SharedString>, dot: f32, tint: gpui::Hsla) -> impl IntoElement {
+    DotGrid {
+        key: key.into(),
+        kind: GridKind::Echo,
+        dot,
+        tint,
+    }
+}
+
+/// A 5×5 grid like [`echo_loader`] with its corners left empty: two comets
+/// orbit the outer ring, half a turn apart, trailing off behind their heads.
+pub fn halo_loader(key: impl Into<SharedString>, dot: f32, tint: gpui::Hsla) -> impl IntoElement {
+    DotGrid {
+        key: key.into(),
+        kind: GridKind::Halo,
+        dot,
+        tint,
+    }
+}
+
+#[derive(IntoElement)]
+struct DotGrid {
+    key: SharedString,
+    kind: GridKind,
+    dot: f32,
+    tint: gpui::Hsla,
+}
+
+impl RenderOnce for DotGrid {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (kind, dot, tint) = (self.kind, self.dot, self.tint);
+        let view = window.with_global_id(self.key.into(), |id, window| {
+            window.with_element_state(id, |previous: Option<Entity<DotGridView>>, _| {
+                let view = previous.unwrap_or_else(|| cx.new(|_| DotGridView { kind, dot, tint }));
+                view.update(cx, |view, cx| {
+                    if view.kind != kind || view.dot != dot || view.tint != tint {
+                        view.kind = kind;
+                        view.dot = dot;
+                        view.tint = tint;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            })
+        });
+        view.cached(gpui::StyleRefinement::default().size(px(grid_side(dot))))
+    }
+}
+
+struct DotGridView {
+    kind: GridKind,
+    dot: f32,
+    tint: gpui::Hsla,
+}
+
+impl Render for DotGridView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (kind, dot, tint) = (self.kind, self.dot, self.tint);
+        let phase = motion::spin_phase(cx.entity_id(), kind.period(), cx).unwrap_or(0.0);
+        div()
+            .size(px(grid_side(dot)))
+            .flex()
+            .flex_col()
+            .gap(px(dot / 2.0))
+            .children((0..GRID_SIDE).map(move |row| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(dot / 2.0))
+                    .children((0..GRID_SIDE).map(move |col| {
+                        let cell = div().size(px(dot)).flex_none();
+                        match kind.opacity(phase, row, col) {
+                            Some(opacity) => cell.rounded(px(dot / 2.0)).bg(tint).opacity(opacity),
+                            None => cell,
+                        }
+                    }))
+            }))
+    }
+}
+
 /// Stroke width of [`upload_progress_ring`].
 const RING_STROKE: f32 = 2.5;
 /// Polyline segments for a full circle — plenty for a ≤40px ring.
@@ -594,6 +710,41 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Bounds, InteractiveElement as _, Pixels};
+
+    struct GridHost;
+
+    impl Render for GridHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(px(8.0))
+                .child(div().debug_selector(|| "echo".into()).child(echo_loader(
+                    "echo",
+                    2.0,
+                    gpui::white(),
+                )))
+                .child(div().debug_selector(|| "halo".into()).child(halo_loader(
+                    "halo",
+                    2.0,
+                    gpui::white(),
+                )))
+        }
+    }
+
+    fn side(bounds: Bounds<Pixels>) -> (f32, f32) {
+        (bounds.size.width.into(), bounds.size.height.into())
+    }
+
+    #[gpui::test]
+    fn echo_and_halo_loaders_size_to_seven_dots(cx: &mut gpui::TestAppContext) {
+        let (_host, cx) = cx.add_window_view(|_, _| GridHost);
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert_eq!(side(cx.debug_bounds("echo").unwrap()), (14.0, 14.0));
+        assert_eq!(side(cx.debug_bounds("halo").unwrap()), (14.0, 14.0));
+    }
 
     #[test]
     fn mark_stagger_follows_flight_axis() {
