@@ -15,7 +15,7 @@ Hoje o `/compact` aparece como bolha do usuário ("⌘ compact") seguida da pala
 | Onde fica o registro | Item novo do histórico do chat (`MessagePart::Compaction`), gravado pelo motor. Sobrevive a reabrir o chat e sincroniza. |
 | Providers | Claude Code e Codex. Os outros continuam como hoje. |
 | Compact manual e automático | Os dois geram a mesma linha. |
-| Bolha do `/compact` | Some quando a resposta tem a linha de compactação. Sem a linha, continua como hoje. |
+| Bolha do `/compact` | Some quando o comando é só `/compact`, sem instruções, e a resposta tem a linha de compactação. Com instruções (`/compact keep the plan`) ou sem a linha, a bolha continua como hoje. |
 | Palavra de trabalho | Não aparece enquanto a linha estiver em "Compacting context". |
 | Texto da interface | Inglês, como o resto do Zeron. |
 | Builds antigos | Ignoram o item novo, como já fazem com `fork` e `switch`. |
