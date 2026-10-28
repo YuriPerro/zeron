@@ -1404,6 +1404,86 @@ mod tests {
             .unwrap();
     }
 
+    #[gpui::test]
+    fn project_drag_survives_a_recency_change_mid_drag(cx: &mut gpui::TestAppContext) {
+        use gpui::MouseButton;
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    state.chats_synced = true;
+                    state.spaces = ["a", "b"]
+                        .into_iter()
+                        .map(|id| {
+                            serde_json::from_value(serde_json::json!({
+                                "id": id, "deviceId": "local", "path": format!("/project/{id}"),
+                                "name": id, "createdAt": "2026-09-20T00:00:00Z"
+                            }))
+                            .unwrap()
+                        })
+                        .collect();
+                    state.chats = ["b", "a"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, project)| {
+                            let mut chat = chat(&format!("{project}-chat"));
+                            chat.space_id = Some(project.into());
+                            chat.created_at -= chrono::Duration::minutes(ix as i64);
+                            chat
+                        })
+                        .collect();
+                });
+                shell.settings.space_filter = None;
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let header_b = window
+            .update(cx, |shell, _, cx| {
+                let state = shell.state.read(cx);
+                let key = zeron_proto::view::project_key(state.space_row("b").unwrap());
+                &*Box::leak(format!("sidebar-group-header-project:{key}").into_boxed_str())
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        cx.run_until_parked();
+        let none = gpui::Modifiers::default();
+        let from = cx.debug_bounds(header_b).unwrap().center();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(
+            from + gpui::point(px(0.0), px(6.0)),
+            Some(MouseButton::Left),
+            none,
+        );
+        cx.run_until_parked();
+        // A message lands in project a mid-drag: by recency it now leads.
+        window
+            .update(&mut cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    let chat = state.chats.iter_mut().find(|c| c.id == "a-chat").unwrap();
+                    chat.created_at += chrono::Duration::minutes(10);
+                });
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, _| {
+                assert!(
+                    shell.sidebar_section_drag.is_some(),
+                    "a recency change must not cancel the drag"
+                );
+            })
+            .unwrap();
+        cx.simulate_mouse_up(from, MouseButton::Left, none);
+        cx.run_until_parked();
+    }
+
     #[test]
     fn section_drop_index_follows_the_leading_edge() {
         let heights = [50.0, 300.0, 50.0];

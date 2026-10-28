@@ -9,6 +9,23 @@ use crate::state::AppState;
 
 use super::Shell;
 
+/// A row grouped in the sidebar, by the chat it shows.
+pub(super) trait SidebarGroupMember {
+    fn sidebar_chat(&self) -> &zeron_proto::Chat;
+}
+
+impl SidebarGroupMember for zeron_proto::Chat {
+    fn sidebar_chat(&self) -> &zeron_proto::Chat {
+        self
+    }
+}
+
+impl SidebarGroupMember for super::spaces::ActiveChatRow {
+    fn sidebar_chat(&self) -> &zeron_proto::Chat {
+        &self.chat
+    }
+}
+
 impl Shell {
     /// The sidebar's active chats under the project and status filters, in
     /// the chosen sort. Pinned chats and the open chat pass any status
@@ -47,7 +64,7 @@ impl Shell {
         let pinned = self.active_sidebar_pins(cx);
         let sections = self.active_sidebar_sections(cx);
         let state = self.state.read(cx);
-        let mut groups: Vec<(Option<(String, String)>, Vec<()>)> = Vec::new();
+        let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
         for (_, chat) in self.sidebar_sorted_chats(state, chrono::Utc::now(), &pinned) {
             if pinned.contains(&chat.id)
                 || sections
@@ -57,8 +74,9 @@ impl Shell {
                 continue;
             }
             let group = Some(super::spaces::sidebar_project_group(state, &chat));
-            if !groups.iter().any(|(existing, _)| existing == &group) {
-                groups.push((group, Vec::new()));
+            match groups.iter_mut().find(|(existing, _)| existing == &group) {
+                Some((_, members)) => members.push(chat),
+                None => groups.push((group, vec![chat])),
             }
         }
         self.order_sidebar_groups(state, &mut groups);
@@ -66,6 +84,35 @@ impl Shell {
             .into_iter()
             .filter_map(|(group, _)| group.map(|(key, _)| key))
             .collect()
+    }
+
+    /// Group keys, newest member first: by creation under a Created sort,
+    /// else by last update, whatever order the chats inside are sorted in.
+    /// Ties keep their first-appearance order.
+    fn recent_group_keys<T: SidebarGroupMember>(
+        &self,
+        groups: &[(Option<(String, String)>, Vec<T>)],
+    ) -> Vec<String> {
+        let created = self.settings.sidebar_sort == SidebarSort::Created;
+        let mut ranked: Vec<_> = groups
+            .iter()
+            .filter_map(|(group, members)| {
+                let newest = members
+                    .iter()
+                    .map(|member| {
+                        let chat = member.sidebar_chat();
+                        if created {
+                            chat.created_at
+                        } else {
+                            chat.last_message_at.unwrap_or(chat.created_at)
+                        }
+                    })
+                    .max()?;
+                Some((newest, group.as_ref()?.0.clone()))
+            })
+            .collect();
+        ranked.sort_by(|left, right| right.0.cmp(&left.0));
+        ranked.into_iter().map(|(_, key)| key).collect()
     }
 
     /// Land a dragged project group: the new order is saved and Projects
@@ -85,7 +132,7 @@ impl Shell {
     }
 
     /// Order the device or project groups the way the sidebar draws them.
-    pub(super) fn order_sidebar_groups<T>(
+    pub(super) fn order_sidebar_groups<T: SidebarGroupMember>(
         &self,
         state: &AppState,
         groups: &mut Vec<(Option<(String, String)>, Vec<T>)>,
@@ -94,11 +141,25 @@ impl Shell {
             SidebarOrganization::ByDevice => {
                 super::spaces::promote_local_device_group(groups, state.local_device_id.as_deref())
             }
-            SidebarOrganization::ByProject => order_project_groups(
-                groups,
-                self.settings.sidebar_project_order,
-                &self.settings.space_order,
-            ),
+            SidebarOrganization::ByProject => {
+                // A lifted group holds the order it was picked up in, so
+                // activity mid-drag can't shuffle the slots under it.
+                if let Some(drag) = self
+                    .sidebar_section_drag
+                    .as_ref()
+                    .filter(|drag| drag.payload.kind == super::SidebarSectionDragKind::Project)
+                {
+                    order_project_groups(groups, SidebarProjectOrder::Manual, &drag.payload.ids);
+                    return;
+                }
+                match self.settings.sidebar_project_order {
+                    SidebarProjectOrder::Recent => {
+                        let recent = self.recent_group_keys(groups);
+                        order_project_groups(groups, SidebarProjectOrder::Manual, &recent)
+                    }
+                    order => order_project_groups(groups, order, &self.settings.space_order),
+                }
+            }
             SidebarOrganization::InOneList => {}
         }
     }

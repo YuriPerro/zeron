@@ -987,6 +987,25 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn recent_project_order_follows_recency_under_a_name_sort(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                project_order_fixture(shell, cx);
+                shell.settings.sidebar_sort = SidebarSort::Name;
+                // b-new is the newest chat, so b leads although a-new sorts first.
+                assert_eq!(
+                    shell.sidebar_visible_order(cx),
+                    ids(&["pin", "b-new", "b-old", "a-new"])
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     fn filter_keeps_pins_and_the_open_chat(cx: &mut gpui::TestAppContext) {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
