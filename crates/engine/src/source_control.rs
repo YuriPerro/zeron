@@ -34,7 +34,26 @@ const GITHUB_REPOSITORY_QUERY: &str =
 const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GITHUB_RESULT_LIMIT: &str = "20";
 const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
-const GITHUB_SEARCH_QUERY: &str = "query($search: String!, $owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: $name) { nameWithOwner } search(query: $search, type: ISSUE, first: 50, after: $after) { issueCount pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { author { login } headRefOid viewerDidAuthor viewerLatestReviewRequest { id } reviewRequests(first: 100) { nodes { id } pageInfo { hasNextPage } } statusCheckRollup { commit { oid } state contexts { totalCount checkRunCountsByState { state count } statusContextCountsByState { state count } } } number title url state isDraft mergeable reviewDecision createdAt updatedAt additions deletions repository { nameWithOwner } } } } }";
+macro_rules! search_selection {
+    () => {
+        "search(query: $search, type: ISSUE, first: 50, after: $after) { issueCount pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { author { login } headRefOid viewerDidAuthor viewerLatestReviewRequest { id } reviewRequests(first: 100) { nodes { id } pageInfo { hasNextPage } } statusCheckRollup { commit { oid } state contexts { totalCount checkRunCountsByState { state count } statusContextCountsByState { state count } } } number title url state isDraft mergeable reviewDecision createdAt updatedAt additions deletions repository { nameWithOwner } } } }"
+    };
+}
+
+/// Names one repository, resolving it so a rename can be followed.
+const GITHUB_SEARCH_QUERY: &str = concat!(
+    "query($search: String!, $owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: $name) { nameWithOwner } ",
+    search_selection!(),
+    " }"
+);
+
+/// Several repositories: no repository is resolved, so one that is gone
+/// cannot fail the page.
+const GITHUB_BOARD_SEARCH_QUERY: &str = concat!(
+    "query($search: String!, $after: String) { ",
+    search_selection!(),
+    " }"
+);
 
 const GITHUB_PR_METADATA_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { pullRequest(number: $number) { headRefOid viewerDidAuthor viewerLatestReviewRequest { id } reviewRequests(first: 100) { nodes { id } pageInfo { hasNextPage } } statusCheckRollup { commit { oid } state contexts(first: 100) { nodes { ... on CheckRun { name status conclusion detailsUrl } ... on StatusContext { context state targetUrl } } totalCount checkRunCountsByState { state count } statusContextCountsByState { state count } } } } } }";
 
@@ -78,24 +97,14 @@ pub fn valid_pr_repository(repository: &str) -> bool {
         })
 }
 
-/// One host and 1 to 5 valid repositories: what a board can list together.
+/// One host and 1 to 5 distinct valid repositories: what a board can list together.
 pub fn valid_board_scope(scope: &zeron_proto::BoardScope) -> bool {
     !scope.host.is_empty()
-        && (1..=5).contains(&scope.repositories.len())
+        && (1..=5).contains(&scope.repositories_normalized().len())
         && scope
             .repositories
             .iter()
             .all(|repository| valid_pr_repository(repository))
-}
-
-fn sorted_repositories(scope: &zeron_proto::BoardScope) -> Vec<String> {
-    let mut repositories: Vec<String> = scope
-        .repositories
-        .iter()
-        .map(|repository| repository.to_ascii_lowercase())
-        .collect();
-    repositories.sort();
-    repositories
 }
 
 /// The search string for a board, `None` when it exceeds GitHub's 256
@@ -127,7 +136,8 @@ struct PrRequestCache {
     /// finishing read whether a write has replaced or dropped it meanwhile.
     in_flight: std::collections::HashMap<String, (u64, PrFetch)>,
     next_fetch: u64,
-    rate_limited_at: Option<Instant>,
+    /// When each host last answered with a rate limit; one host never pauses another.
+    rate_limited_at: std::collections::HashMap<String, Instant>,
 }
 
 /// Repository identity extracted from a Git remote URL.
@@ -431,6 +441,9 @@ pub struct GitHubCli {
     account: Arc<tokio::sync::Mutex<HashMap<String, (Instant, Option<String>)>>>,
     /// Hosts `gh` is signed in to and when they were read; the allowlist for requests.
     hosts: Arc<tokio::sync::Mutex<Option<(Instant, Vec<String>)>>>,
+    /// A `GH_TOKEN` or `GITHUB_TOKEN` was set when the client was built: it may
+    /// belong to another account, so only github.com is allowed and nothing is stored.
+    token_in_env: bool,
 }
 
 impl GitHubCli {
@@ -438,7 +451,13 @@ impl GitHubCli {
     /// share one provider call; distinct reads run side by side. The read runs
     /// detached, so it completes and is cached even when every caller has gone
     /// away. Never retry here.
-    async fn cached_pr_request<F>(&self, key: String, refresh: bool, fetch: F) -> PrResult
+    async fn cached_pr_request<F>(
+        &self,
+        host: String,
+        key: String,
+        refresh: bool,
+        fetch: F,
+    ) -> PrResult
     where
         F: std::future::Future<Output = PrResult> + Send + 'static,
     {
@@ -463,6 +482,7 @@ impl GitHubCli {
         }
         if cache
             .rate_limited_at
+            .get(&host)
             .is_some_and(|at| at.elapsed() < Duration::from_secs(15 * 60))
         {
             return Err(ChangeRequestError::RateLimited);
@@ -474,6 +494,7 @@ impl GitHubCli {
                 cache.next_fetch += 1;
                 let shared = self.pr_cache.clone();
                 let task_key = key.clone();
+                let task_host = host.clone();
                 let task = tokio::spawn(async move {
                     let result = std::panic::AssertUnwindSafe(fetch)
                         .catch_unwind()
@@ -481,7 +502,7 @@ impl GitHubCli {
                         .unwrap_or(Err(ChangeRequestError::CommandFailed));
                     let mut cache = shared.lock().await;
                     if matches!(result, Err(ChangeRequestError::RateLimited)) {
-                        cache.rate_limited_at = Some(Instant::now());
+                        cache.rate_limited_at.insert(task_host, Instant::now());
                     }
                     if cache
                         .in_flight
@@ -559,7 +580,7 @@ impl GitHubCli {
         let revisions = head
             .zip(base)
             .map(|(head, base)| (head.to_owned(), base.to_owned()));
-        self.cached_pr_request(key, refresh, async move {
+        self.cached_pr_request(url.host.clone(), key, refresh, async move {
             if diff && let Some((head, base)) = revisions {
                 return github.fetch_revision_diff(&url, &head, &base).await;
             }
@@ -803,7 +824,7 @@ impl GitHubCli {
         let repository = repository.to_ascii_lowercase();
         let key = format!("repository:{host}:{repository}");
         let github = self.clone();
-        let lookup = self.cached_pr_request(key, false, async move {
+        let lookup = self.cached_pr_request(host.clone(), key, false, async move {
             let (owner, name) = repository
                 .split_once('/')
                 .ok_or(ChangeRequestError::UnsupportedRepository)?;
@@ -855,21 +876,29 @@ impl GitHubCli {
             store: None,
             account: Default::default(),
             hosts: Default::default(),
+            token_in_env: token_in_env(),
         }
     }
 
     #[cfg(test)]
-    fn with_hosts(self, hosts: &[&str]) -> Self {
+    fn with_env_token(mut self, present: bool) -> Self {
+        self.token_in_env = present;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_hosts(mut self, hosts: &[&str]) -> Self {
+        self.token_in_env = false;
         *self.hosts.try_lock().expect("fresh client") = Some((
-            Instant::now(),
+            Instant::now() + Duration::from_secs(60 * 60 * 24 * 365),
             hosts.iter().map(|host| (*host).to_owned()).collect(),
         ));
         self
     }
 
     /// Hosts `gh` is signed in to, lowercased and sorted, re-read every 30
-    /// seconds. A token in the environment, or a `gh` that cannot say, leaves
-    /// only github.com.
+    /// seconds. A token in the environment leaves only github.com. A `gh` that
+    /// cannot say keeps the last list it gave, or github.com before there is one.
     pub async fn known_hosts(&self) -> Vec<String> {
         let mut hosts = self.hosts.lock().await;
         if let Some((read_at, cached)) = hosts.as_ref()
@@ -877,8 +906,7 @@ impl GitHubCli {
         {
             return cached.clone();
         }
-        let token_in_env = token_in_env();
-        let status = if token_in_env {
+        let status = if self.token_in_env {
             None
         } else {
             self.runner
@@ -897,7 +925,9 @@ impl GitHubCli {
                 .filter(|output| output.success && !output.stdout_truncated)
                 .map(|output| output.stdout)
         };
-        let allowed = allowed_hosts(token_in_env, status.as_deref());
+        let allowed = allowed_hosts(self.token_in_env, status.as_deref())
+            .or_else(|| hosts.as_ref().map(|(_, previous)| previous.clone()))
+            .unwrap_or_else(|| vec!["github.com".to_owned()]);
         *hosts = Some((Instant::now(), allowed.clone()));
         allowed
     }
@@ -916,7 +946,7 @@ impl GitHubCli {
     /// environment, which may belong to another account — and then nothing is
     /// stored.
     async fn store_account(&self, host: &str) -> Option<String> {
-        if token_in_env() {
+        if self.token_in_env {
             return None;
         }
         let mut accounts = self.account.lock().await;
@@ -976,7 +1006,7 @@ impl GitHubCli {
         if !self.known_hosts().await.contains(&host) {
             return Err(ChangeRequestError::UnsupportedRepository);
         }
-        let repositories = sorted_repositories(scope);
+        let repositories = scope.repositories_normalized();
         if board_search(&repositories, filter).is_none() {
             return Err(ChangeRequestError::UnsupportedRepository);
         }
@@ -1028,7 +1058,7 @@ impl GitHubCli {
         let host = host.to_owned();
         let after = after.map(str::to_owned);
         let result = self
-            .cached_pr_request(key, refresh, async move {
+            .cached_pr_request(host.clone(), key, refresh, async move {
                 let page = github
                     .fetch_filtered_page(&host, &repositories, filter, after.as_deref())
                     .await?;
@@ -1074,30 +1104,28 @@ impl GitHubCli {
     ) -> Result<(zeron_proto::ChangeRequestPage, Option<String>), ChangeRequestError> {
         let search =
             board_search(repositories, filter).ok_or(ChangeRequestError::UnsupportedRepository)?;
-        let (owner, name) = repositories
-            .first()
-            .and_then(|repository| repository.split_once('/'))
-            .ok_or(ChangeRequestError::UnsupportedRepository)?;
+        let mut args: Vec<String> = vec!["api".into(), "graphql".into(), "-f".into()];
+        match repositories {
+            [repository] => {
+                let (owner, name) = repository
+                    .split_once('/')
+                    .ok_or(ChangeRequestError::UnsupportedRepository)?;
+                args.extend([
+                    format!("query={GITHUB_SEARCH_QUERY}"),
+                    "-f".into(),
+                    format!("owner={owner}"),
+                    "-f".into(),
+                    format!("name={name}"),
+                ]);
+            }
+            _ => args.push(format!("query={GITHUB_BOARD_SEARCH_QUERY}")),
+        }
+        args.extend(["-f".into(), format!("search={search}")]);
+        if let Some(cursor) = after {
+            args.extend(["-f".into(), format!("after={cursor}")]);
+        }
         let request = ProcessRequest {
-            args: vec![
-                "api".into(),
-                "graphql".into(),
-                "-f".into(),
-                format!("query={GITHUB_SEARCH_QUERY}"),
-                "-f".into(),
-                format!("owner={owner}"),
-                "-f".into(),
-                format!("name={name}"),
-                "-f".into(),
-                format!("search={search}"),
-            ]
-            .into_iter()
-            .chain(
-                after
-                    .into_iter()
-                    .flat_map(|cursor| ["-f".into(), format!("after={cursor}")]),
-            )
-            .collect(),
+            args,
             stdin: None,
             ..github_request(host)
         };
@@ -1107,9 +1135,16 @@ impl GitHubCli {
             .flatten();
         // `gh` exits non-zero whenever the response carries `errors`, including
         // the one that accompanies results the viewer cannot read. Those pages
-        // are still usable once the repository itself resolved.
+        // are still usable once the repository itself resolved, or with several
+        // repositories, where none is resolved and the search data is enough.
         let response = match response {
-            Some(response) if output.success || response.data.repository.is_some() => response,
+            Some(response)
+                if output.success
+                    || repositories.len() != 1
+                    || response.data.repository.is_some() =>
+            {
+                response
+            }
             _ if !output.success => return Err(classify_github_failure(&output.stderr)),
             _ => return Err(ChangeRequestError::Decode),
         };
@@ -1261,12 +1296,11 @@ struct GhAuthAccount {
 }
 
 /// The hosts requests may target: those `gh auth status` reports with an
-/// active, working account. A token in the environment, or a status that
-/// cannot be read, leaves only github.com.
-fn allowed_hosts(token_in_env: bool, status: Option<&[u8]>) -> Vec<String> {
-    let github_only = || vec!["github.com".to_owned()];
+/// active, working account. A token in the environment leaves only github.com.
+/// `None` when the status cannot be read.
+fn allowed_hosts(token_in_env: bool, status: Option<&[u8]>) -> Option<Vec<String>> {
     if token_in_env {
-        return github_only();
+        return Some(vec!["github.com".to_owned()]);
     }
     status
         .and_then(|bytes| serde_json::from_slice::<GhAuthStatus>(bytes).ok())
@@ -1284,7 +1318,6 @@ fn allowed_hosts(token_in_env: bool, status: Option<&[u8]>) -> Vec<String> {
                 .into_iter()
                 .collect()
         })
-        .unwrap_or_else(github_only)
 }
 
 /// Board requests run against `host` without a checkout or interactive prompts.
@@ -2445,12 +2478,8 @@ mod tests {
     #[tokio::test]
     async fn known_hosts_reads_signed_in_hosts() {
         let runner = FakeProcessRunner::with_responses([command_success(AUTH_STATUS)]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_env_token(false);
         let expected = vec!["acme.ghe.com".to_owned(), "github.com".to_owned()];
-        if token_in_env() {
-            assert_eq!(github.known_hosts().await, vec!["github.com".to_owned()]);
-            return;
-        }
         assert_eq!(github.known_hosts().await, expected);
         assert_eq!(github.known_hosts().await, expected);
         let requests = runner.requests();
@@ -2458,24 +2487,29 @@ mod tests {
         assert_eq!(requests[0].args, ["auth", "status", "--json", "hosts"]);
     }
 
+    #[tokio::test]
+    async fn known_hosts_with_a_token_is_github_only_and_never_runs_gh() {
+        let runner = FakeProcessRunner::with_responses([]);
+        let github = GitHubCli::with_runner(runner.clone()).with_env_token(true);
+        assert_eq!(github.known_hosts().await, vec!["github.com".to_owned()]);
+        assert_eq!(github.store_account("github.com").await, None);
+        assert!(runner.requests().is_empty());
+    }
+
     #[test]
-    fn allowed_hosts_with_token_is_github_only() {
-        let github_only = vec!["github.com".to_owned()];
+    fn allowed_hosts_is_none_when_status_cannot_be_read() {
         assert_eq!(
             allowed_hosts(true, Some(AUTH_STATUS.as_bytes())),
-            github_only
+            Some(vec!["github.com".to_owned()])
         );
-        assert_eq!(allowed_hosts(false, None), github_only);
-        assert_eq!(allowed_hosts(false, Some(b"not json")), github_only);
+        assert_eq!(allowed_hosts(false, None), None);
+        assert_eq!(allowed_hosts(false, Some(b"not json")), None);
     }
 
     #[tokio::test]
     async fn store_account_is_per_host() {
-        if token_in_env() {
-            return;
-        }
         let runner = FakeProcessRunner::with_responses([command_success("b\n")]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_env_token(false);
         assert_eq!(
             github.store_account("acme.ghe.com").await,
             Some("acme.ghe.com:b".to_owned())
@@ -2957,8 +2991,9 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_alias_remote_matches_through_ssh_config() {
-        let runner =
-            FakeProcessRunner::with_responses([command_success("user git\nhostname github.com\n")]);
+        let runner = FakeProcessRunner::with_responses([command_success(
+            "user git\nhostname github.com\n",
+        )]);
         let resolver = ChangeRequestResolver {
             inspector: GitCheckoutInspector::new(runner.clone()),
             github: GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]),
@@ -3803,6 +3838,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn board_deduplicates_repositories_into_one_search_and_cache_entry() {
+        let runner = FakeProcessRunner::with_responses([command_success(search_response(vec![]))]);
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
+        let filter = zeron_proto::ChangeRequestFilter::All;
+        github
+            .list_page(
+                &board("github.com", &["a/b", "A/B"]),
+                filter,
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        github
+            .list_page(&board("github.com", &["a/b"]), filter, None, false, false)
+            .await
+            .unwrap();
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1, "the same set is one cache entry");
+        assert_eq!(
+            requests[0].args.last().unwrap(),
+            "search=is:pr is:open repo:a/b sort:updated-desc"
+        );
+        let five_unique_of_seven = ["a/1", "A/1", "a/2", "a/3", "a/4", "a/5", "A/5"];
+        assert!(valid_board_scope(&board(
+            "github.com",
+            &five_unique_of_seven
+        )));
+        assert!(!valid_board_scope(&board(
+            "github.com",
+            &["a/1", "a/2", "a/3", "a/4", "a/5", "a/6", "A/1"]
+        )));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_pause_is_per_host() {
+        let runner = FakeProcessRunner::with_responses([
+            command_failure("API rate limit exceeded"),
+            command_success(search_response(vec![])),
+        ]);
+        let github =
+            GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com", "acme.ghe.com"]);
+        let filter = zeron_proto::ChangeRequestFilter::All;
+        assert_eq!(
+            github
+                .list_page(&board("github.com", &["a/b"]), filter, None, false, false)
+                .await,
+            Err(ChangeRequestError::RateLimited)
+        );
+        assert_eq!(
+            github
+                .list_page(&board("github.com", &["a/c"]), filter, None, false, false)
+                .await,
+            Err(ChangeRequestError::RateLimited)
+        );
+        let other = github
+            .list_page(&board("acme.ghe.com", &["a/b"]), filter, None, false, false)
+            .await
+            .unwrap();
+        assert!(other.items.is_empty());
+        assert_eq!(runner.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn several_repositories_search_without_resolving_the_first() {
+        let mut node = search_pull_request(
+            "a/two",
+            7,
+            "Two",
+            "OPEN",
+            "MERGEABLE",
+            "2026-08-10T09:30:00Z",
+            "2026-08-19T12:00:00Z",
+            false,
+            None,
+        );
+        node["headRefOid"] = "a".repeat(40).into();
+        node["statusCheckRollup"] = serde_json::json!({
+            "commit": {"oid": "a".repeat(40)}, "state": "SUCCESS",
+            "contexts": {"totalCount": 1, "checkRunCountsByState": [{"state": "SUCCESS", "count": 1}]}
+        });
+        let runner =
+            FakeProcessRunner::with_responses([command_success(search_response(vec![node]))]);
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
+        let page = github
+            .list_page(
+                &board("github.com", &["a/gone", "a/two"]),
+                zeron_proto::ChangeRequestFilter::All,
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].ci.state,
+            zeron_proto::change_request_assessment::CiState::Passed
+        );
+        let args = &runner.requests()[0].args;
+        assert!(!args.iter().any(|arg| arg.starts_with("owner=")));
+        assert!(!args.iter().any(|arg| arg.starts_with("name=")));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("query=") && arg.contains("repository(owner"))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_auth_status_keeps_the_last_known_hosts() {
+        let runner = FakeProcessRunner::with_responses([
+            command_success(AUTH_STATUS),
+            command_failure("boom"),
+        ]);
+        let github = GitHubCli::with_runner(runner.clone()).with_env_token(false);
+        let expected = vec!["acme.ghe.com".to_owned(), "github.com".to_owned()];
+        assert_eq!(github.known_hosts().await, expected);
+        github.hosts.lock().await.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(31);
+        assert_eq!(github.known_hosts().await, expected);
+        assert_eq!(runner.requests().len(), 2);
+        assert_eq!(github.known_hosts().await, expected);
+        assert_eq!(runner.requests().len(), 2, "the failure is held for 30 s");
+    }
+
+    #[tokio::test]
+    async fn failed_auth_status_on_cold_start_is_github_only() {
+        for response in [
+            command_failure("boom"),
+            command_success("not json"),
+            Err(ProcessRunError::Timeout),
+        ] {
+            let github = GitHubCli::with_runner(FakeProcessRunner::with_responses([response]))
+                .with_env_token(false);
+            assert_eq!(github.known_hosts().await, vec!["github.com".to_owned()]);
+        }
+    }
+
+    #[tokio::test]
     async fn board_rejects_unknown_host() {
         let runner = FakeProcessRunner::with_responses([]);
         let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
@@ -4542,10 +4717,10 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             // Git reports slash-separated paths on Windows, while settings
             // retain canonical Win32 prefixes. Compare the actual directory.
             assert!(
-                refs.iter()
-                    .any(|entry| entry.worktree_path.as_ref().is_some_and(|listed| {
-                        same_file::is_same_file(listed, path).unwrap_or(false)
-                    })),
+                refs.iter().any(|entry| entry
+                    .worktree_path
+                    .as_ref()
+                    .is_some_and(|listed| same_file::is_same_file(listed, path).unwrap_or(false))),
                 "Git refs must include worktree {path}; got {refs:?}"
             );
         }
@@ -4618,10 +4793,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             ],
         );
         run_git(&checkout, &["config", "branch.main.remote", "upstream"]);
-        run_git(
-            &checkout,
-            &["config", "branch.main.merge", "refs/heads/main"],
-        );
+        run_git(&checkout, &["config", "branch.main.merge", "refs/heads/main"]);
 
         let resolver = ChangeRequestResolver::new();
         let source = resolver

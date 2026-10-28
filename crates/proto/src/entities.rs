@@ -1141,15 +1141,27 @@ pub struct BoardScope {
 }
 
 impl BoardScope {
-    /// Stable identity of the scope, independent of repository order and case.
-    pub fn key(&self) -> String {
+    /// The repositories lowercased, sorted and de-duplicated, so the same set
+    /// is always one search, one cache entry and one stored page.
+    pub fn repositories_normalized(&self) -> Vec<String> {
         let mut repositories: Vec<String> = self
             .repositories
             .iter()
             .map(|repository| repository.to_lowercase())
             .collect();
         repositories.sort();
-        format!("{}:{}", self.host.to_lowercase(), repositories.join(","))
+        repositories.dedup();
+        repositories
+    }
+
+    /// Stable identity of the scope, independent of repository order, case
+    /// and repeats.
+    pub fn key(&self) -> String {
+        format!(
+            "{}:{}",
+            self.host.to_lowercase(),
+            self.repositories_normalized().join(",")
+        )
     }
 }
 
@@ -1759,6 +1771,16 @@ mod tests {
             host: "GHE.example".into(),
             repositories: vec!["B/x".into(), "a/y".into()],
         };
+        assert_eq!(scope.key(), "ghe.example:a/y,b/x");
+    }
+
+    #[test]
+    fn board_scope_normalizes_to_sorted_unique_lowercase_repositories() {
+        let scope = BoardScope {
+            host: "GHE.example".into(),
+            repositories: vec!["B/x".into(), "a/y".into(), "b/X".into()],
+        };
+        assert_eq!(scope.repositories_normalized(), ["a/y", "b/x"]);
         assert_eq!(scope.key(), "ghe.example:a/y,b/x");
     }
 
