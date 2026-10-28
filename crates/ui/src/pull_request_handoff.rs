@@ -171,6 +171,7 @@ pub(super) fn prompt(
 ) -> String {
     let repo = repository(url);
     let gh_repo = gh_repository(url);
+    let host = link_host(url);
     let number = detail.number;
     let head = ref_name(&detail.head_ref_name);
     let mut prompt = format!(
@@ -203,9 +204,16 @@ pub(super) fn prompt(
         Handoff::Review => prompt.push_str(&format!(
             "Review this pull request. Read the description with `gh pr view {number} --repo {gh_repo}` and the diff with `gh pr diff {number} --repo {gh_repo}`. Look for correctness bugs, regressions, and missing tests. Report findings by severity with file:line references. Don't push changes or post comments."
         )),
-        Handoff::AddressFeedback => prompt.push_str(&format!(
-            "Address the open review feedback. Read conversation comments with `gh pr view {number} --repo {gh_repo} --comments`. This command excludes inline review comments. Retrieve all inline comment bodies and replies with `gh api --paginate repos/{repo}/pulls/{number}/comments`. Fetch reviewThreads through the GitHub GraphQL API (repository → pullRequest → reviewThreads), including isResolved, isOutdated, path, line, originalLine, and comments with id, replyTo, body, author, url and createdAt. Paginate BOTH reviewThreads and each thread’s comments using pageInfo.hasNextPage/endCursor and after; do not assume the first 100 entries are complete. Prioritize unresolved threads, including outdated ones, and retain resolved threads and replies as context. Make the requested changes on `{head}`, run the relevant tests, and summarize what changed for each comment. Ask before pushing."
-        )),
+        Handoff::AddressFeedback => {
+            let (hostname, on_host) = if host == DEFAULT_HOST {
+                (String::new(), String::new())
+            } else {
+                (format!(" --hostname {host}"), format!(" on {host}"))
+            };
+            prompt.push_str(&format!(
+                "Address the open review feedback. Read conversation comments with `gh pr view {number} --repo {gh_repo} --comments`. This command excludes inline review comments. Retrieve all inline comment bodies and replies with `gh api{hostname} --paginate repos/{repo}/pulls/{number}/comments`. Fetch reviewThreads through the GitHub GraphQL API{on_host} (repository → pullRequest → reviewThreads), including isResolved, isOutdated, path, line, originalLine, and comments with id, replyTo, body, author, url and createdAt. Paginate BOTH reviewThreads and each thread’s comments using pageInfo.hasNextPage/endCursor and after; do not assume the first 100 entries are complete. Prioritize unresolved threads, including outdated ones, and retain resolved threads and replies as context. Make the requested changes on `{head}`, run the relevant tests, and summarize what changed for each comment. Ask before pushing."
+            ))
+        }
         Handoff::ResolveConflicts => prompt.push_str(&format!(
             "Inspect merge conflicts against the current base with `gh pr view {number} --repo {gh_repo} --json baseRefName,mergeable`. Resolve them on `{head}`, preserve both sides' intended behavior, and test the resulting combination. Ask before pushing."
         )),
@@ -217,10 +225,13 @@ pub(super) fn prompt(
             }
             for (name, status, link) in failures {
                 let name = plain(&name);
-                // Only links to github.com are passed on.
-                let link = url::Url::parse(&link)
-                    .ok()
-                    .filter(|link| link.scheme() == "https" && link.host_str() == Some("github.com"));
+                // Only links to github.com or the pull request's own host are passed on.
+                let link = url::Url::parse(&link).ok().filter(|link| {
+                    link.scheme() == "https"
+                        && link
+                            .host_str()
+                            .is_some_and(|link_host| link_host == DEFAULT_HOST || link_host == host)
+                });
                 match link {
                     Some(link) => prompt.push_str(&format!("- {name}: {link} ({status})\n")),
                     None => prompt.push_str(&format!("- {name} ({status})\n")),
@@ -724,6 +735,56 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn ghe_feedback_handoff_reads_comments_from_the_pull_requests_host() {
+        let detail = ChangeRequestDetail {
+            number: 7,
+            ..Default::default()
+        };
+        let feedback = |url: &str| {
+            prompt(
+                Handoff::AddressFeedback,
+                &detail,
+                url,
+                VerificationPlatform::Relevant,
+            )
+        };
+        let enterprise = feedback("https://acme.ghe.com/infra/app/pull/7");
+        assert!(enterprise.contains(
+            "`gh api --hostname acme.ghe.com --paginate repos/infra/app/pulls/7/comments`"
+        ));
+        assert!(enterprise.contains("through the GitHub GraphQL API on acme.ghe.com ("));
+        let public = feedback("https://github.com/a/b/pull/7");
+        assert!(public.contains("`gh api --paginate repos/a/b/pulls/7/comments`"));
+        assert!(public.contains("through the GitHub GraphQL API ("));
+        assert!(!public.contains("--hostname"));
+    }
+
+    #[test]
+    fn check_links_on_the_pull_requests_own_host_are_kept() {
+        let mut detail = detail();
+        detail.status_check_rollup[0].details_url =
+            "https://acme.ghe.com/infra/app/actions/runs/1".into();
+        let checks = |detail: &ChangeRequestDetail, url: &str| {
+            prompt(Handoff::FixChecks, detail, url, VerificationPlatform::Linux)
+        };
+        let enterprise = "https://acme.ghe.com/infra/app/pull/591";
+        assert!(
+            checks(&detail, enterprise)
+                .contains("- linux: https://acme.ghe.com/infra/app/actions/runs/1 (FAILURE)")
+        );
+        assert!(
+            checks(&detail, "https://github.com/acme/zeron/pull/591").contains("- linux (FAILURE)"),
+            "another host's link is dropped"
+        );
+        detail.status_check_rollup[0].details_url =
+            "https://github.com/acme/zeron/actions/runs/1".into();
+        assert!(
+            checks(&detail, enterprise)
+                .contains("- linux: https://github.com/acme/zeron/actions/runs/1 (FAILURE)")
+        );
     }
 
     #[test]
