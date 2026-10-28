@@ -3072,6 +3072,7 @@ impl PullRequestsPage {
                         first,
                         last,
                         self.selected_url.as_deref() == Some(item.url.as_str()),
+                        self.target_device.clone(),
                         &theme,
                         cx,
                     ))
@@ -3237,6 +3238,7 @@ fn render_table_row(
     first: bool,
     last: bool,
     selected: bool,
+    target: Option<String>,
     theme: &Theme,
     cx: &gpui::App,
 ) -> AnyElement {
@@ -3262,7 +3264,7 @@ fn render_table_row(
         .hover(|style| style.bg(theme.glass_hover()))
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
-            crate::pull_request_detail::open(&url, window, cx);
+            crate::pull_request_detail::open_on_device(&url, target.clone(), window, cx);
         });
     let (date_label, timestamp) = if sort_field == PullRequestSortField::Opened {
         ("Opened", item.created_at)
@@ -3961,23 +3963,64 @@ mod tests {
 
     struct RowLayoutFixture {
         item: ChangeRequestListItem,
+        target: Option<String>,
+        opened: Vec<(String, Option<String>)>,
+    }
+
+    impl RowLayoutFixture {
+        fn new(item: ChangeRequestListItem) -> Self {
+            Self {
+                item,
+                target: None,
+                opened: Vec::new(),
+            }
+        }
     }
 
     impl Render for RowLayoutFixture {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let width = f32::from(window.viewport_size().width);
-            div().w_full().child(render_table_row(
-                &self.item,
-                table_layout(width),
-                width < PR_TIGHT_ROW_WIDTH,
-                PullRequestSortField::Updated,
-                true,
-                true,
-                false,
-                Theme::of(cx),
-                cx,
-            ))
+            div()
+                .w_full()
+                .on_action(cx.listener(
+                    |fixture, action: &crate::pull_request_detail::OpenPullRequest, _, _| {
+                        fixture.opened.push((action.0.clone(), action.1.clone()));
+                    },
+                ))
+                .child(render_table_row(
+                    &self.item,
+                    table_layout(width),
+                    width < PR_TIGHT_ROW_WIDTH,
+                    PullRequestSortField::Updated,
+                    true,
+                    true,
+                    false,
+                    self.target.clone(),
+                    Theme::of(cx),
+                    cx,
+                ))
         }
+    }
+
+    #[gpui::test]
+    fn rows_open_on_the_boards_device(cx: &mut gpui::TestAppContext) {
+        fixture::init(cx);
+        let item = pull_request("owner/repo", 7, 1, 1, 1);
+        let url = item.url.clone();
+        let (fixture, cx) = cx.add_window_view(|_, _| RowLayoutFixture {
+            target: Some("remote".into()),
+            ..RowLayoutFixture::new(item)
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(480.0)));
+        cx.run_until_parked();
+        let row = cx.debug_bounds("pull-request-row").expect("row rendered");
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            fixture.read_with(cx, |fixture, _| fixture.opened.clone()),
+            [(url, Some("remote".to_owned()))]
+        );
+        assert_eq!(cx.opened_url(), None);
     }
 
     fn space(id: &str, device: &str, git: bool, created_minutes_ago: i64) -> zeron_proto::Space {
@@ -5038,7 +5081,7 @@ mod tests {
         assert!(row_status(&item, false).starts_with("Draft · "));
         assert!(!row_status(&item, true).contains("Draft"));
         assert!(row_status(&item, true).contains("Merge conflicts"));
-        let (_, cx) = cx.add_window_view(|_, _| RowLayoutFixture { item });
+        let (_, cx) = cx.add_window_view(|_, _| RowLayoutFixture::new(item));
         for (width, diff) in [(360.0, false), (600.0, true)] {
             cx.simulate_resize(gpui::size(px(width), px(480.0)));
             cx.run_until_parked();
@@ -5066,7 +5109,7 @@ mod tests {
         item.is_draft = true;
         item.mergeability = ChangeRequestMergeability::Conflicting;
         item.review_decision = ChangeRequestReviewDecision::ChangesRequested;
-        let (_, cx) = cx.add_window_view(|_, _| RowLayoutFixture { item });
+        let (_, cx) = cx.add_window_view(|_, _| RowLayoutFixture::new(item));
         for width in [272.0, 639.0, 640.0, 899.0, 900.0, 1072.0] {
             cx.simulate_resize(gpui::size(px(width), px(480.0)));
             cx.run_until_parked();

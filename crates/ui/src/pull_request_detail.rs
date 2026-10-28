@@ -135,18 +135,39 @@ pub(crate) fn opens_natively(cx: &App) -> bool {
     settings::current(cx).pull_request_destination != PullRequestDestination::External
 }
 
-pub fn open(url: &str, window: &mut Window, cx: &mut App) {
-    open_on_device(url, None, window, cx);
+/// Where a pull request link opens.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PullRequestOpening {
+    /// In Zeron's own view, read by the named device's engine; `None` for
+    /// this device.
+    Native(Option<String>),
+    /// In the browser: Settings send pull requests there, or `gh` isn't
+    /// signed in to the link's host on that device.
+    Browser,
 }
 
-pub fn open_on_device(url: &str, device: Option<String>, window: &mut Window, cx: &mut App) {
+/// Decides where `url` opens when read from `device`. This device's own id
+/// (`local_device`) counts as `None`, the key its host list is kept under.
+pub(crate) fn pull_request_opening(
+    url: &str,
+    device: Option<String>,
+    local_device: Option<&str>,
+    cx: &App,
+) -> PullRequestOpening {
+    let device = device.filter(|device| Some(device.as_str()) != local_device);
     let known_host = pull_request_repository(url)
         .is_some_and(|link| PullRequestHosts::hosts(cx, device.as_deref()).contains(&link.host));
-    if !known_host || !opens_natively(cx) {
-        cx.open_url(url);
+    if known_host && opens_natively(cx) {
+        PullRequestOpening::Native(device)
     } else {
-        window.dispatch_action(Box::new(OpenPullRequest(url.to_owned(), device)), cx);
+        PullRequestOpening::Browser
     }
+}
+
+/// Opens `url`, read from `device`. The shell decides through
+/// [`pull_request_opening`] whether it opens here or in the browser.
+pub fn open_on_device(url: &str, device: Option<String>, window: &mut Window, cx: &mut App) {
+    window.dispatch_action(Box::new(OpenPullRequest(url.to_owned(), device)), cx);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3396,58 +3417,38 @@ mod tests {
         );
     }
 
-    struct OpenHost {
-        opened: Vec<(String, Option<String>)>,
-        focus: gpui::FocusHandle,
-    }
-
-    impl Render for OpenHost {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .track_focus(&self.focus)
-                .on_action(cx.listener(|host, action: &OpenPullRequest, _, _| {
-                    host.opened.push((action.0.clone(), action.1.clone()));
-                }))
-        }
-    }
-
-    fn open_with_known_hosts(
-        url: &str,
-        cx: &mut gpui::TestAppContext,
-    ) -> (Vec<(String, Option<String>)>, Option<String>) {
+    #[gpui::test]
+    fn pull_requests_open_natively_on_the_devices_signed_in_hosts(cx: &mut gpui::TestAppContext) {
         let _settings = fixture::settings(cx, settings::UiSettings::default());
         cx.update(|cx| {
-            PullRequestHosts::set(cx, None, vec!["github.com".into(), "acme.ghe.com".into()])
+            PullRequestHosts::set(cx, None, vec!["github.com".into(), "acme.ghe.com".into()]);
+            PullRequestHosts::set(cx, Some("remote".into()), vec!["corp.ghe.com".into()]);
+            let ghe = "https://acme.ghe.com/a/b/pull/1";
+            let opening = |url: &str, device: Option<&str>, cx: &App| {
+                pull_request_opening(url, device.map(str::to_owned), Some("local"), cx)
+            };
+            assert_eq!(
+                opening(ghe, Some("local"), cx),
+                PullRequestOpening::Native(None)
+            );
+            assert_eq!(opening(ghe, None, cx), PullRequestOpening::Native(None));
+            assert_eq!(
+                opening(ghe, Some("remote"), cx),
+                PullRequestOpening::Browser
+            );
+            assert_eq!(
+                opening("https://corp.ghe.com/a/b/pull/1", Some("remote"), cx),
+                PullRequestOpening::Native(Some("remote".into()))
+            );
+            assert_eq!(
+                opening("https://other.example.com/a/b/pull/1", Some("local"), cx),
+                PullRequestOpening::Browser
+            );
+            settings::update(settings::SavePolicy::Immediate, cx, |settings| {
+                settings.pull_request_destination = PullRequestDestination::External;
+            });
+            assert_eq!(opening(ghe, None, cx), PullRequestOpening::Browser);
         });
-        let (host, cx) = cx.add_window_view(|_, cx| OpenHost {
-            opened: Vec::new(),
-            focus: cx.focus_handle(),
-        });
-        cx.update(|window, cx| {
-            let focus = host.read(cx).focus.clone();
-            focus.focus(window, cx);
-            open_on_device(url, None, window, cx)
-        });
-        cx.run_until_parked();
-        let opened = cx.opened_url();
-        (host.read_with(cx, |host, _| host.opened.clone()), opened)
-    }
-
-    #[gpui::test]
-    fn opens_ghe_natively_when_host_known(cx: &mut gpui::TestAppContext) {
-        let url = "https://acme.ghe.com/a/b/pull/1";
-        let (dispatched, opened) = open_with_known_hosts(url, cx);
-        assert_eq!(dispatched, [(url.to_owned(), None)]);
-        assert_eq!(opened, None);
-    }
-
-    #[gpui::test]
-    fn opens_unknown_host_in_browser(cx: &mut gpui::TestAppContext) {
-        let url = "https://other.example.com/a/b/pull/1";
-        let (dispatched, opened) = open_with_known_hosts(url, cx);
-        assert!(dispatched.is_empty());
-        assert_eq!(opened.as_deref(), Some(url));
     }
 
     #[test]
