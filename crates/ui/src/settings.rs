@@ -874,6 +874,33 @@ pub enum SidebarSort {
     #[default]
     LastUpdated,
     Created,
+    Name,
+    /// Chats that need attention first, then running, then the rest.
+    Status,
+}
+
+/// How project groups are ordered when the sidebar groups by project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SidebarProjectOrder {
+    /// The project with the newest chat leads.
+    #[default]
+    Recent,
+    /// The order dragged into `space_order`.
+    Manual,
+    Name,
+}
+
+/// Which chats the sidebar lists by status. Pins and the open chat always show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SidebarStatusFilter {
+    #[default]
+    All,
+    /// Hides idle chats.
+    Active,
+    /// Only chats awaiting input or errored.
+    NeedsMe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1009,8 +1036,10 @@ pub struct UiSettings {
     pub sidebar_grouped: bool,
     /// How active sessions are partitioned in the sidebar.
     pub sidebar_organization: SidebarOrganization,
-    /// Timestamp used to order active sessions (newest first).
+    /// How active sessions are ordered within their group.
     pub sidebar_sort: SidebarSort,
+    pub sidebar_project_order: SidebarProjectOrder,
+    pub sidebar_status_filter: SidebarStatusFilter,
     /// Optional harness branding and repository metadata shown below each
     /// session title.
     pub sidebar_show_project_label: bool,
@@ -1053,8 +1082,9 @@ pub struct UiSettings {
     /// non-archived sessions. Kept for file compatibility; no longer read.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub tab_order: std::collections::HashMap<String, Vec<String>>,
-    /// Legacy: manual sidebar space order, from when spaces were a sidebar
-    /// list. Kept for file compatibility; no longer read.
+    /// Manual project-group order: project keys
+    /// (`zeron_proto::view::project_key`), topmost first. Keys of projects
+    /// not shown, including space ids older builds saved, keep their slots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
     /// Master switch for session notification chimes. `ZERON_DISABLE_SOUND`
@@ -1216,6 +1246,8 @@ impl Default for UiSettings {
             sidebar_grouped: false,
             sidebar_organization: SidebarOrganization::InOneList,
             sidebar_sort: SidebarSort::LastUpdated,
+            sidebar_project_order: SidebarProjectOrder::Recent,
+            sidebar_status_filter: SidebarStatusFilter::All,
             sidebar_show_project_label: true,
             sidebar_compact: true,
             sidebar_show_project_icon: true,
@@ -1873,6 +1905,8 @@ impl UiSettings {
             sidebar_grouped,
             sidebar_organization,
             sidebar_sort,
+            sidebar_project_order,
+            sidebar_status_filter,
             sidebar_show_project_label,
             sidebar_compact,
             sidebar_show_project_icon,
@@ -2937,7 +2971,9 @@ mod tests {
             sidebar_collapsed: true,
             sidebar_grouped: true,
             sidebar_organization: SidebarOrganization::ByDevice,
-            sidebar_sort: SidebarSort::Created,
+            sidebar_sort: SidebarSort::Status,
+            sidebar_project_order: SidebarProjectOrder::Manual,
+            sidebar_status_filter: SidebarStatusFilter::NeedsMe,
             sidebar_compact: true,
             sidebar_show_project_icon: false,
             sidebar_show_project_label: false,
@@ -3352,6 +3388,14 @@ mod tests {
         let restored: UiSettings =
             serde_json::from_str(&serde_json::to_string(&customized).unwrap()).unwrap();
         assert_eq!(restored.clamped(), customized);
+    }
+
+    #[test]
+    fn sidebar_order_and_filter_default_to_todays_behavior() {
+        let settings: UiSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.sidebar_sort, SidebarSort::LastUpdated);
+        assert_eq!(settings.sidebar_project_order, SidebarProjectOrder::Recent);
+        assert_eq!(settings.sidebar_status_filter, SidebarStatusFilter::All);
     }
 
     #[test]

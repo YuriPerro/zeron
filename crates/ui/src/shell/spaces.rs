@@ -9,6 +9,7 @@
 //! Child module of `shell` so it renders straight off `Shell`'s private state.
 
 use super::*;
+use super::sidebar_order::compare_sidebar_chats;
 use crate::pickers::{
     breadcrumbs, browser_rows, completion_prefix_len, folder_path_key, parent_path,
     same_folder_path,
@@ -2103,21 +2104,6 @@ pub(super) struct ActiveChatRow {
     pub(super) branch: Option<String>,
     pub(super) change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
-}
-
-pub(super) fn compare_sidebar_chats(
-    sort: SidebarSort,
-    left: &zeron_proto::Chat,
-    right: &zeron_proto::Chat,
-) -> std::cmp::Ordering {
-    let primary = match sort {
-        SidebarSort::Created => right.created_at.cmp(&left.created_at),
-        SidebarSort::LastUpdated => right
-            .last_message_at
-            .unwrap_or(right.created_at)
-            .cmp(&left.last_message_at.unwrap_or(left.created_at)),
-    };
-    primary.then_with(|| left.id.cmp(&right.id))
 }
 
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
@@ -5005,12 +4991,12 @@ impl Shell {
             .as_ref()
             .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let state = self.state.read(cx);
-        let mut chats: Vec<zeron_proto::Chat> = state
-            .sidebar_chats(Utc::now(), filter.as_deref())
-            .into_iter()
-            .map(|(_, chat)| chat.clone())
-            .collect();
-        chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        let mut chats: Vec<_> = state.sidebar_chats(Utc::now(), filter.as_deref());
+        chats.sort_by(|left, right| {
+            compare_sidebar_chats(self.settings.sidebar_sort, *left, *right)
+        });
+        let chats: Vec<zeron_proto::Chat> =
+            chats.into_iter().map(|(_, chat)| chat.clone()).collect();
         let (pinned_chats, chats): (Vec<_>, Vec<_>) = chats
             .into_iter()
             .partition(|chat| pinned_order.contains(&chat.id));
@@ -5329,7 +5315,11 @@ impl Shell {
                 .map(|(status, chat)| (status, chat.clone()))
                 .collect();
             chats.sort_by(|left, right| {
-                compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
+                compare_sidebar_chats(
+                    self.settings.sidebar_sort,
+                    (left.0, &left.1),
+                    (right.0, &right.1),
+                )
             });
             chats
                 .into_iter()
@@ -6065,7 +6055,11 @@ impl Shell {
             .filter(|chat| in_filter(chat))
             .cloned()
             .collect();
-        rows.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        // Archived chats are settled: a Status sort falls back to recency.
+        let idle = ChatIndicator::Idle;
+        rows.sort_by(|left, right| {
+            compare_sidebar_chats(self.settings.sidebar_sort, (idle, left), (idle, right))
+        });
         rows
     }
 
@@ -8216,7 +8210,8 @@ impl Shell {
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{compare_sidebar_chats, promote_local_device_group};
+    use super::promote_local_device_group;
+    use crate::shell::sidebar_order::compare_sidebar_chats;
     use crate::settings::SidebarSort;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
@@ -8251,8 +8246,15 @@ mod tests {
     fn equal_sidebar_timestamps_sort_by_stable_chat_id() {
         let alpha = chat("alpha");
         let beta = chat("beta");
-        assert!(compare_sidebar_chats(SidebarSort::Created, &alpha, &beta).is_lt());
-        assert!(compare_sidebar_chats(SidebarSort::LastUpdated, &alpha, &beta).is_lt());
+        let idle = zeron_proto::ChatIndicator::Idle;
+        for sort in [
+            SidebarSort::Created,
+            SidebarSort::LastUpdated,
+            SidebarSort::Name,
+            SidebarSort::Status,
+        ] {
+            assert!(compare_sidebar_chats(sort, (idle, &alpha), (idle, &beta)).is_lt());
+        }
     }
 
     #[test]

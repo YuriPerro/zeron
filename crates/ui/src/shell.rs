@@ -91,6 +91,7 @@ mod session_hover_card;
 mod session_info;
 mod session_lanes;
 mod side_chats;
+mod sidebar_order;
 mod sidebar_pins;
 mod sidebar_sections;
 mod search_warm;
