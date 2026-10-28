@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::BackgroundTask;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessId {
@@ -963,11 +965,20 @@ pub enum AgentEvent {
         parent_tool_use_id: String,
         event: Box<AgentEvent>,
     },
+    /// The full set of background tasks (background Bash, Monitor) the harness
+    /// reports as running right now. Replaces the previous set. Drivers send
+    /// `started_at` as the Unix epoch: the engine owns the real start time.
+    #[serde(rename_all = "camelCase")]
+    BackgroundTasks {
+        tasks: Vec<BackgroundTask>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackgroundTaskKind;
+    use chrono::{DateTime, Utc};
 
     #[test]
     fn agent_event_round_trips() {
@@ -978,6 +989,21 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn background_tasks_event_round_trips() {
+        let ev = AgentEvent::BackgroundTasks {
+            tasks: vec![BackgroundTask {
+                id: "b1".into(),
+                kind: BackgroundTaskKind::Shell,
+                description: "dev server".into(),
+                started_at: DateTime::<Utc>::UNIX_EPOCH,
+            }],
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"backgroundTasks\""));
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
     }
 

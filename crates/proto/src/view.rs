@@ -12,7 +12,9 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, WorkspaceScope};
+use crate::{
+    AuthState, BackgroundTask, Chat, ChatIndicator, Session, SessionStatus, Space, WorkspaceScope,
+};
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -101,6 +103,14 @@ pub fn running_subagents(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
     session
         .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
         .map_or(0, |s| s.running_subagents)
+}
+
+/// Background tasks running under a chat, with the same freshness rule as
+/// [`running_subagents`]: a stale or missing session row yields nothing. Pure.
+pub fn background_tasks(session: Option<&Session>, now: DateTime<Utc>) -> &[BackgroundTask] {
+    session
+        .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
+        .map_or(&[], |s| s.background_tasks.as_slice())
 }
 
 /// The full display status for a chat row / tab dot: live states win, then the
@@ -385,6 +395,7 @@ mod gate_tests {
             last_turn_outcome: None,
             terminal_activity: None,
             running_subagents: running,
+            background_tasks: Vec::new(),
         }
     }
 
@@ -400,6 +411,28 @@ mod gate_tests {
         );
         assert_eq!(running_subagents(Some(&stale), now), 0);
         assert_eq!(running_subagents(None, now), 0);
+    }
+
+    #[test]
+    fn background_tasks_show_only_while_the_session_row_is_fresh() {
+        use crate::BackgroundTaskKind;
+        let now = Utc::now();
+        let task = BackgroundTask {
+            id: "b1".into(),
+            kind: BackgroundTaskKind::Shell,
+            description: "dev server".into(),
+            started_at: now,
+        };
+        let mut fresh = running_session(0, now - chrono::Duration::seconds(10));
+        fresh.background_tasks = vec![task.clone()];
+        assert_eq!(background_tasks(Some(&fresh), now).len(), 1);
+        let mut stale = running_session(
+            0,
+            now - chrono::Duration::milliseconds(SESSION_STALE_MS + 1),
+        );
+        stale.background_tasks = vec![task];
+        assert!(background_tasks(Some(&stale), now).is_empty());
+        assert!(background_tasks(None, now).is_empty());
     }
 
     #[test]

@@ -413,6 +413,42 @@ pub struct Session {
     /// has not opened; read it through `view::running_subagents`.
     #[serde(default)]
     pub running_subagents: u32,
+    /// Background tasks (background Bash, Monitor) of this chat that are still
+    /// running. Rides the session row like `running_subagents`; read it
+    /// through `view::background_tasks`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_tasks: Vec<BackgroundTask>,
+}
+
+/// A background task a harness reports as still running for a chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTask {
+    pub id: String,
+    pub kind: BackgroundTaskKind,
+    pub description: String,
+    pub started_at: DateTime<Utc>,
+}
+
+/// What a [`BackgroundTask`] is running. `Other` carries the harness's raw
+/// task type for kinds the UI has no dedicated treatment for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackgroundTaskKind {
+    Shell,
+    Other(String),
+}
+
+impl BackgroundTaskKind {
+    /// Maps a harness wire task type to a kind. Subagents (`local_agent`) are
+    /// tracked separately and never become a background task.
+    pub fn from_wire(task_type: &str) -> Option<BackgroundTaskKind> {
+        match task_type {
+            "local_agent" => None,
+            "local_bash" => Some(BackgroundTaskKind::Shell),
+            other => Some(BackgroundTaskKind::Other(other.into())),
+        }
+    }
 }
 
 impl Session {
@@ -1683,6 +1719,32 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn background_task_kind_reads_the_wire_type() {
+        assert_eq!(BackgroundTaskKind::from_wire("local_agent"), None);
+        assert_eq!(
+            BackgroundTaskKind::from_wire("local_bash"),
+            Some(BackgroundTaskKind::Shell)
+        );
+        assert_eq!(
+            BackgroundTaskKind::from_wire("monitor"),
+            Some(BackgroundTaskKind::Other("monitor".into()))
+        );
+    }
+
+    #[test]
+    fn session_without_background_tasks_still_parses() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "chatId": "chat",
+            "deviceId": "dev",
+            "status": "working",
+            "startedAt": null,
+            "updatedAt": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        assert!(session.background_tasks.is_empty());
+    }
 
     fn config(role: Option<&str>, orchestrator: Option<&str>) -> ChatConfig {
         ChatConfig {

@@ -2103,6 +2103,7 @@ impl Inner {
                     last_turn_outcome: None,
                     terminal_activity: None,
                     running_subagents: 0,
+                    background_tasks: Vec::new(),
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always

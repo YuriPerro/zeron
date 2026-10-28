@@ -228,6 +228,7 @@ mod tests {
             started_at: None,
             updated_at: Utc.timestamp_millis_opt(at).unwrap(),
             running_subagents: 0,
+            background_tasks: Vec::new(),
         }
     }
 

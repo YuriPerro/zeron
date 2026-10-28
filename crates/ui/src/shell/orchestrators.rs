@@ -562,6 +562,7 @@ mod tests {
             last_turn_outcome: None,
             terminal_activity: None,
             running_subagents: 0,
+            background_tasks: Vec::new(),
             chat_id: chat_id.into(),
             device_id: "dev".into(),
             status,
