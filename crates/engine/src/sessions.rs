@@ -4365,7 +4365,10 @@ async fn drive_run(
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
             }
-            if compaction_pending && let Some(tokens) = *tokens {
+            if compaction_pending
+                && !compaction::has_running(&folded)
+                && let Some(tokens) = tokens.filter(|tokens| *tokens > 0)
+            {
                 if compaction::fill_after(&mut folded, tokens) {
                     if !dirty {
                         dirty = true;
@@ -4702,7 +4705,7 @@ async fn drive_run(
         }
 
         let event = match event {
-            AgentEvent::Compaction { .. } => {
+            AgentEvent::Compaction { .. } if !compaction::has_running(&folded) => {
                 compaction::with_before(event, doc_ref.context_usage())
             }
             event => event,

@@ -41,6 +41,21 @@ pub(crate) fn fill_after(parts: &mut [MessagePart], tokens: u64) -> bool {
     true
 }
 
+/// Whether a compaction is still running in `parts`. It already holds the
+/// "before" reading taken when it started, and any context reading that lands
+/// while it runs belongs to the compaction itself, not to a settled one.
+pub(crate) fn has_running(parts: &[MessagePart]) -> bool {
+    parts.iter().any(|part| {
+        matches!(
+            part,
+            MessagePart::Compaction {
+                status: CompactionStatus::Running,
+                ..
+            }
+        )
+    })
+}
+
 pub(crate) fn has_pending(parts: &[MessagePart]) -> bool {
     parts.iter().any(is_pending)
 }
@@ -203,6 +218,24 @@ mod tests {
             parts[0],
             compaction(CompactionStatus::Running, Some(10), None)
         );
+    }
+
+    #[test]
+    fn has_running_sees_only_running_parts() {
+        assert!(has_running(&[
+            compaction(CompactionStatus::Done, Some(1), Some(2)),
+            compaction(CompactionStatus::Running, Some(1), None),
+        ]));
+        assert!(!has_running(&[compaction(
+            CompactionStatus::Done,
+            None,
+            None
+        )]));
+        assert!(!has_running(&[MessagePart::Text {
+            id: "t0".into(),
+            text: "hi".into()
+        }]));
+        assert!(!has_running(&[]));
     }
 
     #[test]

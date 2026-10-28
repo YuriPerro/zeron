@@ -3193,6 +3193,172 @@ async fn compaction_after_waits_for_the_next_run_and_takes_only_its_first_readin
     );
 }
 
+#[tokio::test]
+async fn compaction_keeps_its_before_when_a_reading_lands_mid_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        context_script_harness(vec![
+            context_reading(224_000, Some(1_000_000)),
+            compaction_event(CompactionPhase::Started),
+            context_reading(31_000, None),
+            compaction_event(CompactionPhase::Finished),
+            context_reading(33_000, None),
+            AgentEvent::TextDelta { text: "ok".into() },
+            done(DoneStatus::Completed),
+        ]),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "compact-mid-reading",
+        SessionCommandPayload::Run {
+            request: run_request("compact"),
+            message_id: "compact-mid-reading-user".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "the turn to complete",
+    )
+    .await;
+    assert_eq!(
+        compaction_part(&core),
+        MessagePart::Compaction {
+            id: "c0".into(),
+            status: CompactionStatus::Done,
+            tokens_before: Some(224_000),
+            tokens_after: Some(33_000),
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_mid_compaction_reading_does_not_stamp_an_older_pending_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        context_script_harness(vec![
+            compaction_event(CompactionPhase::Started),
+            context_reading(31_000, None),
+            compaction_event(CompactionPhase::Finished),
+            context_reading(33_000, None),
+            AgentEvent::TextDelta {
+                text: "next".into(),
+            },
+            done(DoneStatus::Completed),
+        ]),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle
+        .doc()
+        .push_message(&SessionMessageEntry {
+            id: "older-reply".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Done,
+                tokens_before: Some(1_000),
+                tokens_after: None,
+            }],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "compact-older-pending",
+        SessionCommandPayload::Run {
+            request: run_request("compact again"),
+            message_id: "compact-older-pending-user".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.status == Some(MessageStatus::Complete)
+                    && e.parts
+                        .iter()
+                        .any(|p| matches!(p, MessagePart::Text { text, .. } if text == "next"))
+            })
+        },
+        "the run to complete",
+    )
+    .await;
+    assert_eq!(
+        compaction_parts_now(&core),
+        vec![
+            MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Done,
+                tokens_before: Some(1_000),
+                tokens_after: None,
+            },
+            MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Done,
+                tokens_before: None,
+                tokens_after: Some(33_000),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn compaction_after_ignores_a_zero_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        context_script_harness(vec![
+            context_reading(224_000, Some(1_000_000)),
+            compaction_event(CompactionPhase::Finished),
+            done(DoneStatus::Completed),
+            context_reading(0, None),
+            context_reading(31_000, None),
+        ]),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "compact-zero-reading",
+        SessionCommandPayload::Run {
+            request: run_request("compact"),
+            message_id: "compact-zero-reading-user".into(),
+        },
+    );
+    wait_for(
+        || {
+            handle
+                .doc()
+                .context_usage()
+                .is_some_and(|u| u.tokens == Some(31_000))
+        },
+        "the second post-turn reading",
+    )
+    .await;
+    wait_for(
+        || compaction_settled(&core),
+        "the compaction to take its after",
+    )
+    .await;
+    assert_eq!(
+        compaction_part(&core),
+        MessagePart::Compaction {
+            id: "c0".into(),
+            status: CompactionStatus::Done,
+            tokens_before: Some(224_000),
+            tokens_after: Some(31_000),
+        }
+    );
+}
+
 /// Reproduce a steer accepted just before the old turn's Done. The harness
 /// confirms the new boundary later; only its eventual completion may notify.
 #[tokio::test]
