@@ -6,6 +6,7 @@
 #[path = "source_control_review_threads.rs"]
 mod review_threads;
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -355,8 +356,10 @@ pub struct GitHubCli {
     /// The board's on-disk first pages. `None` keeps everything in memory
     /// (tests, and engines without a data directory).
     store: Option<crate::change_request_store::ChangeRequestStore>,
-    /// The active `gh` account and when it was read, keying the store.
-    account: Arc<tokio::sync::Mutex<Option<(Instant, Option<String>)>>>,
+    /// Each host's active `gh` account and when it was read, keying the store.
+    account: Arc<tokio::sync::Mutex<HashMap<String, (Instant, Option<String>)>>>,
+    /// Hosts `gh` is signed in to and when they were read; the allowlist for requests.
+    hosts: Arc<tokio::sync::Mutex<Option<(Instant, Vec<String>)>>>,
 }
 
 impl GitHubCli {
@@ -518,7 +521,7 @@ impl GitHubCli {
                     serde_json::to_vec(&serde_json::json!({ "body": body }))
                         .map_err(|_| ChangeRequestError::Decode)?,
                 ),
-                ..github_request()
+                ..github_request("github.com")
             })
             .await
             .map_err(classify_run_error)?;
@@ -565,7 +568,7 @@ impl GitHubCli {
                     "-H".into(),
                     "Accept: application/vnd.github.diff".into(),
                 ],
-                ..github_request()
+                ..github_request("github.com")
             })
             .await
             .map_err(classify_run_error)?;
@@ -601,7 +604,7 @@ impl GitHubCli {
             .runner
             .run(ProcessRequest {
                 args,
-                ..github_request()
+                ..github_request("github.com")
             })
             .await
             .map_err(classify_run_error)?;
@@ -683,7 +686,7 @@ impl GitHubCli {
                     "-F".into(),
                     format!("number={}", parts[6]),
                 ],
-                ..github_request()
+                ..github_request("github.com")
             })
             .await
             .map_err(classify_run_error)?;
@@ -738,7 +741,7 @@ impl GitHubCli {
                         "-f".into(),
                         format!("name={name}"),
                     ],
-                    ..github_request()
+                    ..github_request("github.com")
                 })
                 .await
                 .map_err(classify_run_error)?;
@@ -772,7 +775,52 @@ impl GitHubCli {
             pr_cache: Default::default(),
             store: None,
             account: Default::default(),
+            hosts: Default::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_hosts(self, hosts: &[&str]) -> Self {
+        *self.hosts.try_lock().expect("fresh client") = Some((
+            Instant::now(),
+            hosts.iter().map(|host| (*host).to_owned()).collect(),
+        ));
+        self
+    }
+
+    /// Hosts `gh` is signed in to, lowercased and sorted, re-read every 30
+    /// seconds. A token in the environment, or a `gh` that cannot say, leaves
+    /// only github.com.
+    pub async fn known_hosts(&self) -> Vec<String> {
+        let mut hosts = self.hosts.lock().await;
+        if let Some((read_at, cached)) = hosts.as_ref()
+            && read_at.elapsed() < Duration::from_secs(30)
+        {
+            return cached.clone();
+        }
+        let token_in_env = token_in_env();
+        let status = if token_in_env {
+            None
+        } else {
+            self.runner
+                .run(ProcessRequest {
+                    args: vec![
+                        "auth".into(),
+                        "status".into(),
+                        "--json".into(),
+                        "hosts".into(),
+                    ],
+                    timeout: Duration::from_secs(5),
+                    ..github_request("github.com")
+                })
+                .await
+                .ok()
+                .filter(|output| output.success && !output.stdout_truncated)
+                .map(|output| output.stdout)
+        };
+        let allowed = allowed_hosts(token_in_env, status.as_deref());
+        *hosts = Some((Instant::now(), allowed.clone()));
+        allowed
     }
 
     /// Keep the board's first pages in `data_dir`, so it opens at once.
@@ -783,22 +831,20 @@ impl GitHubCli {
         self
     }
 
-    /// The active github.com account, read from `gh`'s local config (no
-    /// network). Re-read every 30 seconds so `gh auth switch` takes effect.
-    /// `None` when it can't be told — including a token in the environment,
-    /// which may belong to another account — and then nothing is stored.
-    async fn store_account(&self) -> Option<String> {
-        if ["GH_TOKEN", "GITHUB_TOKEN"]
-            .iter()
-            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
-        {
+    /// The active account on `host` as `host:login`, read from `gh`'s local
+    /// config (no network). Re-read every 30 seconds so `gh auth switch` takes
+    /// effect. `None` when it can't be told — including a token in the
+    /// environment, which may belong to another account — and then nothing is
+    /// stored.
+    async fn store_account(&self, host: &str) -> Option<String> {
+        if token_in_env() {
             return None;
         }
-        let mut account = self.account.lock().await;
-        if let Some((read_at, login)) = account.as_ref()
+        let mut accounts = self.account.lock().await;
+        if let Some((read_at, account)) = accounts.get(host)
             && read_at.elapsed() < Duration::from_secs(30)
         {
-            return login.clone();
+            return account.clone();
         }
         let login = self
             .runner
@@ -808,10 +854,10 @@ impl GitHubCli {
                     "get".into(),
                     "user".into(),
                     "-h".into(),
-                    "github.com".into(),
+                    host.into(),
                 ],
                 timeout: Duration::from_secs(5),
-                ..github_request()
+                ..github_request(host)
             })
             .await
             .ok()
@@ -824,8 +870,9 @@ impl GitHubCli {
                     && login
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            });
-        *account = Some((Instant::now(), login.clone()));
+            })
+            .map(|login| format!("{host}:{login}"));
+        accounts.insert(host.to_owned(), (Instant::now(), login.clone()));
         login
     }
 
@@ -851,7 +898,7 @@ impl GitHubCli {
         let first_page = after.is_none();
         let stored = match &self.store {
             Some(store) if first_page => self
-                .store_account()
+                .store_account("github.com")
                 .await
                 .map(|account| (store.clone(), account)),
             _ => None,
@@ -950,7 +997,7 @@ impl GitHubCli {
             )
             .collect(),
             stdin: None,
-            ..github_request()
+            ..github_request("github.com")
         };
         let output = self.runner.run(request).await.map_err(classify_run_error)?;
         let response = (!output.stdout_truncated)
@@ -1092,8 +1139,54 @@ impl GitHubCli {
     }
 }
 
-/// Board requests run against GitHub.com without a checkout or interactive prompts.
-fn github_request() -> ProcessRequest {
+fn token_in_env() -> bool {
+    ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+#[derive(Deserialize)]
+struct GhAuthStatus {
+    hosts: BTreeMap<String, Vec<GhAuthAccount>>,
+}
+
+#[derive(Deserialize)]
+struct GhAuthAccount {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    active: bool,
+}
+
+/// The hosts requests may target: those `gh auth status` reports with an
+/// active, working account. A token in the environment, or a status that
+/// cannot be read, leaves only github.com.
+fn allowed_hosts(token_in_env: bool, status: Option<&[u8]>) -> Vec<String> {
+    let github_only = || vec!["github.com".to_owned()];
+    if token_in_env {
+        return github_only();
+    }
+    status
+        .and_then(|bytes| serde_json::from_slice::<GhAuthStatus>(bytes).ok())
+        .map(|status| {
+            status
+                .hosts
+                .into_iter()
+                .filter(|(_, accounts)| {
+                    accounts
+                        .iter()
+                        .any(|account| account.active && account.state == "success")
+                })
+                .map(|(host, _)| host.to_lowercase())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_else(github_only)
+}
+
+/// Board requests run against `host` without a checkout or interactive prompts.
+fn github_request(host: &str) -> ProcessRequest {
     ProcessRequest {
         program: "gh".into(),
         args: Vec::new(),
@@ -1101,7 +1194,7 @@ fn github_request() -> ProcessRequest {
         cwd: None,
         env: vec![
             ("GH_PROMPT_DISABLED".into(), "1".into()),
-            ("GH_HOST".into(), "github.com".into()),
+            ("GH_HOST".into(), host.into()),
         ],
         timeout: GITHUB_TIMEOUT,
         output_limit: GITHUB_OUTPUT_LIMIT,
@@ -2227,6 +2320,59 @@ mod tests {
         })
     }
 
+    const AUTH_STATUS: &str = r#"{"hosts":{"github.com":[{"state":"success","active":true,"login":"a"}],"Acme.GHE.com":[{"state":"success","active":true,"login":"b"}],"old.example":[{"state":"error","active":true,"login":"c"}]}}"#;
+
+    #[tokio::test]
+    async fn known_hosts_reads_signed_in_hosts() {
+        let runner = FakeProcessRunner::with_responses([command_success(AUTH_STATUS)]);
+        let github = GitHubCli::with_runner(runner.clone());
+        let expected = vec!["acme.ghe.com".to_owned(), "github.com".to_owned()];
+        if token_in_env() {
+            assert_eq!(github.known_hosts().await, vec!["github.com".to_owned()]);
+            return;
+        }
+        assert_eq!(github.known_hosts().await, expected);
+        assert_eq!(github.known_hosts().await, expected);
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].args, ["auth", "status", "--json", "hosts"]);
+    }
+
+    #[test]
+    fn allowed_hosts_with_token_is_github_only() {
+        let github_only = vec!["github.com".to_owned()];
+        assert_eq!(
+            allowed_hosts(true, Some(AUTH_STATUS.as_bytes())),
+            github_only
+        );
+        assert_eq!(allowed_hosts(false, None), github_only);
+        assert_eq!(allowed_hosts(false, Some(b"not json")), github_only);
+    }
+
+    #[tokio::test]
+    async fn store_account_is_per_host() {
+        if token_in_env() {
+            return;
+        }
+        let runner = FakeProcessRunner::with_responses([command_success("b\n")]);
+        let github = GitHubCli::with_runner(runner.clone());
+        assert_eq!(
+            github.store_account("acme.ghe.com").await,
+            Some("acme.ghe.com:b".to_owned())
+        );
+        let requests = runner.requests();
+        assert!(
+            requests[0]
+                .args
+                .ends_with(&["-h".to_owned(), "acme.ghe.com".to_owned()])
+        );
+        assert!(
+            requests[0]
+                .env
+                .contains(&("GH_HOST".to_owned(), "acme.ghe.com".to_owned()))
+        );
+    }
+
     /// Real engine dispatch, wire envelopes and GitHub decoding; only subprocess
     /// execution is scripted. Repository discovery still runs real local Git.
     #[tokio::test]
@@ -2333,7 +2479,7 @@ mod tests {
             command_success(serde_json::to_vec(&threads_empty).unwrap()),
             command_failure("authentication required: gh auth login; private-provider-diagnostic"),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let rpc = Arc::try_unwrap(core.rpc_service())
             .ok()
             .unwrap()
@@ -2605,7 +2751,7 @@ mod tests {
             command_success(br#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}"#.to_vec()),
             command_success("new patch"),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         for key in [
             format!("false:{url}::"),
             format!("false:{url}:{old}:"),
@@ -2664,12 +2810,11 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_alias_remote_matches_through_ssh_config() {
-        let runner = FakeProcessRunner::with_responses([command_success(
-            "user git\nhostname github.com\n",
-        )]);
+        let runner =
+            FakeProcessRunner::with_responses([command_success("user git\nhostname github.com\n")]);
         let resolver = ChangeRequestResolver {
             inspector: GitCheckoutInspector::new(runner.clone()),
-            github: GitHubCli::with_runner(runner.clone()),
+            github: GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]),
         };
         assert_eq!(
             resolver
@@ -2689,7 +2834,10 @@ mod tests {
                 .as_deref(),
             Some("acme/zeron")
         );
-        assert_eq!(resolver.github_slug("https://gitlab.com/acme/zeron").await, None);
+        assert_eq!(
+            resolver.github_slug("https://gitlab.com/acme/zeron").await,
+            None
+        );
         assert_eq!(runner.requests().len(), 1);
     }
 
@@ -2721,7 +2869,7 @@ mod tests {
             }))
             .unwrap(),
         )]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         github.pr_cache.lock().await.entries.push((
             "false:https://github.com/a/b/pull/1::".into(),
             Instant::now(),
@@ -2776,7 +2924,7 @@ mod tests {
     #[tokio::test]
     async fn pr_comment_rejects_invalid_inputs_and_never_retries_failure() {
         let runner = FakeProcessRunner::with_responses([command_failure("request failed")]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         assert!(
             github
                 .post_comment("https://evil.test/a/b/pull/1", "hello")
@@ -2809,6 +2957,7 @@ mod tests {
     async fn pr_detail_normalizes_absent_github_fields_and_uses_bounded_process() {
         let runner = FakeProcessRunner::with_responses([command_success(br#"{"number":12,"title":"A PR","body":"Description","author":null,"reviewDecision":null,"comments":[{"viewerDidAuthor":true,"author":{"login":"viewer"},"body":"Own comment"},{"author":{"login":"other"},"body":"Other comment"}],"statusCheckRollup":[{"name":"build","status":"IN_PROGRESS","conclusion":null}]}"#.to_vec()), command_failure("review threads unavailable")]);
         let detail = GitHubCli::with_runner(runner.clone())
+            .with_hosts(&["github.com"])
             .detail("https://github.com/a/b/pull/12", false)
             .await
             .unwrap();
@@ -2835,7 +2984,7 @@ mod tests {
             command_success("diff --git a/a b/a\n"),
             Ok(truncated),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         assert_eq!(
             github
                 .diff("https://github.com/a/b/pull/12", false)
@@ -2960,7 +3109,7 @@ mod tests {
             node
         }).collect();
         let runner = FakeProcessRunner::with_responses([command_success(search_response(nodes))]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let page = github
             .list_page(
                 "acme/zeron",
@@ -3037,7 +3186,7 @@ mod tests {
         Arc<FakeProcessRunner>,
     ) {
         let runner = FakeProcessRunner::with_responses([response]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let result = authored(&github, "acme/zeron", false).await;
         (result, runner)
     }
@@ -3050,7 +3199,7 @@ mod tests {
         Arc<FakeProcessRunner>,
     ) {
         let runner = FakeProcessRunner::with_responses([response]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let result = github.find_for_branch(source).await;
         (result, runner)
     }
@@ -3148,7 +3297,7 @@ mod tests {
             command_success(page(vec![item(1)], Some("Y3Vyc29yOjUw"))),
             command_success(page(vec![item(2)], None)),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let filter = zeron_proto::ChangeRequestFilter::All;
         let first = github
             .list_page("acme/zeron", filter, None, false, false)
@@ -3157,7 +3306,13 @@ mod tests {
         assert_eq!(first.next_cursor.as_deref(), Some("Y3Vyc29yOjUw"));
         assert_eq!(first.total_count, Some(120));
         let second = github
-            .list_page("acme/zeron", filter, first.next_cursor.as_deref(), false, false)
+            .list_page(
+                "acme/zeron",
+                filter,
+                first.next_cursor.as_deref(),
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(second.items[0].number, 2);
@@ -3201,7 +3356,9 @@ mod tests {
             page("first"),
             page("refreshed"),
         ]);
-        let github = GitHubCli::with_runner(runner.clone()).with_store(dir.path());
+        let github = GitHubCli::with_runner(runner.clone())
+            .with_hosts(&["github.com"])
+            .with_store(dir.path());
         let filter = zeron_proto::ChangeRequestFilter::All;
         // Nothing stored yet: a cached read goes to GitHub and stores it.
         let first = github
@@ -3211,8 +3368,13 @@ mod tests {
         assert_eq!(first.items[0].title, "first");
         assert!(first.fetched_at.is_some());
         // A fresh engine (a relaunch) serves the stored page without GitHub.
-        let relaunched = GitHubCli::with_runner(runner.clone()).with_store(dir.path());
-        *relaunched.account.lock().await = Some((Instant::now(), Some("me".into())));
+        let relaunched = GitHubCli::with_runner(runner.clone())
+            .with_hosts(&["github.com"])
+            .with_store(dir.path());
+        relaunched.account.lock().await.insert(
+            "github.com".into(),
+            (Instant::now(), Some("github.com:me".into())),
+        );
         let stored = relaunched
             .list_page("acme/zeron", filter, None, false, true)
             .await
@@ -3273,7 +3435,7 @@ mod tests {
             command_success(serde_json::to_vec(&redirect).unwrap()),
             command_success(items),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         for _ in 0..2 {
             let items = authored(&github, "acme/old-name", false).await.unwrap();
             assert_eq!(items[0].repository, "acme/new-name");
@@ -3305,7 +3467,7 @@ mod tests {
         let runner = FakeProcessRunner::with_responses(
             (0..3).map(|_| command_success(search_response(vec![]))),
         );
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         for (index, filter) in [All, Authored, Reviewing].into_iter().enumerate() {
             github
                 .list_page("acme/zeron", filter, None, false, false)
@@ -3343,7 +3505,7 @@ mod tests {
             command_success(search_response(vec![])),
             command_success(search_response(vec![])),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let (a, b) = tokio::join!(
             authored(&github, "acme/zeron", false),
             authored(&github, "ACME/ZERON", false)
@@ -3388,7 +3550,7 @@ mod tests {
             gate: tokio::sync::Barrier::new(2),
             runs: Default::default(),
         });
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let (diff, same_diff, list) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
                 github.diff("https://github.com/a/b/pull/1", false),
@@ -3413,7 +3575,7 @@ mod tests {
             gate: tokio::sync::Barrier::new(2),
             runs: Default::default(),
         });
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let url = "https://github.com/a/b/pull/1";
         let caller = tokio::spawn({
             let github = github.clone();
@@ -3442,7 +3604,7 @@ mod tests {
             command_failure("request failed"),
             command_success(search_response(vec![])),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         for _ in 0..2 {
             assert_eq!(
                 authored(&github, "a/b", false).await,
@@ -3458,7 +3620,7 @@ mod tests {
     async fn pr_rate_limit_cooldown_covers_other_repositories_and_details() {
         let runner =
             FakeProcessRunner::with_responses([command_failure("API rate limit exceeded")]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         assert_eq!(
             authored(&github, "a/one", false).await,
             Err(ChangeRequestError::RateLimited)
@@ -3483,7 +3645,7 @@ mod tests {
         let runner = FakeProcessRunner::with_responses(
             (0..26).map(|_| command_success(search_response(vec![]))),
         );
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         for invalid in ["", "acme", "a/b repo:c/d", "a/*", "a/b/c", "a/.."] {
             assert_eq!(
                 authored(&github, invalid, false).await,
@@ -3808,7 +3970,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         });
         let resolver = ChangeRequestResolver {
             inspector: GitCheckoutInspector::new(runner.clone()),
-            github: GitHubCli::with_runner(runner),
+            github: GitHubCli::with_runner(runner).with_hosts(&["github.com"]),
         };
 
         let resolution = resolver
@@ -3900,10 +4062,10 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             // Git reports slash-separated paths on Windows, while settings
             // retain canonical Win32 prefixes. Compare the actual directory.
             assert!(
-                refs.iter().any(|entry| entry
-                    .worktree_path
-                    .as_ref()
-                    .is_some_and(|listed| same_file::is_same_file(listed, path).unwrap_or(false))),
+                refs.iter()
+                    .any(|entry| entry.worktree_path.as_ref().is_some_and(|listed| {
+                        same_file::is_same_file(listed, path).unwrap_or(false)
+                    })),
                 "Git refs must include worktree {path}; got {refs:?}"
             );
         }
@@ -3976,7 +4138,10 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             ],
         );
         run_git(&checkout, &["config", "branch.main.remote", "upstream"]);
-        run_git(&checkout, &["config", "branch.main.merge", "refs/heads/main"]);
+        run_git(
+            &checkout,
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
 
         let resolver = ChangeRequestResolver::new();
         let source = resolver
@@ -4150,7 +4315,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             command_success(b"[]".to_vec()),
             command_success(json),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
 
         let result = github.find_for_branch(&source).await.unwrap().unwrap();
 
@@ -4195,7 +4360,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             stderr: Vec::new(),
             stdout_truncated: true,
         })]);
-        let github = GitHubCli::with_runner(runner);
+        let github = GitHubCli::with_runner(runner).with_hosts(&["github.com"]);
 
         let result = github.find_for_branch(&source).await;
 
@@ -4282,7 +4447,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             command_success(list),
             command_success(br#"{"defaultBranchRef":{"name":"main"}}"#.to_vec()),
         ]);
-        let github = GitHubCli::with_runner(runner.clone());
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
 
         let result = github.find_for_branch(&source).await;
 
@@ -4336,7 +4501,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             command_success(list),
             command_failure("could not resolve repository"),
         ]);
-        let github = GitHubCli::with_runner(runner);
+        let github = GitHubCli::with_runner(runner).with_hosts(&["github.com"]);
 
         let result = github.find_for_branch(&source).await;
 

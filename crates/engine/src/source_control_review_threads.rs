@@ -17,7 +17,7 @@ impl GitHubCli {
                     serde_json::to_vec(&json!({"query": query, "variables": variables}))
                         .map_err(|_| ChangeRequestError::Decode)?,
                 ),
-                ..github_request()
+                ..github_request("github.com")
             })
             .await
             .map_err(classify_run_error)?;
