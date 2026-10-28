@@ -50,8 +50,9 @@ pub(crate) fn running(status: CompactionStatus, streaming: bool) -> bool {
     status == CompactionStatus::Running && streaming
 }
 
-pub(crate) fn is_compact_command(raw: &str) -> bool {
-    leading_command(&invocation_prompt(raw)).is_some_and(|(name, _)| name == "compact")
+pub(crate) fn is_bare_compact(raw: &str) -> bool {
+    leading_command(&invocation_prompt(raw))
+        .is_some_and(|(name, args)| name == "compact" && args.is_empty())
 }
 
 fn has_compaction(entry: &SessionMessageEntry) -> bool {
@@ -73,16 +74,16 @@ fn prompt_text(entry: &SessionMessageEntry) -> String {
         .join("\n\n")
 }
 
-/// Ids of the `/compact` prompts whose reply carries the compaction line, so
-/// the line stands in for the bubble. A prompt without that reply keeps its
-/// bubble.
+/// Ids of the bare `/compact` prompts whose reply carries the compaction line,
+/// so the line stands in for the bubble. A prompt without that reply, or one
+/// carrying instructions, keeps its bubble.
 pub(crate) fn hidden_bubbles(entries: &[SessionMessageEntry]) -> HashSet<String> {
     entries
         .windows(2)
         .filter(|pair| {
             pair[0].role == MessageRole::User
                 && has_compaction(&pair[1])
-                && is_compact_command(&prompt_text(&pair[0]))
+                && is_bare_compact(&prompt_text(&pair[0]))
         })
         .map(|pair| pair[0].id.clone())
         .collect()
@@ -224,16 +225,18 @@ mod tests {
     }
 
     #[test]
-    fn compact_command_matches_typed_and_picked_forms() {
+    fn bare_compact_matches_typed_and_picked_forms() {
         let picked = zeron_proto::invocation::Invocation::Command {
             name: "compact".into(),
         }
         .link();
-        assert!(is_compact_command("/compact"));
-        assert!(is_compact_command("  /compact keep the plan"));
-        assert!(is_compact_command(&picked));
-        assert!(!is_compact_command("/review"));
-        assert!(!is_compact_command("please compact"));
+        assert!(is_bare_compact("/compact"));
+        assert!(is_bare_compact("  /compact"));
+        assert!(is_bare_compact(&picked));
+        assert!(!is_bare_compact("/compact keep the plan"));
+        assert!(!is_bare_compact(&format!("{picked} keep the plan")));
+        assert!(!is_bare_compact("/review"));
+        assert!(!is_bare_compact("please compact"));
     }
 
     #[test]
@@ -252,6 +255,12 @@ mod tests {
 
         let text_only = [user("/compact"), reply(vec![text("t2", "ok")])];
         assert!(hidden_bubbles(&text_only).is_empty());
+
+        let with_instructions = [
+            user("/compact keep the plan"),
+            reply(vec![compaction(CompactionStatus::Done)]),
+        ];
+        assert!(hidden_bubbles(&with_instructions).is_empty());
 
         let other_prompt = [
             user("hello"),
