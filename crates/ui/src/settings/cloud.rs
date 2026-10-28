@@ -1307,9 +1307,7 @@ impl CloudPage {
                             .child(axis(usage.days.last())),
                     ),
             );
-        Some(
-            widgets::section(theme, "Usage", block).into_any_element(),
-        )
+        Some(widgets::section(theme, "Usage", block).into_any_element())
     }
 }
 
