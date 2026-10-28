@@ -349,6 +349,18 @@ impl Shell {
                         } => transcript.update(cx, |t, cx| {
                             t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
                         }),
+                        ComposerEvent::OpenSubagent {
+                            chat_id,
+                            doc_id,
+                            title,
+                            frozen,
+                        } => this.add_subagent_surface(
+                            chat_id.clone(),
+                            doc_id.clone(),
+                            title.clone(),
+                            *frozen,
+                            cx,
+                        ),
                     }
                 }
             }),

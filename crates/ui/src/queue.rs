@@ -81,11 +81,11 @@ const ROW_GAP: f32 = PANEL_PAD_X;
 const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
 const ROW_PAD_X: f32 = 8.0;
 pub(crate) const PANEL_RADIUS: f32 = 16.0;
-const PANEL_BORDER: f32 = 1.0;
+pub(crate) const PANEL_BORDER: f32 = 1.0;
 /// One inset on every visible side of the rows: left, right, top, and above
 /// the composer that overlaps the tray's bottom.
 const PANEL_PAD_X: f32 = 4.0;
-const PANEL_PAD_TOP: f32 = 4.0;
+pub(crate) const PANEL_PAD_TOP: f32 = 4.0;
 /// Concentric with the tray: its radius less the border and the inset, so a
 /// row's hover and editing wash follow the tray's corner exactly.
 pub(crate) const ROW_RADIUS: f32 = PANEL_RADIUS - PANEL_BORDER - PANEL_PAD_X;
@@ -280,6 +280,15 @@ fn queue_hidden_attachments_label(labels: &[String], shown: usize) -> Option<Str
     Some(format!("{} more: {}", hidden.len(), hidden.join(" · ")))
 }
 
+/// The trays' glass, shared by everything docked above the composer.
+pub(crate) fn tray_glass(theme: &Theme) -> gpui::Hsla {
+    if theme.is_frost() && matches!(theme.appearance, crate::theme::Appearance::Dark) {
+        theme.composer_sidebar_tint()
+    } else {
+        theme.input_glass_bg()
+    }
+}
+
 /// `dragging`: a drag is in flight. The tray stops occluding then, so files,
 /// workspace paths and chats dropped on it reach the conversation's drop zone
 /// beneath (and land in this composer); otherwise it keeps clicks and hover
@@ -288,13 +297,7 @@ pub(crate) fn queue_panel_surface(theme: &Theme, dragging: bool) -> gpui::Div {
     div()
         .when(!dragging, |el| el.occlude())
         .rounded_t(px(PANEL_RADIUS))
-        .bg(
-            if theme.is_frost() && matches!(theme.appearance, crate::theme::Appearance::Dark) {
-                theme.composer_sidebar_tint()
-            } else {
-                theme.input_glass_bg()
-            },
-        )
+        .bg(tray_glass(theme))
         .border_1()
         .border_color(theme.border)
         .when(!theme.is_frost(), |el| el.shadow_lg())

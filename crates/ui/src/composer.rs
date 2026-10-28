@@ -5719,6 +5719,14 @@ pub enum ComposerEvent {
         chat_id: String,
         message_id: String,
     },
+    /// A running subagent's row in the pills' tray was clicked: open its
+    /// transcript as a right-pane tab, like a spawn chip.
+    OpenSubagent {
+        chat_id: String,
+        doc_id: String,
+        title: String,
+        frozen: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6410,6 +6418,11 @@ pub struct Composer {
     pub(crate) todo_cache: crate::todo_panel::TodoCache,
     pub(crate) todo_panels: HashMap<String, crate::todo_panel::TodoPanelState>,
     pub(crate) todo_scroll: gpui::ScrollHandle,
+    /// The subagent and background pills: per-chat open tray and the stops
+    /// in flight (in memory, like the checklist's state).
+    pub(crate) running_trays: HashMap<String, crate::running_trays::RunningTrayState>,
+    /// Re-renders once a second while an open tray counts elapsed time.
+    pub(crate) running_tick: Option<Task<()>>,
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
@@ -6709,6 +6722,8 @@ impl Composer {
             todo_cache: Default::default(),
             todo_panels: HashMap::new(),
             todo_scroll: gpui::ScrollHandle::new(),
+            running_trays: HashMap::new(),
+            running_tick: None,
             queue_shortcut_revealed: false,
             annotation_marks: Vec::new(),
             expanded_mode: false,
@@ -11535,12 +11550,18 @@ impl Render for Composer {
                 self.staged_comments(cx).len(),
             );
         // The checklist tray stacks above the queue (or directly above the
-        // composer), one step narrower than what follows it.
+        // composer), one step narrower than what follows it; the running
+        // work's pills and tray top the stack, one step narrower again.
         let has_queue = !self.state.read(cx).queue.is_empty();
+        let todo = self.render_todo_panel(has_queue, window, cx);
+        let trays_below = usize::from(has_queue) + usize::from(todo.is_some());
         let container = container.when_some(
-            self.render_todo_panel(has_queue, window, cx),
-            |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
+            self.render_running_trays(trays_below, window, cx),
+            |el, trays| el.child(motion::fade_quick("composer-running", div().child(trays))),
         );
+        let container = container.when_some(todo, |el, panel| {
+            el.child(motion::fade_quick("composer-todo", div().child(panel)))
+        });
         let container = container.when_some(
             self.render_queue_panel(show_queue_latest_shortcut, window, cx),
             |el, panel| {

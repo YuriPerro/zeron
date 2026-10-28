@@ -71,6 +71,7 @@ pub mod rail;
 pub(crate) mod reply_images;
 mod roll_text;
 pub mod running_pill;
+mod running_trays;
 pub(crate) mod running_work;
 pub mod settings;
 pub mod shell;
