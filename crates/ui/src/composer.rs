@@ -7239,15 +7239,27 @@ impl Composer {
             let (restored, mut stash): (Vec<_>, Vec<_>) = std::mem::take(&mut draft.unstaged)
                 .into_iter()
                 .partition(is_mentioned);
-            let (mut kept, dropped): (Vec<_>, Vec<_>) = self
+            let (kept, dropped): (Vec<_>, Vec<_>) = self
                 .attachments
                 .remove(&key)
                 .unwrap_or_default()
                 .into_iter()
                 .partition(is_mentioned);
             let changed = !restored.is_empty() || !dropped.is_empty();
-            kept.extend(restored);
-            kept.sort_by_key(|att| att.mention.unwrap_or(0));
+            // A returning chip's file goes back by its number. Attachments
+            // without a chip (image tiles) ride behind the chip staged before
+            // them, so they keep their place.
+            let mut before = 0;
+            let mut placed: Vec<(u32, StagedAttachment)> = kept
+                .into_iter()
+                .chain(restored)
+                .map(|att| {
+                    before = att.mention.unwrap_or(before);
+                    (before, att)
+                })
+                .collect();
+            placed.sort_by_key(|(slot, _)| *slot);
+            let kept: Vec<_> = placed.into_iter().map(|(_, att)| att).collect();
             stash.extend(dropped);
             draft.unstaged = stash;
             if !kept.is_empty() {
