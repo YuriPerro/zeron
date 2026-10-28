@@ -373,6 +373,22 @@ fn fits_op_budget(op: &RowOp) -> bool {
     serde_json::to_vec(op).is_ok_and(|bytes| bytes.len() <= MAX_OP_BYTES)
 }
 
+/// A session op the room would reject as oversized carries an empty
+/// `backgroundTasks` instead: the set is the only unbounded field, and one
+/// rejected op wedges the whole queue (see `enqueue_ops`).
+fn shed_oversized_background_tasks(op: &mut RowOp) {
+    if fits_op_budget(op) {
+        return;
+    }
+    if let Some(tasks) = op
+        .set
+        .as_mut()
+        .and_then(|set| set.get_mut("backgroundTasks"))
+    {
+        *tasks = json!([]);
+    }
+}
+
 /// The `sessions` fields the room's push notifications switch on
 /// (`notificationFor` in `edge/src/push-notify.ts`): the status indicator
 /// and the completed-turn marker. `updatedAt` only gates staleness, so the
@@ -952,15 +968,25 @@ impl RegistryDoc {
     }
 
     fn write(&mut self, kind: &str, id: &str, op: OpKind, set: BTreeMap<String, Value>) {
-        let hlc = self.next_hlc();
-        self.enqueue_ops(vec![RowOp {
+        let op = self.local_op(kind, id, op, set);
+        self.enqueue_ops(vec![op]);
+    }
+
+    fn local_op(
+        &mut self,
+        kind: &str,
+        id: &str,
+        op: OpKind,
+        set: BTreeMap<String, Value>,
+    ) -> RowOp {
+        RowOp {
             kind: kind.to_string(),
             id: id.to_string(),
             op,
             set: Some(set),
-            hlc,
+            hlc: self.next_hlc(),
             clocks: None,
-        }]);
+        }
     }
 
     fn delete_row_ops(&mut self, keys: &[(&str, &str)]) {
@@ -1550,7 +1576,9 @@ impl RegistryDoc {
             ("runningSubagents", json!(session.running_subagents)),
             ("backgroundTasks", json!(session.background_tasks)),
         ]);
-        self.write(KIND_SESSIONS, &session.chat_id.clone(), OpKind::Upsert, set);
+        let mut op = self.local_op(KIND_SESSIONS, &session.chat_id, OpKind::Upsert, set);
+        shed_oversized_background_tasks(&mut op);
+        self.enqueue_ops(vec![op]);
         Ok(())
     }
 
@@ -1619,14 +1647,16 @@ impl RegistryDoc {
     pub fn seed_from_workspace(&mut self, state: &WorkspaceState) -> Result<usize, DocError> {
         let mut ops: Vec<RowOp> = Vec::new();
         let mut seed = |kind: &str, id: &str, ms: i64, set: BTreeMap<String, Value>| {
-            ops.push(RowOp {
+            let mut op = RowOp {
                 kind: kind.to_string(),
                 id: id.to_string(),
                 op: OpKind::Upsert,
                 set: Some(set),
                 hlc: encode_hlc(ms.max(1), 0, "migration"),
                 clocks: None,
-            });
+            };
+            shed_oversized_background_tasks(&mut op);
+            ops.push(op);
         };
         for device in &state.devices {
             let ms = newest(&[device.last_seen_at, device.created_at]);

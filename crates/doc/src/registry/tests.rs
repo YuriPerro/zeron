@@ -381,6 +381,41 @@ fn background_tasks_ride_the_session_row_to_other_devices() {
     assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
 }
 
+/// A set too large for one op must never reach the room: the room rejects
+/// the whole batch and the queue wedges behind it.
+#[test]
+fn oversized_background_tasks_fall_back_to_an_empty_set() {
+    let mut row = session("chat", "host", SessionStatus::Working);
+    row.background_tasks = (0..20)
+        .map(|i| zeron_proto::BackgroundTask {
+            id: format!("b{i}"),
+            kind: zeron_proto::BackgroundTaskKind::Shell,
+            description: "x".repeat(1024),
+            started_at: ts(3_200),
+        })
+        .collect();
+    let mut migrated = RegistryDoc::new("host");
+    migrated
+        .seed_from_workspace(&WorkspaceState {
+            devices: Vec::new(),
+            spaces: Vec::new(),
+            chats: Vec::new(),
+            sessions: vec![row.clone()],
+        })
+        .unwrap();
+    let mut host = RegistryDoc::new("host");
+    host.upsert_session(&row).unwrap();
+    for doc in [&host, &migrated] {
+        let op = &doc.pending[0].ops[0];
+        assert!(fits_op_budget(op));
+        assert_eq!(op.set.as_ref().unwrap()["backgroundTasks"], json!([]));
+        assert_eq!(
+            op.set.as_ref().unwrap()["status"],
+            serde_json::to_value(SessionStatus::Working).unwrap()
+        );
+    }
+}
+
 /// Stand-in for the server: applies every pushable batch from `docs` to a row
 /// table with the SAME merge fn, acks, and broadcasts merged rows to all.
 fn server_round(

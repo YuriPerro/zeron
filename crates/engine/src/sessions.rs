@@ -2120,8 +2120,14 @@ impl Inner {
     /// Publish the background tasks `chat_id`'s harness reports, the way
     /// [`Self::set_running_subagents`] publishes its count. A task keeps the
     /// start of its first report (the harness gives none), a new one starts
-    /// now, and an unchanged set is a no-op.
+    /// now, and an unchanged set is a no-op. The set rides one registry row
+    /// op, so it keeps [`MAX_BACKGROUND_TASKS`] tasks and clamps each
+    /// description to [`MAX_BACKGROUND_TASK_DESCRIPTION`] chars.
     fn set_background_tasks(&self, chat_id: &str, mut tasks: Vec<zeron_proto::BackgroundTask>) {
+        tasks.truncate(MAX_BACKGROUND_TASKS);
+        for task in &mut tasks {
+            clamp_description(&mut task.description);
+        }
         let session = {
             let mut statuses = lock(&self.statuses);
             let Some(entry) = statuses.get_mut(chat_id) else {
@@ -2760,6 +2766,24 @@ fn clip_chars(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
         Some((cut, _)) => format!("{}… [truncated]", &text[..cut]),
         None => text.to_owned(),
+    }
+}
+
+/// Background tasks one session row publishes.
+const MAX_BACKGROUND_TASKS: usize = 20;
+/// A background task's description length, ellipsis included.
+const MAX_BACKGROUND_TASK_DESCRIPTION: usize = 200;
+
+/// Cut `description` to [`MAX_BACKGROUND_TASK_DESCRIPTION`] chars on a char
+/// boundary, ending in `…` when cut.
+fn clamp_description(description: &mut String) {
+    if let Some((cut, _)) = description
+        .char_indices()
+        .nth(MAX_BACKGROUND_TASK_DESCRIPTION - 1)
+        && description[cut..].chars().nth(1).is_some()
+    {
+        description.truncate(cut);
+        description.push('…');
     }
 }
 
@@ -6151,6 +6175,44 @@ mod tests {
         set(&["m1"]);
         assert_eq!(row().updated_at, only.updated_at);
         assert_eq!(row().background_tasks, only.background_tasks);
+    }
+
+    /// The set rides one registry row op, so a huge description or a long
+    /// list is clamped before it is published.
+    #[test]
+    fn background_tasks_are_clamped_before_publishing() {
+        use super::*;
+        use zeron_proto::{BackgroundTask, BackgroundTaskKind};
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let task = |id: String, description: String| BackgroundTask {
+            id,
+            kind: BackgroundTaskKind::Shell,
+            description,
+            started_at: std::time::UNIX_EPOCH.into(),
+        };
+        sessions
+            .inner
+            .set_status("chat", SessionStatus::Working, true);
+        let huge = "é".repeat(10 * 1024);
+        let exact = "a".repeat(200);
+        let mut tasks = vec![
+            task("big".into(), huge),
+            task("short".into(), "ok".into()),
+            task("exact".into(), exact.clone()),
+        ];
+        tasks.extend((0..30).map(|i| task(format!("t{i}"), String::new())));
+        sessions.inner.set_background_tasks("chat", tasks);
+        let row = sessions.session_status("chat").unwrap().background_tasks;
+        assert_eq!(row.len(), 20);
+        assert_eq!(row[0].description.chars().count(), 200);
+        assert!(row[0].description.ends_with('…'));
+        assert_eq!(row[1].description, "ok");
+        assert_eq!(row[2].description, exact);
     }
 
     fn done(status: DoneStatus) -> AgentEvent {
