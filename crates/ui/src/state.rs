@@ -1023,6 +1023,9 @@ pub struct AppState {
     /// snapshots): real relay-leg progress for the sending thumbnail's
     /// percent ring, present exactly while bytes are moving.
     transfers: HashMap<String, (u64, u64)>,
+    /// Background tasks whose stop is in flight, as (chat id, task id). The
+    /// composer's tray and the lanes card share it, so a task stops once.
+    stopping_background_tasks: HashSet<(String, String)>,
     /// Written by the changes pane, read by the composer.
     review_comments: HashMap<String, Vec<ReviewComment>>,
     /// File surfaces whose editor-backed comments currently cite a buffer
@@ -1185,6 +1188,7 @@ impl AppState {
             pending_sends: HashMap::new(),
             upload_progress: None,
             transfers: HashMap::new(),
+            stopping_background_tasks: HashSet::new(),
             review_comments: HashMap::new(),
             review_comment_flushes: HashMap::new(),
             local_device_id: None,
@@ -3330,6 +3334,23 @@ impl AppState {
         now: DateTime<Utc>,
     ) -> &[zeron_proto::BackgroundTask] {
         zeron_proto::view::background_tasks(self.session_for(chat_id), now)
+    }
+
+    /// Whether a stop of `chat_id`'s background task `task_id` is in flight.
+    pub fn background_task_stopping(&self, chat_id: &str, task_id: &str) -> bool {
+        self.stopping_background_tasks
+            .contains(&(chat_id.to_owned(), task_id.to_owned()))
+    }
+
+    /// Mark a stop in flight; `false` when one already is.
+    pub(crate) fn mark_background_task_stopping(&mut self, chat_id: &str, task_id: &str) -> bool {
+        self.stopping_background_tasks
+            .insert((chat_id.to_owned(), task_id.to_owned()))
+    }
+
+    pub(crate) fn clear_background_task_stopping(&mut self, chat_id: &str, task_id: &str) {
+        self.stopping_background_tasks
+            .remove(&(chat_id.to_owned(), task_id.to_owned()));
     }
 
     /// Native run indicator for composer/Stop controls. Sidebar attention is

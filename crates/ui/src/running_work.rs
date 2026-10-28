@@ -8,7 +8,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use gpui::{
     App, Entity, InteractiveElement as _, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Task, div, prelude::*, px,
+    StatefulInteractiveElement as _, Styled as _, div, prelude::*, px,
 };
 use zeron_doc::{MessagePart, SubagentStatus};
 use zeron_proto::{BackgroundTask, ChatIndicator};
@@ -171,54 +171,56 @@ pub(crate) fn background_stop_button(
         .child(div().size(px(STOP_SQUARE)).rounded(px(1.5)).bg(danger))
 }
 
-/// Ask the chat's host to stop one of its background tasks. A refusal says
-/// so only while the task still runs — one that ended on its own in the
-/// meantime needs no toast. Each surface keeps its own in-flight mark and
-/// clears it on `Err`.
+/// Ask the chat's host to stop one of its background tasks. The stop is
+/// marked in flight on [`AppState`] for every surface that lists the task,
+/// so a second stop is a no-op. The mark clears once the call settles either
+/// way: an acked task leaves the list with the next set the host publishes,
+/// and a refusal says so only while the task still runs — one that ended on
+/// its own in the meantime needs no toast.
 pub(crate) fn stop_background_task(
     state: &Entity<AppState>,
     chat_id: String,
     task_id: String,
     cx: &mut App,
-) -> Task<Result<(), String>> {
-    let (engine, host) = {
-        let state = state.read(cx);
-        let host = state
-            .chats
-            .iter()
-            .find(|chat| chat.id == chat_id)
-            .map(|chat| chat.device_id.clone());
-        (state.engine().cloned(), host)
+) {
+    let Some((engine, params)) = state.update(cx, |state, cx| {
+        let engine = state.engine().cloned()?;
+        if !state.mark_background_task_stopping(&chat_id, &task_id) {
+            return None;
+        }
+        cx.notify();
+        let mut params = serde_json::json!({ "chatId": chat_id, "taskId": task_id });
+        if let Some(chat) = state.chats.iter().find(|chat| chat.id == chat_id) {
+            params["targetDeviceId"] = serde_json::Value::String(chat.device_id.clone());
+        }
+        Some((engine, params))
+    }) else {
+        return;
     };
-    let Some(engine) = engine else {
-        return Task::ready(Err("not connected".into()));
-    };
-    let mut params = serde_json::json!({ "chatId": chat_id, "taskId": task_id });
-    if let Some(host) = host {
-        params["targetDeviceId"] = serde_json::Value::String(host);
-    }
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let Err(err) = engine
+        let result = engine
             .client()
             .call(methods::STOP_BACKGROUND_TASK, params)
-            .await
-        else {
-            return Ok(());
-        };
-        tracing::warn!(error = %err, "stopping a background task failed");
+            .await;
         cx.update(|cx| {
-            let running = state
-                .read(cx)
-                .background_tasks_for(&chat_id, clock_now())
-                .iter()
-                .any(|task| task.id == task_id);
-            if running {
-                crate::toast::error(cx, format!("Couldn't stop the task: {err}"));
+            let running = state.update(cx, |state, cx| {
+                state.clear_background_task_stopping(&chat_id, &task_id);
+                cx.notify();
+                state
+                    .background_tasks_for(&chat_id, clock_now())
+                    .iter()
+                    .any(|task| task.id == task_id)
+            });
+            if let Err(err) = result {
+                tracing::warn!(error = %err, "stopping a background task failed");
+                if running {
+                    crate::toast::error(cx, format!("Couldn't stop the task: {err}"));
+                }
             }
         });
-        Err(err.to_string())
     })
+    .detach();
 }
 
 /// How long `since` has run as of `now`: `41s`, `1m 12s` or `1h 03m`.

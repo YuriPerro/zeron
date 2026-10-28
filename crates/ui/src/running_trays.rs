@@ -6,8 +6,6 @@
 //! A pill's count is its tray's length, so the two never disagree; a pill
 //! with nothing to list is absent, and its open tray closes with it.
 
-use std::collections::HashSet;
-
 use gpui::{
     AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
@@ -37,9 +35,6 @@ pub(crate) enum RunningTray {
 pub(crate) struct RunningTrayState {
     /// The open tray; opening one closes the other.
     open: Option<RunningTray>,
-    /// Background tasks whose stop is in flight. An id leaves once its task
-    /// leaves the chat's set, or when the stop fails.
-    stopping: HashSet<String>,
 }
 
 impl RunningTrayState {
@@ -135,9 +130,6 @@ impl Composer {
         let chat_id = self.state.read(cx).selected_chat.clone()?;
         let (subagents, tasks) = self.running_work(cx);
         let entry = self.running_trays.entry(chat_id.clone()).or_default();
-        entry
-            .stopping
-            .retain(|id| tasks.iter().any(|task| task.id == *id));
         let len = |tray: RunningTray| match tray {
             RunningTray::Subagents => subagents.len(),
             RunningTray::Background => tasks.len(),
@@ -149,9 +141,7 @@ impl Composer {
         if pills.is_empty() {
             return None;
         }
-        let entry = &self.running_trays[&chat_id];
-        let open = entry.open;
-        let stopping = entry.stopping.clone();
+        let open = self.running_trays[&chat_id].open;
 
         let theme = Theme::of(cx).clone();
         let reduced = motion::reduced_motion(cx);
@@ -194,7 +184,8 @@ impl Composer {
                 RunningTray::Background => tasks
                     .iter()
                     .map(|task| {
-                        let stopping = stopping.contains(&task.id);
+                        let stopping =
+                            self.state.read(cx).background_task_stopping(&chat_id, &task.id);
                         self.background_tray_row(&chat_id, task, stopping, now, &theme, cx)
                     })
                     .collect(),
@@ -404,15 +395,13 @@ impl Composer {
             row_meta(elapsed_label(task.started_at, now), theme.text_faint, theme)
         };
         let key = format!("running-task-{}", task.id);
-        let composer = cx.weak_entity();
+        let state = self.state.downgrade();
         let (chat_id, task_id) = (chat_id.to_owned(), task.id.clone());
         let stop =
             background_stop_button(&key, stopping, ROW_RADIUS - STOP_INSET, theme, move |cx| {
-                composer
-                    .update(cx, |this, cx| {
-                        this.stop_running_task(chat_id.clone(), task_id.clone(), cx)
-                    })
-                    .ok();
+                if let Some(state) = state.upgrade() {
+                    stop_background_task(&state, chat_id.clone(), task_id.clone(), cx)
+                }
             });
         tray_row(key.clone())
             .pr(px(STOP_INSET))
@@ -425,35 +414,6 @@ impl Composer {
             .child(meta)
             .child(stop)
             .into_any_element()
-    }
-
-    /// Stop one of the chat's background tasks. The row is marked until the
-    /// task leaves the set; a refusal clears the mark.
-    pub(crate) fn stop_running_task(
-        &mut self,
-        chat_id: String,
-        task_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        let tray = self.running_trays.entry(chat_id.clone()).or_default();
-        if !tray.stopping.insert(task_id.clone()) {
-            return;
-        }
-        cx.notify();
-        let stop = stop_background_task(&self.state, chat_id.clone(), task_id.clone(), cx);
-        cx.spawn(async move |this, cx| {
-            if stop.await.is_ok() {
-                return;
-            }
-            this.update(cx, |composer, cx| {
-                if let Some(tray) = composer.running_trays.get_mut(&chat_id) {
-                    tray.stopping.remove(&task_id);
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 }
 
@@ -763,27 +723,18 @@ mod tests {
         (rpc, calls)
     }
 
-    fn stop(handle: &gpui::WindowHandle<Composer>, task_id: &str, cx: &mut gpui::TestAppContext) {
-        handle
-            .update(cx, |composer, _, cx| {
-                composer.stop_running_task("a".into(), task_id.into(), cx)
-            })
-            .unwrap();
+    fn stop(state: &gpui::Entity<AppState>, task_id: &str, cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| stop_background_task(state, "a".into(), task_id.into(), cx));
     }
 
-    fn stopping(
-        handle: &gpui::WindowHandle<Composer>,
-        cx: &mut gpui::TestAppContext,
-    ) -> Vec<String> {
-        handle
-            .read_with(cx, |composer, _| {
-                composer
-                    .running_trays
-                    .get("a")
-                    .map(|tray| tray.stopping.iter().cloned().collect())
-                    .unwrap_or_default()
-            })
-            .unwrap()
+    fn stopping(state: &gpui::Entity<AppState>, cx: &mut gpui::TestAppContext) -> Vec<String> {
+        state.read_with(cx, |state, _| {
+            ["bg-1", "bg-2"]
+                .into_iter()
+                .filter(|id| state.background_task_stopping("a", id))
+                .map(str::to_owned)
+                .collect()
+        })
     }
 
     #[gpui::test]
@@ -797,10 +748,12 @@ mod tests {
             state.sessions = vec![session("a", vec![task("bg-1")])]
         });
         assert!(rendered(&handle, cx));
-        stop(&handle, "bg-1", cx);
-        assert_eq!(stopping(&handle, cx), ["bg-1"]);
+        stop(&state, "bg-1", cx);
+        assert_eq!(stopping(&state, cx), ["bg-1"]);
+        // The lanes card shares the mark: a second stop never reaches the host.
+        stop(&state, "bg-1", cx);
         rpc.settle(cx, &runtime, |_| !calls.lock().unwrap().is_empty());
-        rpc.settle(cx, &runtime, |_| rpc.completed() >= 1);
+        rpc.settle(cx, &runtime, |cx| stopping(&state, cx).is_empty());
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             [(
@@ -808,14 +761,13 @@ mod tests {
                 json!({ "chatId": "a", "taskId": "bg-1", "targetDeviceId": "a-host" })
             )]
         );
-        // Acknowledged: the row stays marked until the task leaves the set.
+        // Acknowledged: the mark clears and the row stays until the host's
+        // next set drops the task.
         assert!(rendered(&handle, cx));
-        assert_eq!(stopping(&handle, cx), ["bg-1"]);
         state.update(cx, |state, _| {
             state.sessions = vec![session("a", Vec::new())]
         });
         assert!(!rendered(&handle, cx));
-        assert!(stopping(&handle, cx).is_empty());
     }
 
     #[gpui::test]
@@ -829,15 +781,14 @@ mod tests {
             state.sessions = vec![session("a", vec![task("bg-1"), task("bg-2")])]
         });
         assert!(rendered(&handle, cx));
-        stop(&handle, "bg-1", cx);
+        stop(&state, "bg-1", cx);
         // The task ends on its own before the refusal comes back.
         state.update(cx, |state, _| {
             state.sessions = vec![session("a", vec![task("bg-2")])]
         });
         cx.run_until_parked();
-        assert_eq!(stopping(&handle, cx), ["bg-1"]);
-        // Only the refusal clears the mark here: nothing renders the tray.
-        rpc.settle(cx, &runtime, |cx| stopping(&handle, cx).is_empty());
+        assert_eq!(stopping(&state, cx), ["bg-1"]);
+        rpc.settle(cx, &runtime, |cx| stopping(&state, cx).is_empty());
         cx.run_until_parked();
         cx.read(|cx| assert!(crate::toast::messages(cx).is_empty()));
     }
@@ -853,11 +804,11 @@ mod tests {
             state.sessions = vec![session("a", vec![task("bg-1")])]
         });
         assert!(rendered(&handle, cx));
-        stop(&handle, "bg-1", cx);
+        stop(&state, "bg-1", cx);
         rpc.settle(cx, &runtime, |cx| {
             cx.read(|cx| !crate::toast::messages(cx).is_empty())
         });
-        assert!(stopping(&handle, cx).is_empty());
+        assert!(stopping(&state, cx).is_empty());
         cx.read(|cx| {
             assert_eq!(
                 crate::toast::messages(cx),

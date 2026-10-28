@@ -6,8 +6,6 @@
 //! session-card rows; clicking a row opens it in the right pane. Settled
 //! subagents fold into one "finished" row, closed until opened.
 
-use std::collections::HashSet;
-
 use zeron_proto::{BackgroundTask, Chat, ChatIndicator};
 
 use super::session_info::SESSION_CARD_WIDTH;
@@ -35,9 +33,6 @@ pub(super) struct LaneState {
     scroll: gpui::ScrollHandle,
     /// The card's floating scrollbar, the file tree's treatment.
     bar: popover::MenuScrollbarState,
-    /// Background tasks whose stop is in flight. An id leaves once its task
-    /// leaves the chat's set, or when the stop fails.
-    stopping: HashSet<String>,
 }
 
 impl LaneState {
@@ -276,9 +271,6 @@ impl Shell {
                 state.background_tasks_for(&chat.id, now).to_vec(),
             )
         };
-        self.session_lanes
-            .stopping
-            .retain(|id| tasks.iter().any(|task| task.id == *id));
         let view = cx.entity_id();
         // Subagents run on the session's own harness.
         let harness = chat.config.as_ref().map(|config| config.harness);
@@ -598,7 +590,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let key = format!("session-lanes-task-{}", task.id);
-        let stopping = self.session_lanes.stopping.contains(&task.id);
+        let stopping = self
+            .state
+            .read(cx)
+            .background_task_stopping(chat_id, &task.id);
         let loader = loaders::halo_loader(format!("{key}-loader"), 2.0, theme.busy);
         let title = row_title(format!("{key}-title"), background_task_title(task));
         let time = if stopping {
@@ -606,7 +601,7 @@ impl Shell {
         } else {
             time_label(elapsed_label(task.started_at, now), theme)
         };
-        let shell = cx.weak_entity();
+        let state = self.state.downgrade();
         let (chat_id, task_id) = (chat_id.to_owned(), task.id.clone());
         let stop = background_stop_button(
             &key,
@@ -614,11 +609,9 @@ impl Shell {
             popover::MENU_ITEM_RADIUS - STOP_INSET,
             theme,
             move |cx| {
-                shell
-                    .update(cx, |this, cx| {
-                        this.stop_lane_task(chat_id.clone(), task_id.clone(), cx)
-                    })
-                    .ok();
+                if let Some(state) = state.upgrade() {
+                    stop_background_task(&state, chat_id.clone(), task_id.clone(), cx)
+                }
             },
         );
         popover::picker_row(theme, false, false, key.clone())
@@ -633,27 +626,6 @@ impl Shell {
             .child(title)
             .child(time)
             .child(stop)
-    }
-
-    /// Stop one of the open chat's background tasks from its lane row. The
-    /// row is marked until the task leaves the set; a refusal clears the mark.
-    fn stop_lane_task(&mut self, chat_id: String, task_id: String, cx: &mut Context<Self>) {
-        if !self.session_lanes.stopping.insert(task_id.clone()) {
-            return;
-        }
-        cx.notify();
-        let stop = stop_background_task(&self.state, chat_id, task_id.clone(), cx);
-        cx.spawn(async move |this, cx| {
-            if stop.await.is_ok() {
-                return;
-            }
-            this.update(cx, |this, cx| {
-                this.session_lanes.stopping.remove(&task_id);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// The settled subagents' fold, with their count.
