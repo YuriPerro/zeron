@@ -17,15 +17,18 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, ParentElement as _, Pixels, Radians, ScaledPixels, ShapedLine,
-    SharedString, Style, Styled as _, TextRun, TransformationMatrix, Window, div, point, px,
+    App, Bounds, ContentMask, Element, ElementId, GlobalElementId, HighlightStyle, Hsla,
+    InspectorElementId, IntoElement, LayoutId, ParentElement as _, Pixels, Radians,
+    ScaledPixels, ShapedLine, SharedString, Style, Styled as _, StyledText, TextRun,
+    TransformationMatrix, Window, div, point, px,
 };
 
-use crate::motion::{CubicBezier, EASE_OUT_QUINT, RESIZE, lerp, speed_scale};
+use crate::motion::{CubicBezier, EASE_OUT_QUINT, RESIZE, lerp, mix, speed_scale};
 
 /// Scritto's default roll duration.
 const DURATION: Duration = Duration::from_millis(550);
@@ -49,11 +52,89 @@ fn layout_progress(elapsed: f32) -> f32 {
     RESIZE.progress(elapsed / RESIZE.total().as_secs_f32())
 }
 
+/// A color ramp across a label, left to right, one color per character; the
+/// label's own text color applies without one.
+#[derive(Clone, PartialEq)]
+pub struct Tint(Arc<[Hsla]>);
+
+impl Tint {
+    pub fn new(stops: Vec<Hsla>) -> Self {
+        assert!(!stops.is_empty(), "a tint needs a color");
+        Self(stops.into())
+    }
+
+    /// The ramp's color `t` of the way across (0–1).
+    pub fn at(&self, t: f32) -> Hsla {
+        let last = self.0.len() - 1;
+        if last == 0 {
+            return self.0[0];
+        }
+        let place = t.clamp(0.0, 1.0) * last as f32;
+        let i = (place.floor() as usize).min(last - 1);
+        mix(self.0[i], self.0[i + 1], place - i as f32)
+    }
+
+    /// The color of the character at byte `index` of a `len`-byte label.
+    fn for_index(&self, index: usize, len: usize) -> Hsla {
+        self.at((index as f32 + 0.5) / len.max(1) as f32)
+    }
+}
+
+/// One highlight per character of `text`, colored along `tint`.
+fn tint_highlights(text: &str, tint: &Tint) -> Vec<(Range<usize>, HighlightStyle)> {
+    text.char_indices()
+        .map(|(index, ch)| {
+            let color = tint.for_index(index, text.len());
+            (
+                index..index + ch.len_utf8(),
+                HighlightStyle {
+                    color: Some(color),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+/// The runs `text` shapes and paints with: one per character along `tint`,
+/// else one in `color`. A color change splits gpui's shaping runs, so a
+/// tinted label is a hair wider than a plain one; whatever sizes the label
+/// must shape these same runs.
+pub fn tinted_runs(text: &str, tint: Option<&Tint>, font: gpui::Font, color: Hsla) -> Vec<TextRun> {
+    let run = |len: usize, color: Hsla| TextRun {
+        len,
+        font: font.clone(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    match tint {
+        Some(tint) => text
+            .char_indices()
+            .map(|(index, ch)| run(ch.len_utf8(), tint.for_index(index, text.len())))
+            .collect(),
+        None => vec![run(text.len(), color)],
+    }
+}
+
+/// `text` colored along `tint`, or plain without one.
+pub fn tinted(text: SharedString, tint: Option<&Tint>) -> StyledText {
+    match tint {
+        Some(tint) => {
+            let highlights = tint_highlights(&text, tint);
+            StyledText::new(text).with_highlights(highlights)
+        }
+        None => StyledText::new(text),
+    }
+}
 
 #[derive(Clone)]
 struct Roll {
     from: SharedString,
+    from_tint: Option<Tint>,
     to: SharedString,
+    to_tint: Option<Tint>,
     started: Instant,
 }
 
@@ -61,8 +142,8 @@ struct Roll {
 const MAX_KEYS: usize = 256;
 
 thread_local! {
-    /// Last label per key, plus the roll in flight (if any).
-    static ROLLS: RefCell<HashMap<SharedString, (SharedString, Option<Roll>)>> =
+    /// Last label and tint per key, plus the roll in flight (if any).
+    static ROLLS: RefCell<HashMap<SharedString, (SharedString, Option<Tint>, Option<Roll>)>> =
         RefCell::new(HashMap::new());
 }
 
@@ -78,9 +159,28 @@ fn total() -> Duration {
 
 /// The label for `key`: plain at rest, rolling for a moment after `text`
 /// changes. The first sight of a key never rolls.
-pub fn roll_text(key: impl Into<SharedString>, text: SharedString, reduced: bool) -> gpui::AnyElement {
-    rolling(key, text.clone(), reduced)
-        .unwrap_or_else(|| div().min_w_0().truncate().child(text).into_any_element())
+pub fn roll_text(
+    key: impl Into<SharedString>,
+    text: SharedString,
+    reduced: bool,
+) -> gpui::AnyElement {
+    roll_text_tinted(key, text, None, reduced)
+}
+
+/// [`roll_text`] colored along `tint`, rolling glyphs included.
+pub fn roll_text_tinted(
+    key: impl Into<SharedString>,
+    text: SharedString,
+    tint: Option<Tint>,
+    reduced: bool,
+) -> gpui::AnyElement {
+    rolling_tinted(key, text.clone(), tint.clone(), reduced).unwrap_or_else(|| {
+        div()
+            .min_w_0()
+            .truncate()
+            .child(tinted(text, tint.as_ref()))
+            .into_any_element()
+    })
 }
 
 /// The rolling element while `key`'s label is mid-roll, else `None` — for
@@ -90,6 +190,17 @@ pub fn rolling(
     text: SharedString,
     reduced: bool,
 ) -> Option<gpui::AnyElement> {
+    rolling_tinted(key, text, None, reduced)
+}
+
+/// [`rolling`] for a label colored along `tint`: each side of a roll keeps
+/// the tint its label had.
+pub fn rolling_tinted(
+    key: impl Into<SharedString>,
+    text: SharedString,
+    tint: Option<Tint>,
+    reduced: bool,
+) -> Option<gpui::AnyElement> {
     let key = key.into();
     let now = Instant::now();
     let roll = ROLLS.with(|rolls| {
@@ -97,14 +208,19 @@ pub fn rolling(
         // Keys can be per-turn (the working trailer), so bound the map: past
         // the cap, forget settled labels — they show plain next time.
         if rolls.len() >= MAX_KEYS && !rolls.contains_key(&key) {
-            rolls.retain(|_, (_, roll)| roll.is_some());
+            rolls.retain(|_, (_, _, roll)| roll.is_some());
         }
-        let entry = rolls.entry(key).or_insert_with(|| (text.clone(), None));
+        let entry = rolls
+            .entry(key)
+            .or_insert_with(|| (text.clone(), tint.clone(), None));
+        let from_tint = std::mem::replace(&mut entry.1, tint.clone());
         if entry.0 != text {
             let from = std::mem::replace(&mut entry.0, text.clone());
-            entry.1 = (!reduced).then(|| Roll {
+            entry.2 = (!reduced).then(|| Roll {
                 from,
+                from_tint,
                 to: text.clone(),
+                to_tint: tint,
                 started: now,
             });
         }
@@ -112,13 +228,13 @@ pub fn rolling(
         // would come to finish it: settle on the plain label now.
         if reduced
             || entry
-                .1
+                .2
                 .as_ref()
                 .is_some_and(|roll| now.saturating_duration_since(roll.started) >= total())
         {
-            entry.1 = None;
+            entry.2 = None;
         }
-        entry.1.clone()
+        entry.2.clone()
     });
     roll.map(|roll| RollText { roll }.into_any_element())
 }
@@ -218,21 +334,14 @@ impl Element for RollText {
                 .line_height
                 .to_pixels(font_size.into(), window.rem_size()),
         );
-        let shape = |text: &SharedString| {
-            let run = TextRun {
-                len: text.len(),
-                font: text_style.font(),
-                color: text_style.color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
+        let shape = |text: &SharedString, tint: Option<&Tint>| {
+            let runs = tinted_runs(text, tint, text_style.font(), text_style.color);
             window
                 .text_system()
-                .shape_line(text.clone(), font_size, &[run], None)
+                .shape_line(text.clone(), font_size, &runs, None)
         };
-        let from = shape(&self.roll.from);
-        let to = shape(&self.roll.to);
+        let from = shape(&self.roll.from, self.roll.from_tint.as_ref());
+        let to = shape(&self.roll.to, self.roll.to_tint.as_ref());
         let progress = layout_progress(self.elapsed());
         // Rounded up like gpui's text element sizes the plain label, so the
         // settled width equals the label that replaces this element.
@@ -365,6 +474,7 @@ impl Element for RollText {
         // blur fade with it; scale and translate are the caller's.
         let paint = |window: &mut Window,
                      glyph: &Glyph,
+                     color: Hsla,
                      dx: f32,
                      dy: f32,
                      scale: f32,
@@ -428,6 +538,10 @@ impl Element for RollText {
                 px(f32::from(font_size) * BLUR_EM * motion),
             );
         };
+        let tone = |tint: &Option<Tint>, glyph: &Glyph, len: usize| {
+            tint.as_ref()
+                .map_or(color, |tint| tint.for_index(glyph.index, len))
+        };
         window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
             for glyph in &from_glyphs {
                 if !changed(glyph.index, from_len) {
@@ -437,6 +551,7 @@ impl Element for RollText {
                 paint(
                     window,
                     glyph,
+                    tone(&self.roll.from_tint, glyph, from_len),
                     0.0,
                     -travel * progress,
                     lerp(1.0, REST_SCALE, progress),
@@ -445,16 +560,18 @@ impl Element for RollText {
                 );
             }
             for glyph in &to_glyphs {
+                let color = tone(&self.roll.to_tint, glyph, to_len);
                 if glyph.index < prefix {
-                    paint(window, glyph, 0.0, 0.0, 1.0, 0.0, 1.0);
+                    paint(window, glyph, color, 0.0, 0.0, 1.0, 0.0, 1.0);
                 } else if glyph.index >= to_len - suffix {
-                    paint(window, glyph, suffix_dx, 0.0, 1.0, 0.0, 1.0);
+                    paint(window, glyph, color, suffix_dx, 0.0, 1.0, 0.0, 1.0);
                 } else {
                     let progress =
                         GLIDE.eval(((elapsed - to_delay(glyph.x)) / duration).clamp(0.0, 1.0));
                     paint(
                         window,
                         glyph,
+                        color,
                         0.0,
                         travel * (1.0 - progress),
                         lerp(REST_SCALE, 1.0, progress),
@@ -500,5 +617,39 @@ mod tests {
             assert!(value >= last, "not monotonic at {i}");
             last = value;
         }
+    }
+
+    #[test]
+    fn a_tint_ramps_across_the_label_one_color_per_character() {
+        let (red, blue) = (gpui::red(), gpui::blue());
+        let tint = Tint::new(vec![red, blue]);
+        assert_eq!(tint.at(0.0), red);
+        assert_eq!(tint.at(1.0), blue);
+        assert_eq!(Tint::new(vec![red]).at(0.7), red);
+        let highlights = tint_highlights("Ultra", &tint);
+        let ranges: Vec<_> = highlights.iter().map(|(range, _)| range.clone()).collect();
+        assert_eq!(ranges, vec![0..1, 1..2, 2..3, 3..4, 4..5]);
+        let colors: Vec<gpui::Hsla> = highlights.iter().map(|(_, h)| h.color.unwrap()).collect();
+        // The rolling glyphs and the resting label agree on every character.
+        for (i, color) in colors.iter().enumerate() {
+            assert_eq!(*color, tint.for_index(i, 5));
+        }
+        let redness = |c: &gpui::Hsla| gpui::Rgba::from(*c).r;
+        assert!(colors.windows(2).all(|w| redness(&w[0]) > redness(&w[1])));
+    }
+
+    #[test]
+    fn tinted_runs_split_where_the_painted_label_splits() {
+        let font = gpui::font("Test");
+        let tint = Tint::new(vec![gpui::red(), gpui::blue()]);
+        let runs = tinted_runs("Ultra", Some(&tint), font.clone(), gpui::black());
+        assert_eq!(runs.len(), 5);
+        assert!(runs.iter().all(|run| run.len == 1 && run.font == font));
+        for (i, run) in runs.iter().enumerate() {
+            assert_eq!(run.color, tint.for_index(i, 5));
+        }
+        let plain = tinted_runs("Ultra", None, font, gpui::black());
+        assert_eq!(plain.len(), 1);
+        assert_eq!((plain[0].len, plain[0].color), (5, gpui::black()));
     }
 }

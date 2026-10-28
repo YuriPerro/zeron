@@ -1,4 +1,5 @@
 //! Alternate presentation of the same model and option mutations.
+use super::effort_effects::{self as fx, LevelEffect};
 use super::*;
 
 pub(super) const COMPACT_WIDTH: f32 = 256.0;
@@ -74,6 +75,17 @@ pub(super) struct CompactEffort {
     stops: EffortStops,
 }
 
+impl CompactEffort {
+    fn effect(&self) -> LevelEffect {
+        match &self.stops {
+            EffortStops::Reasoning(levels) => levels
+                .get(self.selected)
+                .map_or(LevelEffect::Plain, |level| LevelEffect::of(*level)),
+            EffortStops::Option { .. } => LevelEffect::Plain,
+        }
+    }
+}
+
 enum EffortStops {
     Reasoning(Vec<ReasoningLevel>),
     Option {
@@ -95,10 +107,16 @@ pub(super) struct CompactMotion {
     press: Option<ScalarTransition>,
     drag_fraction: Option<f32>,
     energy: Option<ScalarTransition>,
-    /// Shimmer clock for fast mode and the top effort levels, integrated
-    /// per frame so changing intensity never jumps the band.
-    shimmer_phase: f32,
-    shimmer_last_frame: Option<std::time::Instant>,
+    rainbow: Option<ScalarTransition>,
+    code: Option<ScalarTransition>,
+    /// Seconds the effects have run, advanced only while they move so a
+    /// paused card resumes where it stopped.
+    fx_time: f32,
+    /// The Ultracode stream's clock, which fast mode runs faster.
+    code_clock: f32,
+    fx_last_frame: Option<std::time::Instant>,
+    settled_effect: Option<LevelEffect>,
+    burst: Option<(LevelEffect, std::time::Instant)>,
     fast: Option<ScalarTransition>,
     height: Option<ScalarTransition>,
     page: Option<CompactPage>,
@@ -835,9 +853,11 @@ impl Pickers {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
-        let (levels, selected) = self
-            .compact_effort(cx)
-            .map_or((Vec::new(), 0), |e| (e.labels, e.selected));
+        let compact_effort = self.compact_effort(cx);
+        let effect = compact_effort
+            .as_ref()
+            .map_or(LevelEffect::Plain, CompactEffort::effect);
+        let (levels, selected) = compact_effort.map_or((Vec::new(), 0), |e| (e.labels, e.selected));
         let name = self.model_name(cx);
         let label = Self::compact_title_text(&name);
         let name_element: AnyElement = if name == ModelName::Loading {
@@ -857,8 +877,8 @@ impl Pickers {
             format!("{} · {} · Change model", effort, label).into();
         let now = std::time::Instant::now();
         let reduced = cx.reduce_motion();
-        // Fast mode alone brings the fill to life: a sheen and speed streaks
-        // racing toward the thumb, and a breathing glow.
+        // Fast mode blows exhaust off the thumb over a breathing glow;
+        // Ultrathink and Ultracode bring their own effects.
         let fast = self
             .compact_fast_choice(cx)
             .is_some_and(|(_, _, _, fast)| fast);
@@ -871,23 +891,88 @@ impl Pickers {
         if powering {
             window.request_animation_frame();
         }
-        let dt = self
-            .compact_motion
-            .shimmer_last_frame
-            .replace(now)
-            .map_or(0.0, |last| now.duration_since(last).as_secs_f32().min(0.05));
-        let alive =
-            intensity > 0.001 && !reduced && window.is_window_active() && self.open.is_open();
-        if alive {
-            self.compact_motion.shimmer_phase =
-                (self.compact_motion.shimmer_phase + dt * (0.32 + 0.22 * intensity)).fract();
+        let (rainbow, fading_rainbow) = ScalarTransition::sample(
+            &mut self.compact_motion.rainbow,
+            if effect == LevelEffect::Ultrathink {
+                1.0
+            } else {
+                0.0
+            },
+            now,
+            reduced,
+        );
+        let (code, fading_code) = ScalarTransition::sample(
+            &mut self.compact_motion.code,
+            if effect == LevelEffect::Ultracode {
+                1.0
+            } else {
+                0.0
+            },
+            now,
+            reduced,
+        );
+        if fading_rainbow || fading_code {
             window.request_animation_frame();
         }
-        let phase = self.compact_motion.shimmer_phase;
-        let breath = if alive {
-            0.5 + 0.5 * (std::f32::consts::TAU * phase).sin()
+        let (settled, fired) = fx::settle_effect(
+            self.compact_motion.settled_effect,
+            effect,
+            self.effort_dragging,
+        );
+        self.compact_motion.settled_effect = settled;
+        if let Some(fired) = fired.filter(|_| !reduced) {
+            self.compact_motion.burst = Some((fired, now));
+        }
+        let burst = self.compact_motion.burst.and_then(|(effect, started)| {
+            fx::burst_elapsed(
+                effect,
+                now.duration_since(started).as_secs_f32() / motion::speed_scale(),
+            )
+            .map(|elapsed| (effect, elapsed))
+        });
+        if burst.is_none() {
+            self.compact_motion.burst = None;
+        }
+        let dt = self
+            .compact_motion
+            .fx_last_frame
+            .replace(now)
+            .map_or(0.0, |last| now.duration_since(last).as_secs_f32().min(0.05));
+        let alive = fx::effects_alive(
+            intensity > 0.001 || rainbow > 0.001 || code > 0.001 || burst.is_some(),
+            reduced,
+            window.is_window_active(),
+            self.open.is_open(),
+        );
+        if alive {
+            let motion = &mut self.compact_motion;
+            motion.fx_time = (motion.fx_time + dt) % 3600.0;
+            motion.code_clock = (motion.code_clock + dt * fx::code_clock_rate(intensity)) % 3600.0;
+            window.request_animation_frame();
+        }
+        let time = self.compact_motion.fx_time;
+        let code_clock = self.compact_motion.code_clock;
+        let breath = if alive && intensity > 0.001 {
+            0.5 + 0.5 * (std::f32::consts::TAU * 0.5 * time).sin()
         } else {
             0.5
+        };
+        // The thumb glows in the color the rainbow carries into it, flashes
+        // when a burst lands and carries a caret once Ultracode is typed.
+        let thumb_hue = fx::ultrathink_thumb_color(time);
+        let (flash_color, thumb_flash) = match burst {
+            Some((LevelEffect::Ultracode, elapsed)) => {
+                (theme.accent, fx::ultracode_thumb_flash(elapsed))
+            }
+            Some((LevelEffect::Ultrathink, elapsed)) => {
+                (thumb_hue, fx::ultrathink_thumb_flash(elapsed))
+            }
+            _ => (theme.accent, 0.0),
+        };
+        let caret = match burst {
+            Some((LevelEffect::Ultracode, elapsed)) if fx::ultracode_typing(elapsed) => 0.0,
+            _ if reduced => code,
+            _ => code * fx::ultracode_caret(time),
         };
         // The effort titles the model's name as one button filling the row
         // up to fast mode, its text on the rail's and option rows' edge; fast
@@ -925,9 +1010,10 @@ impl Pickers {
                         .line_height(px(17.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(crate::roll_text::roll_text(
+                        .child(crate::roll_text::roll_text_tinted(
                             format!("compact-effort-title-{}", cx.entity_id()),
                             effort.clone(),
+                            fx::label_tint(effect, theme.appearance.is_dark()),
                             reduced,
                         )),
                 )
@@ -1176,10 +1262,15 @@ impl Pickers {
                     &theme,
                     fraction,
                     levels.len(),
-                    Shimmer {
-                        intensity,
-                        phase,
+                    FillEffects {
+                        fast: intensity,
                         breath,
+                        time,
+                        code_clock,
+                        rainbow,
+                        code,
+                        burst,
+                        reduced,
                     },
                 ))
                 .child({
@@ -1210,6 +1301,24 @@ impl Pickers {
                                 inset: false,
                             }]))
                         })
+                        .when(rainbow > 0.001, |el| {
+                            el.child(place(div()).shadow(vec![gpui::BoxShadow {
+                                color: thumb_hue.opacity(0.55 * rainbow),
+                                offset: gpui::point(px(0.0), px(0.0)),
+                                blur_radius: px(12.0),
+                                spread_radius: px(1.0),
+                                inset: false,
+                            }]))
+                        })
+                        .when(thumb_flash > 0.001, |el| {
+                            el.child(place(div()).shadow(vec![gpui::BoxShadow {
+                                color: flash_color.opacity(0.8 * thumb_flash),
+                                offset: gpui::point(px(0.0), px(0.0)),
+                                blur_radius: px(16.0),
+                                spread_radius: px(4.0 * thumb_flash),
+                                inset: false,
+                            }]))
+                        })
                         .when(press > 0.001, |el| {
                             el.child(place(div()).shadow(vec![gpui::BoxShadow {
                                 color: gpui::black().opacity(0.12 * press),
@@ -1222,6 +1331,17 @@ impl Pickers {
                         .child(
                             crate::glass::thumb(place(div()), &theme),
                         )
+                        .when(caret > 0.001, |el| {
+                            el.child(
+                                place(div()).flex().items_center().justify_center().child(
+                                    div()
+                                        .w(px(1.5))
+                                        .h(px(14.0))
+                                        .rounded_full()
+                                        .bg(theme.accent.opacity(caret)),
+                                ),
+                            )
+                        })
                 });
             // The rail starts on the same edge as the title and row labels.
             panel = panel.child(
@@ -1268,30 +1388,46 @@ impl Pickers {
 /// The accent glass fill from the rail's start to just past the thumb, with
 /// the stops painted over rail and fill in one coordinate space.
 #[derive(Clone, Copy)]
-struct Shimmer {
-    /// 0 at rest, up to 1 for fast mode on a top level.
-    intensity: f32,
-    /// 0–1 position of the band's sweep.
-    phase: f32,
-    /// 0–1 breathing of the glow.
+struct FillEffects {
+    /// 0 at rest, up to 1 with fast mode on.
+    fast: f32,
+    /// 0–1 breathing of the fast mode glow.
     breath: f32,
+    /// The effects' clock in seconds.
+    time: f32,
+    /// The Ultracode stream's own clock.
+    code_clock: f32,
+    /// How much of the Ultrathink prism shows, 0–1.
+    rainbow: f32,
+    /// How much of the Ultracode stream shows, 0–1.
+    code: f32,
+    /// A running arrival burst and its elapsed seconds.
+    burst: Option<(LevelEffect, f32)>,
+    reduced: bool,
 }
 
-fn effort_fill(theme: &Theme, fraction: f32, count: usize, shimmer: Shimmer) -> AnyElement {
-    let Shimmer {
-        intensity,
-        phase,
+fn effort_fill(theme: &Theme, fraction: f32, count: usize, effects: FillEffects) -> AnyElement {
+    const CODE_FONT: f32 = 11.0;
+    const CODE_LINE: f32 = 14.0;
+    let FillEffects {
+        fast,
         breath,
-    } = shimmer;
+        time,
+        code_clock,
+        rainbow,
+        code,
+        burst,
+        reduced,
+    } = effects;
     // A contained glow that breathes; it must not wash over the option rows.
-    let fill = crate::glass::accent_plate(theme, 1.0, intensity * (0.2 + 0.25 * breath));
-    let accent = theme.accent;
+    let fill = crate::glass::accent_plate(theme, 1.0, fast * (0.2 + 0.25 * breath));
     // Quiet stops: a hint of the ladder, not a second focal point.
     let filled_stop = gpui::white().opacity(0.4);
     let open_stop = theme.text_muted.opacity(0.28);
+    let mono = theme.font_mono.clone();
     gpui::canvas(
         |_, _, _| (),
-        move |bounds, _, window, _| {
+        move |bounds, _, window, cx| {
             let width = f32::from(bounds.size.width);
             let run = (width - 2.0 * THUMB_INSET).max(0.0);
             let center = THUMB_INSET + fraction * run;
@@ -1301,109 +1437,225 @@ fn effort_fill(theme: &Theme, fraction: f32, count: usize, shimmer: Shimmer) -> 
                     gpui::size(px(w), px(h)),
                 )
             };
+            let fill_end = (center + FILL_PAST).min(width);
             fill.paint(
                 window,
-                rect(0.0, RAIL_TOP, (center + FILL_PAST).min(width), RAIL_HEIGHT),
+                rect(0.0, RAIL_TOP, fill_end, RAIL_HEIGHT),
                 RAIL_HEIGHT / 2.0,
             );
-            // Fast mode: a band of light flows through the whole fill toward
-            // the thumb. Two slow waves drift at different speeds, shading
-            // the fill between a lifted accent and a hue-shifted one, and the
-            // light gathers just before the thumb. It is painted in thin
-            // strips whose gradients join end to end; the end strips carry
-            // the fill's corner radius, so it never leaves the rounded ends.
-            let fill_end = (center + FILL_PAST).min(width);
-            if intensity > 0.001 && fill_end > RAIL_HEIGHT {
-                let inset = 1.0;
-                let height = RAIL_HEIGHT - 2.0 * inset;
-                let radius = height / 2.0;
-                let (from, to) = (inset, fill_end - inset);
-                let base = accent;
-                let lifted = motion::mix(base, gpui::white(), 0.45);
-                let shifted = gpui::hsla(
-                    (base.h + 0.07).fract(),
-                    base.s,
-                    (base.l + 0.14).min(0.9),
-                    1.0,
-                );
-                let tau = std::f32::consts::TAU;
-                let flow = |x: f32| -> gpui::Hsla {
-                    let slow = 0.5 + 0.5 * (tau * (x / 150.0 - 2.0 * phase)).sin();
-                    let quick = 0.5 + 0.5 * (tau * (x / 64.0 - 3.0 * phase) + 1.7).sin();
-                    let glow = (0.65 * slow + 0.35 * quick).powi(2);
-                    let charge = (-(center - x).max(0.0) / 40.0).exp() * (0.6 + 0.4 * breath);
-                    let lead = ((x - from) / 28.0).clamp(0.0, 1.0);
-                    let alpha = intensity * ((0.08 + 0.34 * glow) * lead + 0.22 * charge);
-                    motion::mix(shifted, lifted, slow).opacity(alpha.min(1.0))
-                };
-                let mut edges = vec![from, (from + radius).min(to)];
-                let inner_end = (to - radius).max(edges[1]);
-                let mut x = edges[1];
-                while x + 4.0 < inner_end {
-                    x += 4.0;
-                    edges.push(x);
+            let inset = 1.0;
+            let height = RAIL_HEIGHT - 2.0 * inset;
+            let radius = height / 2.0;
+            let (from, to) = (inset, fill_end - inset);
+            // Particles keep clear of the fill's rounded start and the thumb.
+            let (open_from, open_to) = (from + radius, center - THUMB_WIDTH / 2.0 + 2.0);
+            let middle = SLIDER_HEIGHT / 2.0;
+            let lane_y = |lane: f32| RAIL_TOP + inset + 3.0 + lane * (height - 6.0);
+            let burst_of = |effect: LevelEffect| {
+                burst.and_then(|(running, elapsed)| (running == effect).then_some(elapsed))
+            };
+            let ultracode = burst_of(LevelEffect::Ultracode);
+            if fill_end > RAIL_HEIGHT {
+                if rainbow > 0.001 {
+                    let ultrathink = burst_of(LevelEffect::Ultrathink);
+                    paint_fill_strips(window, &rect, from, to, RAIL_TOP + inset, height, &|x| {
+                        let color = fx::ultrathink_color(x, to, time, ultrathink);
+                        color.opacity(color.a * rainbow)
+                    });
                 }
-                if inner_end > *edges.last().unwrap() {
-                    edges.push(inner_end);
-                }
-                if to > *edges.last().unwrap() {
-                    edges.push(to);
-                }
-                let last = edges.len().saturating_sub(2);
-                for (i, pair) in edges.windows(2).enumerate() {
-                    let (x0, x1) = (pair[0], pair[1]);
-                    if x1 - x0 < 0.1 {
-                        continue;
+                if code > 0.001 {
+                    for glyph in fx::code_glyphs(code_clock, open_from, open_to, ultracode, fast) {
+                        let text: SharedString = glyph.ch.to_string().into();
+                        let run = gpui::TextRun {
+                            len: text.len(),
+                            font: gpui::Font {
+                                family: mono.clone(),
+                                features: gpui::FontFeatures::default(),
+                                fallbacks: None,
+                                weight: gpui::FontWeight::MEDIUM,
+                                style: gpui::FontStyle::Normal,
+                            },
+                            color: gpui::white().opacity(0.9 * code * glyph.alpha),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let line =
+                            window
+                                .text_system()
+                                .shape_line(text, px(CODE_FONT), &[run], None);
+                        let x = glyph.x + (fx::CODE_CELL - f32::from(line.width)) / 2.0;
+                        line.paint(
+                            bounds.origin + gpui::point(px(x), px(middle - CODE_LINE / 2.0)),
+                            px(CODE_LINE),
+                            gpui::TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
+                        .ok();
                     }
-                    let r = px(radius.min(x1 - x0));
-                    let zero = px(0.0);
-                    let corners = gpui::Corners {
-                        top_left: if i == 0 { r } else { zero },
-                        bottom_left: if i == 0 { r } else { zero },
-                        top_right: if i == last { r } else { zero },
-                        bottom_right: if i == last { r } else { zero },
-                    };
-                    window.paint_quad(gpui::quad(
-                        rect(x0, RAIL_TOP + inset, x1 - x0, height),
-                        corners,
-                        gpui::linear_gradient(
-                            90.0,
-                            gpui::linear_color_stop(flow(x0), 0.0),
-                            gpui::linear_color_stop(flow(x1), 1.0),
-                        ),
-                        px(0.0),
-                        gpui::transparent_black(),
-                        gpui::BorderStyle::default(),
-                    ));
+                    if let Some(cursor) = ultracode
+                        .and_then(|elapsed| fx::ultracode_cursor(elapsed, open_from, open_to))
+                    {
+                        paint_round(
+                            window,
+                            rect(
+                                cursor - fx::CODE_CELL,
+                                middle - 7.0,
+                                fx::CODE_CELL - 1.0,
+                                14.0,
+                            ),
+                            1.0,
+                            gpui::white().opacity(0.9 * code),
+                        );
+                    }
+                }
+                // Fast mode: motes stream off the thumb toward the rail's
+                // start, thick near it and thinning out as they go. Ultracode
+                // shows fast mode in its own stream instead.
+                let motes = fast * (1.0 - code);
+                if motes > 0.001 && !reduced {
+                    for mote in fx::exhaust(time, open_from, open_to) {
+                        if mote.alpha < 0.01 {
+                            continue;
+                        }
+                        let r = mote.radius;
+                        paint_round(
+                            window,
+                            rect(
+                                mote.x - r,
+                                lane_y(mote.lane) - r,
+                                2.0 * r * mote.stretch,
+                                2.0 * r,
+                            ),
+                            r,
+                            gpui::white().opacity(0.9 * motes * mote.alpha),
+                        );
+                    }
                 }
             }
-            for i in 0..count {
-                let stop = if count > 1 {
-                    i as f32 / (count - 1) as f32
-                } else {
-                    0.0
-                };
-                let x = THUMB_INSET + stop * run;
-                // Filled stops follow the animated front, never jump ahead of it.
-                let color = if stop <= fraction {
-                    filled_stop
-                } else {
-                    open_stop
-                };
-                window.paint_quad(gpui::quad(
-                    rect(x - 2.0, SLIDER_HEIGHT / 2.0 - 2.0, 4.0, 4.0),
-                    px(2.0),
-                    color,
-                    px(0.0),
-                    gpui::transparent_black(),
-                    gpui::BorderStyle::default(),
-                ));
+            // Ultra levels hide the ladder's stops behind their own effect.
+            let stops = 1.0 - rainbow.max(code);
+            if stops > 0.01 {
+                for i in 0..count {
+                    let stop = if count > 1 {
+                        i as f32 / (count - 1) as f32
+                    } else {
+                        0.0
+                    };
+                    let x = THUMB_INSET + stop * run;
+                    // Filled stops follow the animated front, never jump ahead of it.
+                    let color = if stop <= fraction {
+                        filled_stop
+                    } else {
+                        open_stop
+                    };
+                    paint_round(
+                        window,
+                        rect(x - 2.0, middle - 2.0, 4.0, 4.0),
+                        2.0,
+                        color.opacity(stops),
+                    );
+                }
+            }
+            // Ultrathink's landing: the thumb throws a fan of hues back over
+            // the fill, from behind itself.
+            if let Some(elapsed) = burst_of(LevelEffect::Ultrathink) {
+                for spark in fx::prism_spray(elapsed, center, middle) {
+                    let color = fx::rainbow_color(spark.hue);
+                    let (r, glow) = (spark.radius, spark.radius * 2.6);
+                    paint_round(
+                        window,
+                        rect(spark.x - glow, spark.y - glow, 2.0 * glow, 2.0 * glow),
+                        glow,
+                        color.opacity(0.35 * spark.alpha),
+                    );
+                    paint_round(
+                        window,
+                        rect(spark.x - r, spark.y - r, 2.0 * r, 2.0 * r),
+                        r,
+                        color.opacity(spark.alpha),
+                    );
+                }
             }
         },
     )
     .absolute()
     .inset_0()
     .into_any_element()
+}
+
+/// A flat rounded quad: stops, motes and sparks.
+fn paint_round(
+    window: &mut Window,
+    bounds: gpui::Bounds<gpui::Pixels>,
+    radius: f32,
+    color: gpui::Hsla,
+) {
+    window.paint_quad(gpui::quad(
+        bounds,
+        px(radius),
+        color,
+        px(0.0),
+        gpui::transparent_black(),
+        gpui::BorderStyle::default(),
+    ));
+}
+
+/// Paints a color that varies along the fill in thin strips whose gradients
+/// join end to end; the end strips carry the fill's corner radius, so the
+/// color never leaves the rounded ends.
+fn paint_fill_strips(
+    window: &mut Window,
+    rect: &dyn Fn(f32, f32, f32, f32) -> gpui::Bounds<gpui::Pixels>,
+    from: f32,
+    to: f32,
+    top: f32,
+    height: f32,
+    color_at: &dyn Fn(f32) -> gpui::Hsla,
+) {
+    let radius = height / 2.0;
+    let mut edges = vec![from, (from + radius).min(to)];
+    let inner_end = (to - radius).max(edges[1]);
+    let mut x = edges[1];
+    while x + 4.0 < inner_end {
+        x += 4.0;
+        edges.push(x);
+    }
+    if inner_end > *edges.last().unwrap() {
+        edges.push(inner_end);
+    }
+    if to > *edges.last().unwrap() {
+        edges.push(to);
+    }
+    let last = edges.len().saturating_sub(2);
+    for (i, pair) in edges.windows(2).enumerate() {
+        let (x0, x1) = (pair[0], pair[1]);
+        if x1 - x0 < 0.1 {
+            continue;
+        }
+        let r = px(radius.min(x1 - x0));
+        let zero = px(0.0);
+        let corners = gpui::Corners {
+            top_left: if i == 0 { r } else { zero },
+            bottom_left: if i == 0 { r } else { zero },
+            top_right: if i == last { r } else { zero },
+            bottom_right: if i == last { r } else { zero },
+        };
+        window.paint_quad(gpui::quad(
+            rect(x0, top, x1 - x0, height),
+            corners,
+            gpui::linear_gradient(
+                90.0,
+                gpui::linear_color_stop(color_at(x0), 0.0),
+                gpui::linear_color_stop(color_at(x1), 1.0),
+            ),
+            px(0.0),
+            gpui::transparent_black(),
+            gpui::BorderStyle::default(),
+        ));
+    }
 }
 
 fn effort_fraction(x: f32, width: f32) -> f32 {

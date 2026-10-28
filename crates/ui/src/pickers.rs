@@ -12,8 +12,9 @@
 //! rendered as skeletons / inline errors with Retry.
 
 mod compact;
+mod effort_effects;
 
-use crate::roll_text::{roll_text, rolling};
+use crate::roll_text::{Tint, roll_text, rolling, rolling_tinted, tinted};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -3642,7 +3643,7 @@ impl Pickers {
         &mut self,
         window: &mut Window,
         label: &SharedString,
-        suffix: Option<&SharedString>,
+        suffix: Option<&(SharedString, Option<Tint>)>,
         label_loading: bool,
         fast: bool,
         cx: &App,
@@ -3651,27 +3652,24 @@ impl Pickers {
         let size = crate::typography::ui_rems(12.0).to_pixels(window.rem_size());
         let mut font = window.text_style().font();
         font.weight = gpui::FontWeight::MEDIUM;
-        let measure = |text: &SharedString| -> f32 {
-            let run = gpui::TextRun {
-                len: text.len(),
-                font: font.clone(),
-                color: gpui::black(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
+        let measure = |text: &SharedString, tint: Option<&Tint>| -> f32 {
+            let runs = crate::roll_text::tinted_runs(text, tint, font.clone(), gpui::black());
             f32::from(
                 window
                     .text_system()
-                    .shape_line(text.clone(), size, &[run], None)
+                    .shape_line(text.clone(), size, &runs, None)
                     .width,
             )
             .ceil()
         };
-        let label_width = if label_loading { 56.0 } else { measure(label) };
+        let label_width = if label_loading {
+            56.0
+        } else {
+            measure(label, None)
+        };
         let mut width = 2.0 * 6.0 + 16.0 + GAP + label_width;
-        if let Some(suffix) = suffix {
-            width += GAP + measure(suffix);
+        if let Some((suffix, tint)) = suffix {
+            width += GAP + measure(suffix, tint.as_ref());
         }
         if fast {
             width += GAP + 13.0;
@@ -3703,7 +3701,7 @@ impl Pickers {
         // (model unknown).
         icon_loading: bool,
         label_loading: bool,
-        suffix: Option<(SharedString, Option<gpui::Hsla>)>,
+        suffix: Option<(SharedString, Option<Tint>)>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -3807,14 +3805,19 @@ impl Pickers {
                     None => div().min_w_0().truncate().child(label).into_any_element(),
                 })
             })
-            // The effort half of the combined model+effort chip (and the space
-            // chip's "@ device" tag): muted, no icon — one button, two tones.
-            // `tint` overrides the muted tone (the offline warning). Under row
-            // pressure the suffix yields FIRST (large shrink factor) so the
-            // model name — the run's identity — truncates last.
+            // The effort half of the combined model+effort chip: muted, no
+            // icon — one button, two tones. `tint` colors it instead (the
+            // ultra levels' ramps). Under row pressure the suffix yields FIRST
+            // (large shrink factor) so the model name — the run's identity —
+            // truncates last.
             .when_some(suffix, |el, (suffix, tint)| {
-                let color = tint.unwrap_or(theme.text_muted.opacity(0.7));
-                let rolling = rolling(format!("{id}-suffix"), suffix.clone(), cx.reduce_motion());
+                let color = theme.text_muted.opacity(0.7);
+                let rolling = rolling_tinted(
+                    format!("{id}-suffix"),
+                    suffix.clone(),
+                    tint.clone(),
+                    cx.reduce_motion(),
+                );
                 el.child(if let Some(rolling) = rolling {
                     div()
                         .flex()
@@ -3824,14 +3827,19 @@ impl Pickers {
                         .child(rolling)
                         .into_any_element()
                 } else if resizing {
-                    resizing_chip_text(format!("{id}-suffix").into(), 1000.0, Some(color), suffix)
+                    resizing_chip_text(
+                        format!("{id}-suffix").into(),
+                        1000.0,
+                        Some(color),
+                        tinted(suffix, tint.as_ref()),
+                    )
                 } else {
                     div()
                         .flex_shrink(1000.0)
                         .min_w_0()
                         .text_color(color)
                         .truncate()
-                        .child(suffix)
+                        .child(tinted(suffix, tint.as_ref()))
                         .into_any_element()
                 })
             })
@@ -6446,7 +6454,7 @@ fn resizing_chip_text(
     id: SharedString,
     shrink: f32,
     color: Option<gpui::Hsla>,
-    text: SharedString,
+    text: impl IntoElement,
 ) -> AnyElement {
     let overflow = gpui::ScrollHandle::new();
     crate::edge_fade::edge_faded(
@@ -6704,11 +6712,18 @@ impl Render for Pickers {
 
         // The composer places this model chip beside microphone and Send:
         // brand icon + model name, then the effort as the chip's muted second
-        // tone — the ladder's level, else an effort option's choice (Cursor).
-        // None for the title picker (titles always run at minimal reasoning).
+        // tone — the ladder's level, else an effort option's choice (Cursor);
+        // the ultra levels wear their color ramp. None for the title picker
+        // (titles always run at minimal reasoning).
         let chip_suffix = effort
             .filter(|_| self.title.is_none())
-            .map(|level| (SharedString::from(reasoning_label(level)), None))
+            .map(|level| {
+                let effect = effort_effects::LevelEffect::of(level);
+                (
+                    SharedString::from(reasoning_label(level)),
+                    effort_effects::label_tint(effect, theme.appearance.is_dark()),
+                )
+            })
             .or_else(|| {
                 self.title
                     .is_none()
@@ -6732,7 +6747,7 @@ impl Render for Pickers {
         let chip_width = self.model_chip_width(
             window,
             &model_label,
-            chip_suffix.as_ref().map(|(text, _)| text),
+            chip_suffix.as_ref(),
             chip_label_loading,
             fast,
             cx,
