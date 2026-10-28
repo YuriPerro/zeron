@@ -464,7 +464,10 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let bounds = self.sidebar_section_bounds.borrow().clone();
+        let bounds = match payload.kind {
+            SidebarSectionDragKind::Custom => self.sidebar_section_bounds.borrow().clone(),
+            SidebarSectionDragKind::Project => self.sidebar_project_bounds.borrow().clone(),
+        };
         let Some(from) = payload.ids.iter().position(|id| id == &payload.section_id) else {
             return;
         };
@@ -591,6 +594,9 @@ impl Shell {
         let Some(drag) = self.sidebar_section_drag.as_ref() else {
             return true;
         };
+        if drag.payload.kind == SidebarSectionDragKind::Project {
+            return self.sidebar_project_keys(cx) == *drag.payload.ids;
+        }
         self.active_sidebar_pin_profile_key(cx).as_deref() == Some(&drag.payload.profile_key)
             && self
                 .active_sidebar_sections(cx)
@@ -619,6 +625,12 @@ impl Shell {
             self.end_sidebar_section_drag(false, cx);
             return;
         }
+        if drag.payload.kind == SidebarSectionDragKind::Project {
+            let ids = drag.payload.ids.clone();
+            self.move_sidebar_project(&ids, from, over, cx);
+            self.end_sidebar_section_drag(true, cx);
+            return;
+        }
         let mut ids = (*drag.payload.ids).clone();
         let id = ids.remove(from);
         let change = SidebarSectionChange::Move {
@@ -641,6 +653,10 @@ impl Shell {
             return;
         };
         let mut settle = std::collections::HashMap::new();
+        let slot_key = |id: &str| match drag.payload.kind {
+            SidebarSectionDragKind::Custom => format!("custom:{id}"),
+            SidebarSectionDragKind::Project => format!("g:project:{id}"),
+        };
         if !self.reduced_motion {
             let over = if placed { drag.over } else { drag.from };
             let landed = drag.top
@@ -650,7 +666,7 @@ impl Shell {
                     .map(|ix| drag.heights[ix] + SIDEBAR_LIST_GAP)
                     .sum::<f32>();
             settle.insert(
-                format!("custom:{}", drag.payload.section_id),
+                slot_key(&drag.payload.section_id),
                 self.lifted_sidebar_section_top(drag) - landed,
             );
             let step = drag.heights[drag.from] + SIDEBAR_LIST_GAP;
@@ -658,7 +674,7 @@ impl Shell {
                 let current = drag.siblings.get(id).map_or(0.0, |slide| slide.current());
                 let target = crate::terminal::panel::slide_offset(ix, drag.from, over) * step;
                 if ix != drag.from && (current - target).abs() > 0.5 {
-                    settle.insert(format!("custom:{id}"), current - target);
+                    settle.insert(slot_key(id), current - target);
                 }
             }
         }
@@ -1275,6 +1291,115 @@ mod tests {
         window
             .update(&mut cx, |shell, _, _| {
                 assert!(shell.sidebar_section_drag.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn project_groups_reorder_by_dragging_their_header(cx: &mut gpui::TestAppContext) {
+        use gpui::MouseButton;
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        let keys = window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    state.chats_synced = true;
+                    state.spaces = ["a", "b", "c"]
+                        .into_iter()
+                        .map(|id| {
+                            serde_json::from_value(serde_json::json!({
+                                "id": id, "deviceId": "local", "path": format!("/project/{id}"),
+                                "name": id, "createdAt": "2026-09-20T00:00:00Z"
+                            }))
+                            .unwrap()
+                        })
+                        .collect();
+                    // Newest first: c, b, a.
+                    state.chats = ["c", "b", "a"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, project)| {
+                            let mut chat = chat(&format!("{project}-chat"));
+                            chat.space_id = Some(project.into());
+                            chat.created_at -= chrono::Duration::minutes(ix as i64);
+                            chat
+                        })
+                        .collect();
+                });
+                shell.settings.space_filter = None;
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, true);
+                let state = shell.state.read(cx);
+                ["a", "b", "c"]
+                    .map(|id| zeron_proto::view::project_key(state.space_row(id).unwrap()))
+            })
+            .unwrap();
+        let [a, b, c] = keys.clone();
+        let header = |key: &str| -> &'static str {
+            Box::leak(format!("sidebar-group-header-project:{key}").into_boxed_str())
+        };
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        cx.run_until_parked();
+        let saved = |cx: &mut gpui::VisualTestContext| {
+            window
+                .update(cx, |shell, _, _| {
+                    (
+                        shell.settings.space_order.clone(),
+                        shell.settings.sidebar_project_order,
+                    )
+                })
+                .unwrap()
+        };
+        let none = gpui::Modifiers::default();
+        let nudge = gpui::point(px(0.0), px(6.0));
+
+        // Nudged and dropped in place: nothing is written.
+        let from = cx.debug_bounds(header(&c)).unwrap().center();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from + nudge, Some(MouseButton::Left), none);
+        cx.simulate_mouse_up(from + nudge, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(saved(&mut cx), (vec![], SidebarProjectOrder::Recent));
+
+        // The newest project dragged to the bottom sticks there.
+        let last = cx.debug_bounds(header(&a)).unwrap();
+        let to = gpui::point(from.x, last.bottom() + px(30.0));
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from + nudge, Some(MouseButton::Left), none);
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "project drag never started"));
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), none);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar-lifted-section").is_some());
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(
+            saved(&mut cx),
+            (
+                vec![b.clone(), a.clone(), c.clone()],
+                SidebarProjectOrder::Manual
+            )
+        );
+        let order = window
+            .update(&mut cx, |shell, _, cx| shell.sidebar_visible_order(cx))
+            .unwrap();
+        assert_eq!(order, ["b-chat", "a-chat", "c-chat"]);
+
+        // Released outside the sidebar, the project goes home.
+        let from = cx.debug_bounds(header(&b)).unwrap().center();
+        let outside = gpui::point(px(900.0), from.y + px(200.0));
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from + nudge, Some(MouseButton::Left), none);
+        cx.simulate_mouse_move(outside, Some(MouseButton::Left), none);
+        cx.simulate_mouse_up(outside, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(saved(&mut cx).0, vec![b, a, c]);
+        window
+            .update(&mut cx, |shell, _, _| {
+                assert!(shell.sidebar_section_drag.is_none())
             })
             .unwrap();
     }

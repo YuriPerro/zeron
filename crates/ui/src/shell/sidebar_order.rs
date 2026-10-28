@@ -39,6 +39,51 @@ impl Shell {
             .collect()
     }
 
+    /// The project groups' keys in drawn order, while grouping by project.
+    pub(super) fn sidebar_project_keys(&self, cx: &gpui::App) -> Vec<String> {
+        if self.settings.sidebar_organization != SidebarOrganization::ByProject {
+            return Vec::new();
+        }
+        let pinned = self.active_sidebar_pins(cx);
+        let sections = self.active_sidebar_sections(cx);
+        let state = self.state.read(cx);
+        let mut groups: Vec<(Option<(String, String)>, Vec<()>)> = Vec::new();
+        for (_, chat) in self.sidebar_sorted_chats(state, chrono::Utc::now(), &pinned) {
+            if pinned.contains(&chat.id)
+                || sections
+                    .iter()
+                    .any(|section| section.session_ids.contains(&chat.id))
+            {
+                continue;
+            }
+            let group = Some(super::spaces::sidebar_project_group(state, &chat));
+            if !groups.iter().any(|(existing, _)| existing == &group) {
+                groups.push((group, Vec::new()));
+            }
+        }
+        self.order_sidebar_groups(state, &mut groups);
+        groups
+            .into_iter()
+            .filter_map(|(group, _)| group.map(|(key, _)| key))
+            .collect()
+    }
+
+    /// Land a dragged project group: the new order is saved and Projects
+    /// switches to Manual so it sticks.
+    pub(super) fn move_sidebar_project(
+        &mut self,
+        visible: &[String],
+        from: usize,
+        over: usize,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.settings.space_order =
+            moved_project_order(&self.settings.space_order, visible, from, over);
+        self.settings.sidebar_project_order = SidebarProjectOrder::Manual;
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     /// Order the device or project groups the way the sidebar draws them.
     pub(super) fn order_sidebar_groups<T>(
         &self,

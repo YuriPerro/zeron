@@ -2481,7 +2481,10 @@ pub(super) fn promote_local_device_group<T>(
 /// Project-mode group of a chat as (key, label). Projects sharing a
 /// repository identity fold into one group named for their representative
 /// space; project-less sessions group per device as "No project".
-fn sidebar_project_group(state: &AppState, chat: &zeron_proto::Chat) -> (String, String) {
+pub(super) fn sidebar_project_group(
+    state: &AppState,
+    chat: &zeron_proto::Chat,
+) -> (String, String) {
     match state.space_for_chat(chat) {
         Some(space) => (
             zeron_proto::view::project_key(space),
@@ -5678,6 +5681,17 @@ impl Shell {
             });
         }
         self.order_sidebar_groups(self.state.read(cx), &mut regular_groups);
+        // Project groups reorder by their header once there are two to order.
+        let project_order = (self.settings.sidebar_organization == SidebarOrganization::ByProject
+            && regular_groups.len() > 1)
+            .then(|| {
+                std::sync::Arc::new(
+                    regular_groups
+                        .iter()
+                        .filter_map(|(group, _)| group.as_ref().map(|(key, _)| key.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            });
         let mut sections = Vec::with_capacity(regular_groups.len() + usize::from(pinned_count > 0));
         if !pinned_rows.is_empty() {
             sections.push((None, pinned_rows));
@@ -5997,6 +6011,7 @@ impl Shell {
                             .clone()
                             .zip(profile_key.clone())
                             .map(|(ids, profile_key)| SidebarSectionDrag {
+                                kind: SidebarSectionDragKind::Custom,
                                 section_id: section.id.clone(),
                                 profile_key,
                                 ids,
@@ -6106,6 +6121,10 @@ impl Shell {
                 )
                     .group(group_name)
                 .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
+                .debug_selector({
+                    let collapse_key = collapse_key.clone();
+                    move || format!("sidebar-group-header-{collapse_key}")
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
                     this.begin_sidebar_disclosure_motion(
@@ -6119,7 +6138,28 @@ impl Shell {
                         this.sidebar_collapsed_groups.remove(&toggle_key);
                     }
                     cx.notify();
-                }));
+                }))
+                .when_some(
+                    project_order
+                        .clone()
+                        .filter(|_| project_group)
+                        .map(|ids| SidebarSectionDrag {
+                            kind: SidebarSectionDragKind::Project,
+                            section_id: key.clone(),
+                            profile_key: String::new(),
+                            ids,
+                        }),
+                    |el, payload| {
+                        let shell = cx.entity();
+                        el.on_drag(payload, move |payload, grab, window, cx| {
+                            shell.update(cx, |shell, cx| {
+                                shell.begin_sidebar_section_drag(payload, grab, window, cx);
+                            });
+                            cx.stop_propagation();
+                            cx.new(|_| DragGhost)
+                        })
+                    },
+                );
             let body = self.render_sidebar_disclosure_body(
                 &motion_key,
                 !collapsed,
