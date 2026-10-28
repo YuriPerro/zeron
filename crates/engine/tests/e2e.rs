@@ -4068,6 +4068,102 @@ async fn session_row_lists_background_tasks_until_the_run_ends() {
     core.sessions.shutdown().await;
 }
 
+async fn stop_background_task(
+    core: &EngineCore,
+    chat_id: &str,
+    task_id: &str,
+) -> Result<serde_json::Value, zeron_rpc::RpcError> {
+    use zeron_rpc::RpcService;
+    match core
+        .rpc_service()
+        .handle(
+            zeron_rpc::methods::STOP_BACKGROUND_TASK,
+            serde_json::json!({ "chatId": chat_id, "taskId": task_id }),
+        )
+        .await?
+    {
+        zeron_rpc::RpcReply::Value(value) => Ok(value),
+        zeron_rpc::RpcReply::Stream(_) => panic!("unary method replied with a stream"),
+    }
+}
+
+/// Stopping one task asks the CLI for just that task: the row drops it and
+/// the turn runs on to its own end.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_background_task_stops_one_task_and_clears_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, request) = fake_claude(dir.path(), "scenario:stop-task");
+    core.sessions
+        .dispatch(CHAT, HarnessId::ClaudeCode, request, None)
+        .await
+        .unwrap();
+    wait_for(|| !background_tasks(&core).is_empty(), "the reported task").await;
+
+    let reply = stop_background_task(&core, CHAT, "b1").await.unwrap();
+    assert_eq!(reply, serde_json::json!({}));
+
+    wait_for(|| background_tasks(&core).is_empty(), "the row to empty").await;
+    wait_for(
+        || {
+            matches!(
+                core.sessions.session_status(CHAT).map(|s| s.status),
+                Some(SessionStatus::Idle)
+            )
+        },
+        "the turn to finish on its own",
+    )
+    .await;
+    core.sessions.shutdown().await;
+}
+
+/// A task the chat does not hold, and a chat with no run, are both "not
+/// running" without ever reaching the CLI.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_background_task_rejects_unknown_tasks_and_chats() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, request) = fake_claude(dir.path(), "scenario:stop-task");
+    core.sessions
+        .dispatch(CHAT, HarnessId::ClaudeCode, request, None)
+        .await
+        .unwrap();
+    wait_for(|| !background_tasks(&core).is_empty(), "the reported task").await;
+
+    let unknown_task = stop_background_task(&core, CHAT, "nope").await;
+    assert!(
+        matches!(&unknown_task, Err(zeron_rpc::RpcError::Failed(m)) if m == "not running"),
+        "{unknown_task:?}"
+    );
+    let unknown_chat = stop_background_task(&core, "missing", "b1").await;
+    assert!(
+        matches!(&unknown_chat, Err(zeron_rpc::RpcError::Failed(m)) if m == "not running"),
+        "{unknown_chat:?}"
+    );
+    assert_eq!(background_tasks(&core).len(), 1, "the task is untouched");
+    core.sessions.shutdown().await;
+}
+
+/// A CLI that never answers the stop does not hang the caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_background_task_times_out_when_nobody_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, request) = fake_claude(dir.path(), "scenario:stop-task-silent");
+    core.sessions
+        .set_stop_task_timeout(Duration::from_millis(300));
+    core.sessions
+        .dispatch(CHAT, HarnessId::ClaudeCode, request, None)
+        .await
+        .unwrap();
+    wait_for(|| !background_tasks(&core).is_empty(), "the reported task").await;
+
+    let timed_out = stop_background_task(&core, CHAT, "b1").await;
+    assert!(
+        matches!(&timed_out, Err(zeron_rpc::RpcError::Failed(m)) if m == "stop timed out"),
+        "{timed_out:?}"
+    );
+    assert_eq!(background_tasks(&core).len(), 1, "the task is untouched");
+    core.sessions.shutdown().await;
+}
+
 /// The set the CLI reports while a turn is stopped in place stays on the row,
 /// and the next report (here, the next turn's empty one) replaces it.
 #[tokio::test(flavor = "multi_thread")]

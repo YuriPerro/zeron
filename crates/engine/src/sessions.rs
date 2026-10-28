@@ -266,6 +266,9 @@ struct Inner {
     /// while no run was live (between the failed run and its retry) found
     /// nothing to stop, and still ends the turn.
     user_stops: Mutex<HashMap<String, u64>>,
+    /// How long [`SessionsEngine::stop_background_task`] waits for the CLI's
+    /// answer, in millis (tests shorten it).
+    stop_task_timeout_ms: std::sync::atomic::AtomicU64,
     /// Loopback IPC port this engine serves, once known (0 = not serving):
     /// what the injected `zeron mcp` server dials back into.
     ipc_port: std::sync::atomic::AtomicU16,
@@ -347,6 +350,7 @@ impl SessionsEngine {
                 revivals: Mutex::new(HashMap::new()),
                 cancelled_sends: Mutex::new(HashMap::new()),
                 user_stops: Mutex::new(HashMap::new()),
+                stop_task_timeout_ms: std::sync::atomic::AtomicU64::new(10_000),
                 ipc_port: std::sync::atomic::AtomicU16::new(0),
                 ipc_token_file: Mutex::new(None),
                 journal,
@@ -1464,6 +1468,48 @@ impl SessionsEngine {
         }
         tracing::warn!(chat = %chat_id, "turn stop did not settle; tearing the runtime down");
         self.terminate(chat_id).await
+    }
+
+    /// Stop one background task of the chat's live runtime, leaving the turn
+    /// and the runtime's other work alone. Only a task the chat's row lists
+    /// is asked for: the CLI answers (or never does, for drivers without a
+    /// per-task stop), and the row follows its next report.
+    pub async fn stop_background_task(
+        &self,
+        chat_id: &str,
+        task_id: &str,
+    ) -> Result<(), EngineError> {
+        let not_running = || EngineError::Other("not running".into());
+        let turn = lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| h.turn.clone())
+            .ok_or_else(not_running)?;
+        let listed = lock(&self.inner.statuses)
+            .get(chat_id)
+            .is_some_and(|s| s.background_tasks.iter().any(|t| t.id == task_id));
+        if !listed {
+            return Err(not_running());
+        }
+        let timeout = std::time::Duration::from_millis(
+            self.inner
+                .stop_task_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        match tokio::time::timeout(timeout, turn.stop_task(task_id.into())).await {
+            Err(_) => Err(EngineError::Other("stop timed out".into())),
+            Ok(Err(_)) => Err(not_running()),
+            Ok(Ok(Err(msg))) => Err(EngineError::Other(msg)),
+            Ok(Ok(Ok(()))) => Ok(()),
+        }
+    }
+
+    /// Shorten the wait [`Self::stop_background_task`] gives the CLI.
+    #[doc(hidden)]
+    pub fn set_stop_task_timeout(&self, timeout: std::time::Duration) {
+        self.inner.stop_task_timeout_ms.store(
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Tear the chat's live runtime down (protocol interrupt, then the

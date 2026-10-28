@@ -99,6 +99,13 @@ struct ChatParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct StopBackgroundTaskParams {
+    chat_id: String,
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
     #[serde(default)]
@@ -2163,6 +2170,7 @@ fn forwardable(method: &str) -> bool {
             | methods::REMOVE_QUEUED_MESSAGE
             | methods::SEND_QUEUED_MESSAGE_NOW
             | methods::STEER_QUEUED_MESSAGE_NOW
+            | methods::STOP_BACKGROUND_TASK
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -3118,6 +3126,14 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "sent": sent }))
+            }
+            methods::STOP_BACKGROUND_TASK => {
+                let p: StopBackgroundTaskParams = parse_params(params)?;
+                self.sessions
+                    .stop_background_task(&p.chat_id, &p.task_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({}))
             }
             methods::PROBE_SYNC => {
                 // Focus probes remain cheap. An explicit Retry may also allow

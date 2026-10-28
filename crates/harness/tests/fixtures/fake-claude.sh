@@ -601,6 +601,16 @@ case "$first" in
   cat >/dev/null
   ;;
 
+*scenario:stop-task-silent*)
+  # `stop-task` whose CLI reads the stop request and never answers it.
+  [ "$initialized" = true ] || exit 7
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-stop-silent"}'
+  emit '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash","description":"watch ci"}]}'
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}'
+  read -r line || exit 1
+  exec sleep 30
+  ;;
+
 *scenario:stop-task*)
   # A per-task stop is the `stop_task` control request: the CLI stops that
   # one background task and the turn runs on. An id it does not hold is

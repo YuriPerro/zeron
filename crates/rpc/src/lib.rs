@@ -104,6 +104,8 @@ pub mod methods {
     pub const REMOVE_QUEUED_MESSAGE: &str = "RemoveQueuedMessage";
     /// Interrupt whatever is running and send this one. `{ chatId, id }` → `{ sent }`.
     pub const SEND_QUEUED_MESSAGE_NOW: &str = "SendQueuedMessageNow";
+    /// Stop one background task of a chat's live runtime. `{ chatId, taskId }` → `{}`.
+    pub const STOP_BACKGROUND_TASK: &str = "StopBackgroundTask";
     /// Steer this row into the live turn without interrupting it.
     /// `{ chatId, id }` → `{ sent }`.
     pub const STEER_QUEUED_MESSAGE_NOW: &str = "SteerQueuedMessageNow";
