@@ -1,19 +1,28 @@
 //! The lanes card, stacked under the session card and shown with it: what
 //! runs alongside the open chat — its **side chats** (forks, and chats an
 //! agent spawned through the Zeron MCP server) and its **subagents** (the
-//! spawn chips of its transcript, with their live status). Each lane is a
-//! section of session-card rows; clicking a row opens it in the right pane.
-//! Settled subagents fold into one "finished" row, closed until opened.
+//! spawn chips of its transcript, with their live status), then its
+//! **background tasks**, each with a stop button. Each lane is a section of
+//! session-card rows; clicking a row opens it in the right pane. Settled
+//! subagents fold into one "finished" row, closed until opened.
 
-use zeron_proto::{Chat, ChatIndicator};
+use std::collections::HashSet;
+
+use zeron_proto::{BackgroundTask, Chat, ChatIndicator};
 
 use super::session_info::SESSION_CARD_WIDTH;
-use crate::running_work::{SubagentRow, subagent_rows};
+use crate::running_work::{
+    STOP_SIZE, SubagentRow, background_stop_button, background_task_title, elapsed_label,
+    stop_background_task, subagent_rows,
+};
 use super::*;
 
 /// Rows a lane shows before "Show more" pages it, and the page size.
 const INITIAL_ROWS: usize = 8;
 const PAGE_ROWS: usize = 10;
+/// A background row's stop button sits as far from the row's top, bottom
+/// and trailing edge, so its corners are concentric with the row's.
+const STOP_INSET: f32 = (popover::PICKER_ROW_HEIGHT - STOP_SIZE) / 2.0;
 
 /// What the lanes card has unfolded or paged, and where it has scrolled; it
 /// follows the open chat.
@@ -26,6 +35,12 @@ pub(super) struct LaneState {
     scroll: gpui::ScrollHandle,
     /// The card's floating scrollbar, the file tree's treatment.
     bar: popover::MenuScrollbarState,
+    /// Background tasks whose stop is in flight. An id leaves once its task
+    /// leaves the chat's set, or when the stop fails.
+    stopping: HashSet<String>,
+    /// Elapsed times only move with the clock: while the background lane
+    /// shows them, the card re-renders once a second.
+    tick: Option<Task<()>>,
 }
 
 impl LaneState {
@@ -256,13 +271,17 @@ impl Shell {
     ) -> AnyElement {
         let now = Utc::now();
         self.session_lanes.follow(&chat.id);
-        let (side_chats, subagents) = {
+        let (side_chats, subagents, tasks) = {
             let state = self.state.read(cx);
             (
                 child_chat_rows(state, &chat.id, now),
                 SubagentLane::new(subagent_rows(state, &chat.id)),
+                state.background_tasks_for(&chat.id, now).to_vec(),
             )
         };
+        self.session_lanes
+            .stopping
+            .retain(|id| tasks.iter().any(|task| task.id == *id));
         let view = cx.entity_id();
         // Subagents run on the session's own harness.
         let harness = chat.config.as_ref().map(|config| config.harness);
@@ -392,6 +411,22 @@ impl Shell {
                     },
                 ));
             }
+        }
+        // ── Background tasks, each stoppable from its row.
+        if !tasks.is_empty() {
+            rows.push(popover::picker_divider().into_any_element());
+            rows.push(
+                popover::menu_heading(theme, "Background")
+                    .debug_selector(|| "session-lanes-background".into())
+                    .into_any_element(),
+            );
+            for task in &tasks {
+                rows.push(
+                    self.render_background_row(&chat.id, task, now, theme, cx)
+                        .into_any_element(),
+                );
+            }
+            self.tick_background_lane(cx);
         }
 
         let body = div()
@@ -547,6 +582,90 @@ impl Shell {
             .child(time_label(time.into(), theme))
     }
 
+    /// A background task: the loader, what it runs, its elapsed time and the
+    /// stop button. While its stop is in flight the row reads `Stopping…` and
+    /// the button is inert.
+    fn render_background_row(
+        &mut self,
+        chat_id: &str,
+        task: &BackgroundTask,
+        now: DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let key = format!("session-lanes-task-{}", task.id);
+        let stopping = self.session_lanes.stopping.contains(&task.id);
+        let loader = loaders::halo_loader(format!("{key}-loader"), 2.0, theme.busy);
+        let title = row_title(format!("{key}-title"), background_task_title(task));
+        let time = if stopping {
+            time_label("Stopping…".into(), theme).text_color(theme.danger)
+        } else {
+            time_label(elapsed_label(task.started_at, now), theme)
+        };
+        let shell = cx.weak_entity();
+        let (chat_id, task_id) = (chat_id.to_owned(), task.id.clone());
+        let stop = background_stop_button(
+            &key,
+            stopping,
+            popover::MENU_ITEM_RADIUS - STOP_INSET,
+            theme,
+            move |cx| {
+                shell
+                    .update(cx, |this, cx| {
+                        this.stop_lane_task(chat_id.clone(), task_id.clone(), cx)
+                    })
+                    .ok();
+            },
+        );
+        popover::picker_row(theme, false, false, key.clone())
+            .id(SharedString::from(key.clone()))
+            .debug_selector({
+                let key = key.clone();
+                move || key
+            })
+            .cursor(gpui::CursorStyle::Arrow)
+            .pr(px(STOP_INSET))
+            .child(popover::picker_icon_slot(loader.into_any_element()))
+            .child(title)
+            .child(time)
+            .child(stop)
+    }
+
+    /// Stop one of the open chat's background tasks from its lane row. The
+    /// row is marked until the task leaves the set; a refusal clears the mark.
+    fn stop_lane_task(&mut self, chat_id: String, task_id: String, cx: &mut Context<Self>) {
+        if !self.session_lanes.stopping.insert(task_id.clone()) {
+            return;
+        }
+        cx.notify();
+        let stop = stop_background_task(&self.state, chat_id, task_id.clone(), cx);
+        cx.spawn(async move |this, cx| {
+            if stop.await.is_ok() {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.session_lanes.stopping.remove(&task_id);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn tick_background_lane(&mut self, cx: &mut Context<Self>) {
+        if self.session_lanes.tick.is_some() {
+            return;
+        }
+        self.session_lanes.tick = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            this.update(cx, |this, cx| {
+                this.session_lanes.tick = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// The settled subagents' fold, with their count.
     fn render_finished_fold(
         &mut self,
@@ -616,8 +735,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_doc::{MessageRole, MessageStatus, SessionMessageEntry};
-    use zeron_proto::ToolCall;
+    use crate::shell::panel_interaction_tests::{settled, setup};
 
     fn chat(id: &str, parent: Option<&str>, minutes_ago: i64) -> Chat {
         serde_json::from_value(serde_json::json!({
@@ -669,5 +787,47 @@ mod tests {
         lanes.reveal_chat("other", 0);
         assert!(!lanes.finished_open);
         assert_eq!(LaneState::shown(lanes.shown_chats), INITIAL_ROWS);
+    }
+
+    #[gpui::test]
+    fn background_lane_shows_only_with_tasks(cx: &mut gpui::TestAppContext) {
+        let (_dir, shell, cx) = setup(cx);
+        cx.update(|_, cx| shell.update(cx, |shell, cx| shell.show_session_info(cx)));
+        settled(&shell, cx);
+        assert!(cx.debug_bounds("session-lanes").is_some());
+        assert!(cx.debug_bounds("session-lanes-background").is_none());
+
+        cx.update(|_, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.sessions = vec![zeron_proto::Session {
+                        last_turn_outcome: None,
+                        terminal_activity: None,
+                        last_completed_turn: None,
+                        chat_id: "a".into(),
+                        device_id: "local".into(),
+                        status: zeron_proto::SessionStatus::Working,
+                        started_at: Some(Utc::now()),
+                        updated_at: Utc::now(),
+                        running_subagents: 0,
+                        background_tasks: vec![zeron_proto::BackgroundTask {
+                            id: "bg-1".into(),
+                            kind: zeron_proto::BackgroundTaskKind::Shell,
+                            description: "watch the build".into(),
+                            started_at: Utc::now() - chrono::Duration::seconds(41),
+                        }],
+                    }];
+                    cx.notify();
+                })
+            })
+        });
+        settled(&shell, cx);
+        assert!(cx.debug_bounds("session-lanes-background").is_some());
+        assert!(cx.debug_bounds("session-lanes-task-bg-1").is_some());
+        let title = shell.read_with(cx, |shell, cx| {
+            let state = shell.state.read(cx);
+            background_task_title(&state.background_tasks_for("a", Utc::now())[0])
+        });
+        assert_eq!(title.as_ref(), "watch the build");
     }
 }

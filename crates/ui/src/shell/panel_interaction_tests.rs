@@ -2,7 +2,9 @@
 use super::*;
 use gpui::{AppContext, Bounds, TestAppContext, VisualTestContext};
 
-fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
+pub(super) fn setup(
+    cx: &mut TestAppContext,
+) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
     let dir = tempfile::tempdir().unwrap();
     cx.update(|cx| {
         gpui_base::init(cx);
@@ -95,7 +97,7 @@ impl Panel {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Frame {
+pub(super) struct Frame {
     // Sidebar, Files, surface host, visible conversation.
     widths: [f32; 4],
     composer: Bounds<Pixels>,
@@ -155,7 +157,7 @@ fn continuous(before: Frame, after: Frame) {
     }
 }
 
-fn settled(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Frame {
+pub(super) fn settled(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Frame {
     // A closing column may make room for a hidden neighbour to return.
     draw(shell, cx, 600);
     draw(shell, cx, 600)

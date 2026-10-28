@@ -1,13 +1,21 @@
 //! Work running under the open chat, derived once for every surface that
 //! lists it: the lanes card and the composer's pills. Subagents are the
-//! spawn chips of the transcript with their live status.
+//! spawn chips of the transcript with their live status; background tasks
+//! share their title, stop button and stop flow.
+
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use gpui::SharedString;
+use gpui::{
+    App, Entity, InteractiveElement as _, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Task, div, prelude::*, px,
+};
 use zeron_doc::{MessagePart, SubagentStatus};
-use zeron_proto::ChatIndicator;
+use zeron_proto::{BackgroundTask, ChatIndicator};
+use zeron_rpc::methods;
 
-use crate::state::AppState;
+use crate::state::{AppState, clock_now};
+use crate::theme::Theme;
 
 /// A spawn chip of the open transcript, as its lane lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +115,110 @@ pub(crate) fn running_subagent_rows(state: &AppState, chat_id: &str) -> Vec<Suba
     let mut rows = subagent_rows(state, chat_id);
     rows.retain(|row| row.status == Some(SubagentStatus::Running));
     rows
+}
+
+/// What a background task runs, or its id when it says nothing.
+pub(crate) fn background_task_title(task: &BackgroundTask) -> SharedString {
+    if task.description.is_empty() {
+        task.id.clone().into()
+    } else {
+        task.description.clone().into()
+    }
+}
+
+/// The stop button's square; a row insets it as far from its edges.
+pub(crate) const STOP_SIZE: f32 = 20.0;
+const STOP_SQUARE: f32 = 7.0;
+
+/// A background task's stop button, `radius` concentric with its row. While
+/// the stop is in flight (`stopping`) it is inert.
+pub(crate) fn background_stop_button(
+    key: &str,
+    stopping: bool,
+    radius: f32,
+    theme: &Theme,
+    on_stop: impl Fn(&mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let danger = theme.danger;
+    let accent = theme.accent;
+    div()
+        .id(SharedString::from(format!("{key}-stop")))
+        .role(gpui::Role::Button)
+        .aria_label("Stop task")
+        .size(px(STOP_SIZE))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radius))
+        .bg(danger.opacity(0.14))
+        .when(stopping, |el| {
+            el.cursor(gpui::CursorStyle::Arrow).opacity(0.45)
+        })
+        .when(!stopping, |el| {
+            el.cursor_pointer()
+                .hover(move |s| s.bg(danger.opacity(0.30)))
+                .tab_index(0)
+                .focus_visible(move |s| s.bg(accent.opacity(0.18)))
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    on_stop(cx);
+                })
+        })
+        .tooltip(crate::settings::widgets::text_tooltip("Stop task"))
+        .tooltip_show_delay(Duration::from_millis(350))
+        .child(div().size(px(STOP_SQUARE)).rounded(px(1.5)).bg(danger))
+}
+
+/// Ask the chat's host to stop one of its background tasks. A refusal says
+/// so only while the task still runs — one that ended on its own in the
+/// meantime needs no toast. Each surface keeps its own in-flight mark and
+/// clears it on `Err`.
+pub(crate) fn stop_background_task(
+    state: &Entity<AppState>,
+    chat_id: String,
+    task_id: String,
+    cx: &mut App,
+) -> Task<Result<(), String>> {
+    let (engine, host) = {
+        let state = state.read(cx);
+        let host = state
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.device_id.clone());
+        (state.engine().cloned(), host)
+    };
+    let Some(engine) = engine else {
+        return Task::ready(Err("not connected".into()));
+    };
+    let mut params = serde_json::json!({ "chatId": chat_id, "taskId": task_id });
+    if let Some(host) = host {
+        params["targetDeviceId"] = serde_json::Value::String(host);
+    }
+    let state = state.clone();
+    cx.spawn(async move |cx| {
+        let Err(err) = engine
+            .client()
+            .call(methods::STOP_BACKGROUND_TASK, params)
+            .await
+        else {
+            return Ok(());
+        };
+        tracing::warn!(error = %err, "stopping a background task failed");
+        cx.update(|cx| {
+            let running = state
+                .read(cx)
+                .background_tasks_for(&chat_id, clock_now())
+                .iter()
+                .any(|task| task.id == task_id);
+            if running {
+                crate::toast::error(cx, format!("Couldn't stop the task: {err}"));
+            }
+        });
+        Err(err.to_string())
+    })
 }
 
 /// How long `since` has run as of `now`: `41s`, `1m 12s` or `1h 03m`.

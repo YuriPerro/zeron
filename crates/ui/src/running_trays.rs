@@ -14,13 +14,15 @@ use gpui::{
     SharedString, StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
 };
 use zeron_proto::BackgroundTask;
-use zeron_rpc::methods;
 
 use crate::composer::{Composer, ComposerEvent, QUEUE_COMPOSER_OVERLAP};
 use crate::icons::{self, icon};
 use crate::motion;
 use crate::queue::{PANEL_BORDER, PANEL_PAD_TOP, PANEL_RADIUS, ROW_RADIUS};
-use crate::running_work::{SubagentRow, elapsed_label, running_subagent_rows};
+use crate::running_work::{
+    STOP_SIZE, SubagentRow, background_stop_button, background_task_title, elapsed_label,
+    running_subagent_rows, stop_background_task,
+};
 use crate::state::clock_now;
 use crate::theme::Theme;
 
@@ -63,9 +65,7 @@ const META_SIZE: f32 = 11.0;
 const LOADER_DOT: f32 = 2.0;
 /// The stop button sits as far from the row's top, bottom and trailing edge,
 /// so its corners are concentric with the row's.
-const STOP_SIZE: f32 = 20.0;
 const STOP_INSET: f32 = (ROW_HEIGHT - STOP_SIZE) / 2.0;
-const STOP_SQUARE: f32 = 7.0;
 
 impl Composer {
     /// The pills that render for the selected chat, left to right: one per
@@ -383,48 +383,22 @@ impl Composer {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let title: SharedString = if task.description.is_empty() {
-            task.id.clone().into()
-        } else {
-            task.description.clone().into()
-        };
         let meta = if stopping {
             row_meta("Stopping…".into(), theme.danger, theme)
         } else {
             row_meta(elapsed_label(task.started_at, now), theme.text_faint, theme)
         };
         let key = format!("running-task-{}", task.id);
-        let danger = theme.danger;
-        let accent = theme.accent;
+        let composer = cx.weak_entity();
         let (chat_id, task_id) = (chat_id.to_owned(), task.id.clone());
-        let stop = div()
-            .id(SharedString::from(format!("{key}-stop")))
-            .role(gpui::Role::Button)
-            .aria_label("Stop task")
-            .size(px(STOP_SIZE))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(ROW_RADIUS - STOP_INSET))
-            .bg(danger.opacity(0.14))
-            .when(stopping, |el| {
-                el.cursor(gpui::CursorStyle::Arrow).opacity(0.45)
-            })
-            .when(!stopping, |el| {
-                el.cursor_pointer()
-                    .hover(move |s| s.bg(danger.opacity(0.30)))
-                    .tab_index(0)
-                    .focus_visible(move |s| s.bg(accent.opacity(0.18)))
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.stop_running_task(chat_id.clone(), task_id.clone(), cx);
-                    }))
-            })
-            .tooltip(crate::settings::widgets::text_tooltip("Stop task"))
-            .tooltip_show_delay(Duration::from_millis(350))
-            .child(div().size(px(STOP_SQUARE)).rounded(px(1.5)).bg(danger));
+        let stop =
+            background_stop_button(&key, stopping, ROW_RADIUS - STOP_INSET, theme, move |cx| {
+                composer
+                    .update(cx, |this, cx| {
+                        this.stop_running_task(chat_id.clone(), task_id.clone(), cx)
+                    })
+                    .ok();
+            });
         tray_row(key.clone())
             .pr(px(STOP_INSET))
             .child(crate::loaders::halo_loader(
@@ -432,64 +406,33 @@ impl Composer {
                 LOADER_DOT,
                 theme.busy,
             ))
-            .child(row_title(title, theme))
+            .child(row_title(background_task_title(task), theme))
             .child(meta)
             .child(stop)
             .into_any_element()
     }
 
-    /// Ask the chat's host to stop one of its background tasks. The row is
-    /// marked until the task leaves the set; a refusal clears the mark, and
-    /// says so only while the task still runs — one that ended on its own in
-    /// the meantime needs no toast.
+    /// Stop one of the chat's background tasks. The row is marked until the
+    /// task leaves the set; a refusal clears the mark.
     pub(crate) fn stop_running_task(
         &mut self,
         chat_id: String,
         task_id: String,
         cx: &mut Context<Self>,
     ) {
-        let (engine, host) = {
-            let state = self.state.read(cx);
-            let Some(engine) = state.engine().cloned() else {
-                return;
-            };
-            let host = state
-                .chats
-                .iter()
-                .find(|chat| chat.id == chat_id)
-                .map(|chat| chat.device_id.clone());
-            (engine, host)
-        };
         let tray = self.running_trays.entry(chat_id.clone()).or_default();
         if !tray.stopping.insert(task_id.clone()) {
             return;
         }
         cx.notify();
-        let mut params = serde_json::json!({ "chatId": chat_id, "taskId": task_id });
-        if let Some(host) = host {
-            params["targetDeviceId"] = serde_json::Value::String(host);
-        }
+        let stop = stop_background_task(&self.state, chat_id.clone(), task_id.clone(), cx);
         cx.spawn(async move |this, cx| {
-            let Err(err) = engine
-                .client()
-                .call(methods::STOP_BACKGROUND_TASK, params)
-                .await
-            else {
+            if stop.await.is_ok() {
                 return;
-            };
-            tracing::warn!(error = %err, "stopping a background task failed");
+            }
             this.update(cx, |composer, cx| {
                 if let Some(tray) = composer.running_trays.get_mut(&chat_id) {
                     tray.stopping.remove(&task_id);
-                }
-                let running = composer
-                    .state
-                    .read(cx)
-                    .background_tasks_for(&chat_id, clock_now())
-                    .iter()
-                    .any(|task| task.id == task_id);
-                if running {
-                    crate::toast::error(cx, format!("Couldn't stop the task: {err}"));
                 }
                 cx.notify();
             })
