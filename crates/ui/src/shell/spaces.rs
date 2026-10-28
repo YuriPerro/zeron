@@ -3366,6 +3366,10 @@ impl Shell {
         self.chat_status_hover = None;
         self.cancel_pinned_session_drag(cx);
         self.sidebar_session_return = None;
+        // Lifted rows drop their glide wrapper, which restarts on release: a
+        // finished resort kept here would replay as a phantom reorder.
+        self.sidebar_resort.clear();
+        self.sidebar_new_keys.clear();
         self.pinned_session_drag_generation = self.pinned_session_drag_generation.wrapping_add(1);
         let lifted = window.mouse_position() - cursor_offset;
         self.sidebar_session_transfer = Some(SidebarSessionTransfer {

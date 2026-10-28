@@ -1484,6 +1484,96 @@ mod tests {
         cx.run_until_parked();
     }
 
+    #[gpui::test]
+    fn a_nudged_session_does_not_replay_the_last_project_resort(cx: &mut gpui::TestAppContext) {
+        use gpui::MouseButton;
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    state.chats_synced = true;
+                    state.spaces = ["a", "b"]
+                        .into_iter()
+                        .map(|id| {
+                            serde_json::from_value(serde_json::json!({
+                                "id": id, "deviceId": "local", "path": format!("/project/{id}"),
+                                "name": id, "createdAt": "2026-09-20T00:00:00Z"
+                            }))
+                            .unwrap()
+                        })
+                        .collect();
+                    // Newest first: a, b.
+                    state.chats = ["a", "b"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, project)| {
+                            let mut chat = chat(&format!("{project}-chat"));
+                            chat.space_id = Some(project.into());
+                            chat.created_at -= chrono::Duration::minutes(ix as i64);
+                            chat
+                        })
+                        .collect();
+                });
+                shell.settings.space_filter = None;
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                let state = shell.state.read(cx);
+                let manual = ["b", "a"]
+                    .map(|id| zeron_proto::view::project_key(state.space_row(id).unwrap()));
+                shell.settings.space_order = manual.to_vec();
+                shell.settings.sidebar_project_order = SidebarProjectOrder::Manual;
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, false);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        cx.run_until_parked();
+        // Back to Recent: the two projects swap and glide.
+        window
+            .update(&mut cx, |shell, _, cx| {
+                shell.settings.sidebar_project_order = SidebarProjectOrder::Recent;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, _| {
+                assert!(!shell.sidebar_resort.is_empty())
+            })
+            .unwrap();
+
+        // A session nudged and released in place. While it is lifted the rows
+        // drop their glide wrapper, so a kept offset would replay on release.
+        let none = gpui::Modifiers::default();
+        let from = cx.debug_bounds("chat-a-chat").unwrap().center();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(
+            from + gpui::point(px(1.0), px(-6.0)),
+            Some(MouseButton::Left),
+            none,
+        );
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "session drag never started"));
+        cx.simulate_mouse_up(
+            from + gpui::point(px(1.0), px(-6.0)),
+            MouseButton::Left,
+            none,
+        );
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, _| {
+                assert!(
+                    shell.sidebar_resort.is_empty(),
+                    "stale resort offsets would replay: {:?}",
+                    shell.sidebar_resort
+                );
+                assert!(shell.sidebar_new_keys.is_empty());
+            })
+            .unwrap();
+    }
+
     #[test]
     fn section_drop_index_follows_the_leading_edge() {
         let heights = [50.0, 300.0, 50.0];
