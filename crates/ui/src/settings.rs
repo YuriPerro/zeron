@@ -512,6 +512,22 @@ pub fn compact_model_picker(cx: &App) -> bool {
         .is_some_and(|store| store.current.compact_model_picker)
 }
 
+/// The usage window the footer ring shows, read each render without cloning
+/// the settings.
+pub fn account_usage_window(cx: &App) -> Option<gpui::SharedString> {
+    cx.try_global::<SettingsStore>()?
+        .current
+        .account_usage_window
+        .clone()
+        .map(gpui::SharedString::from)
+}
+
+pub fn set_account_usage_window(window: Option<String>, cx: &mut App) {
+    update(SavePolicy::Immediate, cx, |settings| {
+        settings.account_usage_window = window;
+    });
+}
+
 /// Copy a selected image into Zeron's device-local data directory and make it
 /// the new-thread canvas background. A unique file name avoids stale image
 /// caches when the background is replaced.
@@ -1002,6 +1018,9 @@ pub struct UiSettings {
         std::collections::HashMap<zeron_proto::HarnessId, SkillCompletionSettings>,
     /// Open model selection with an effort slider and a separate model list.
     pub compact_model_picker: bool,
+    /// The usage window label ("Session", "Week") the footer ring shows;
+    /// `None`, or a label the account lacks, shows the most-used window.
+    pub account_usage_window: Option<String>,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
@@ -1253,6 +1272,7 @@ impl Default for UiSettings {
             skills_in_slash_menu: false,
             skill_completion_by_harness: Default::default(),
             compact_model_picker: true,
+            account_usage_window: None,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             appshot_destination: crate::appshots::AppshotDestination::Automatic,
@@ -1868,6 +1888,7 @@ impl UiSettings {
             skills_in_slash_menu,
             skill_completion_by_harness,
             compact_model_picker,
+            account_usage_window,
             sidebar_width,
             sidebar_collapsed,
             sidebar_grouped,
@@ -2993,6 +3014,7 @@ mod tests {
             skills_in_slash_menu: true,
             skill_completion_by_harness: Default::default(),
             compact_model_picker: true,
+            account_usage_window: Some("Session".into()),
             appshots_enabled: false,
             appshot_sound_enabled: true,
             // The destination is only persisted where Appshots exist (macOS and

@@ -62,6 +62,23 @@ pub fn used_fraction(account: &AgentAccount) -> Option<f32> {
         .reduce(f32::max)
 }
 
+/// The ring's reading as `(shown, peak)`: `shown` is the window labeled
+/// `pick` when the account has it, else the most-used; `peak` is always the
+/// most-used, so the ring's color still warns of a limit it isn't showing.
+/// Pure.
+pub fn ring_reading(account: &AgentAccount, pick: Option<&str>) -> Option<(f32, f32)> {
+    let peak = used_fraction(account)?;
+    let shown = pick
+        .and_then(|label| {
+            account
+                .usage_windows
+                .iter()
+                .find(|window| window.label == label)
+        })
+        .map_or(peak, |window| window.used_fraction.clamp(0.0, 1.0));
+    Some((shown, peak))
+}
+
 /// The harness's live account, when it reports usage. Pure.
 pub fn active_account(
     snapshot: &AgentAccountsSnapshot,
@@ -260,10 +277,14 @@ impl AccountUsage {
         cx.notify();
     }
 
-    /// The ring's reading: the live account's most-used window, when the
-    /// harness has a live account with usage to show.
-    fn fraction(&self, cx: &gpui::App) -> Option<f32> {
-        used_fraction(active_account(self.snapshot(cx)?, self.harness?)?)
+    /// The ring's [`ring_reading`] of the live account, when the harness has
+    /// a live account with usage to show.
+    fn fraction(&self, cx: &gpui::App) -> Option<(f32, f32)> {
+        let pick = crate::settings::account_usage_window(cx);
+        ring_reading(
+            active_account(self.snapshot(cx)?, self.harness?)?,
+            pick.as_deref(),
+        )
     }
 
     /// A trigger click: open this ring's popover, or close it when the
@@ -432,6 +453,7 @@ impl AccountUsage {
                             })),
                     )
             }))
+            .children(self.window_picker(&rows, theme, cx))
             .children(self.error.clone().map(|error| {
                 div()
                     .px(px(8.0))
@@ -440,6 +462,73 @@ impl AccountUsage {
                     .text_color(theme.danger)
                     .child(error)
             }))
+    }
+
+    /// Which window the ring shows, offered once the live account has more
+    /// than one. A pick the account lacks reads as "Most used", as it shows.
+    fn window_picker(
+        &self,
+        rows: &[AgentAccount],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let labels: Vec<String> = rows
+            .iter()
+            .find(|account| account.active)?
+            .usage_windows
+            .iter()
+            .map(|window| window.label.clone())
+            .collect();
+        if labels.len() < 2 {
+            return None;
+        }
+        let pick = crate::settings::account_usage_window(cx)
+            .map(String::from)
+            .filter(|pick| labels.contains(pick));
+        let choices = std::iter::once((None, "Most used".to_string()))
+            .chain(labels.into_iter().map(|label| (Some(label.clone()), label)));
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .child(popover::menu_separator())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(theme.text_muted)
+                                .child("Footer shows"),
+                        )
+                        .children(choices.enumerate().map(|(ix, (window, label))| {
+                            let selected = window == pick;
+                            div()
+                                .id(("account-usage-window", ix))
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .when(selected, |chip| {
+                                    chip.bg(crate::theme::ink(0.08)).text_color(theme.accent)
+                                })
+                                .when(!selected, |chip| {
+                                    chip.text_color(theme.text_muted)
+                                        .hover(|style| style.bg(crate::theme::ink(0.05)))
+                                })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    crate::settings::set_account_usage_window(window.clone(), cx);
+                                    cx.notify();
+                                }))
+                                .child(SharedString::from(label))
+                        })),
+                ),
+        )
     }
 }
 
@@ -465,8 +554,8 @@ impl Render for AccountUsage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let context = self.state.read(cx).context_usage;
-        let account = self.fraction(cx).map(|fraction| {
-            let level = usage_level(fraction);
+        let account = self.fraction(cx).map(|(fraction, peak)| {
+            let level = usage_level(peak);
             let chip = crate::context_usage::ring_chip(
                 "account-usage",
                 fraction,
@@ -560,6 +649,21 @@ mod tests {
         assert_eq!(
             used_fraction(&account(HarnessId::Codex, true, &[1.4])),
             Some(1.0)
+        );
+    }
+
+    #[test]
+    fn ring_shows_the_picked_window_and_colors_by_the_most_used() {
+        let mut both = account(HarnessId::ClaudeCode, true, &[0.04, 0.49]);
+        both.usage_windows[0].label = "Session".into();
+        both.usage_windows[1].label = "Week".into();
+        assert_eq!(ring_reading(&both, None), Some((0.49, 0.49)));
+        assert_eq!(ring_reading(&both, Some("Session")), Some((0.04, 0.49)));
+        assert_eq!(ring_reading(&both, Some("Week")), Some((0.49, 0.49)));
+        assert_eq!(ring_reading(&both, Some("Month")), Some((0.49, 0.49)));
+        assert_eq!(
+            ring_reading(&account(HarnessId::ClaudeCode, true, &[]), Some("Week")),
+            None
         );
     }
 
