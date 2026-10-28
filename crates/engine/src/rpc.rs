@@ -3271,7 +3271,10 @@ impl RpcService for EngineRpc {
                 let page = self
                     .github
                     .list_page(
-                        &p.repository,
+                        &zeron_proto::BoardScope {
+                            host: "github.com".into(),
+                            repositories: vec![p.repository],
+                        },
                         p.filter,
                         p.after.as_deref(),
                         p.refresh,

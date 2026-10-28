@@ -78,6 +78,45 @@ pub fn valid_pr_repository(repository: &str) -> bool {
         })
 }
 
+/// One host and 1 to 5 valid repositories: what a board can list together.
+pub fn valid_board_scope(scope: &zeron_proto::BoardScope) -> bool {
+    !scope.host.is_empty()
+        && (1..=5).contains(&scope.repositories.len())
+        && scope
+            .repositories
+            .iter()
+            .all(|repository| valid_pr_repository(repository))
+}
+
+fn sorted_repositories(scope: &zeron_proto::BoardScope) -> Vec<String> {
+    let mut repositories: Vec<String> = scope
+        .repositories
+        .iter()
+        .map(|repository| repository.to_ascii_lowercase())
+        .collect();
+    repositories.sort();
+    repositories
+}
+
+/// The search string for a board, `None` when it exceeds GitHub's 256
+/// character limit.
+fn board_search(
+    repositories: &[String],
+    filter: zeron_proto::ChangeRequestFilter,
+) -> Option<String> {
+    let qualifier = match filter {
+        zeron_proto::ChangeRequestFilter::All => "",
+        zeron_proto::ChangeRequestFilter::Authored => "author:@me ",
+        zeron_proto::ChangeRequestFilter::Reviewing => "review-requested:@me ",
+    };
+    let repos: String = repositories
+        .iter()
+        .map(|repository| format!("repo:{repository} "))
+        .collect();
+    let search = format!("is:pr is:open {qualifier}{repos}sort:updated-desc");
+    (search.len() <= 256).then_some(search)
+}
+
 type PrResult = Result<serde_json::Value, ChangeRequestError>;
 type PrFetch = futures::future::Shared<futures::future::BoxFuture<'static, PrResult>>;
 
@@ -879,20 +918,29 @@ impl GitHubCli {
         login
     }
 
-    /// One page of open pull requests, 50 at a time, newest updates first.
+    /// One page of open pull requests across the scope's repositories, 50 at a
+    /// time, newest updates first.
     ///
     /// `cached` asks for the first page's on-disk copy, whatever its age, so
     /// the board can show it at once and refresh behind it; without one it
     /// reads GitHub as usual. Every first page read from GitHub is stored.
     pub async fn list_page(
         &self,
-        repository: &str,
+        scope: &zeron_proto::BoardScope,
         filter: zeron_proto::ChangeRequestFilter,
         after: Option<&str>,
         refresh: bool,
         cached: bool,
     ) -> Result<zeron_proto::ChangeRequestPage, ChangeRequestError> {
-        if !valid_pr_repository(repository) {
+        if !valid_board_scope(scope) {
+            return Err(ChangeRequestError::UnsupportedRepository);
+        }
+        let host = scope.host.to_ascii_lowercase();
+        if !self.known_hosts().await.contains(&host) {
+            return Err(ChangeRequestError::UnsupportedRepository);
+        }
+        let repositories = sorted_repositories(scope);
+        if board_search(&repositories, filter).is_none() {
             return Err(ChangeRequestError::UnsupportedRepository);
         }
         if after.is_some_and(|cursor| !valid_page_cursor(cursor)) {
@@ -901,40 +949,51 @@ impl GitHubCli {
         let first_page = after.is_none();
         let stored = match &self.store {
             Some(store) if first_page => self
-                .store_account("github.com")
+                .store_account(&host)
                 .await
                 .map(|account| (store.clone(), account)),
             _ => None,
         };
+        let stored_repository = repositories.join(",");
         if cached
             && !refresh
             && let Some((store, account)) = &stored
-            && let Some(page) = store.load(account, repository, filter).await
+            && let Some(page) = store.load(account, &stored_repository, filter).await
         {
             return Ok(page);
         }
-        let page = self.fetch_list_page(repository, filter, after, refresh).await?;
+        let page = self
+            .fetch_list_page(scope, &host, repositories, filter, after, refresh)
+            .await?;
         if let Some((store, account)) = stored {
-            store.save(&account, repository, filter, &page).await;
+            store
+                .save(&account, &stored_repository, filter, &page)
+                .await;
         }
         Ok(page)
     }
 
     async fn fetch_list_page(
         &self,
-        repository: &str,
+        scope: &zeron_proto::BoardScope,
+        host: &str,
+        repositories: Vec<String>,
         filter: zeron_proto::ChangeRequestFilter,
         after: Option<&str>,
         refresh: bool,
     ) -> Result<zeron_proto::ChangeRequestPage, ChangeRequestError> {
-        let repository = repository.to_ascii_lowercase();
-        let key = format!("list:{repository}:{filter:?}:{}", after.unwrap_or_default());
+        let key = format!(
+            "list:{}:{filter:?}:{}",
+            scope.key(),
+            after.unwrap_or_default()
+        );
         let github = self.clone();
+        let host = host.to_owned();
         let after = after.map(str::to_owned);
         let result = self
             .cached_pr_request(key, refresh, async move {
                 let page = github
-                    .fetch_filtered_page(&repository, filter, after.as_deref())
+                    .fetch_filtered_page(&host, &repositories, filter, after.as_deref())
                     .await?;
                 serde_json::to_value(page).map_err(|_| ChangeRequestError::Decode)
             })
@@ -944,13 +1003,17 @@ impl GitHubCli {
 
     async fn fetch_filtered_page(
         &self,
-        repository: &str,
+        host: &str,
+        repositories: &[String],
         filter: zeron_proto::ChangeRequestFilter,
         after: Option<&str>,
     ) -> Result<zeron_proto::ChangeRequestPage, ChangeRequestError> {
-        let (page, canonical) = self.fetch_scoped_search(repository, filter, after).await?;
+        let (page, canonical) = self
+            .fetch_scoped_search(host, repositories, filter, after)
+            .await?;
         if after.is_none()
             && page.items.is_empty()
+            && let [repository] = repositories
             && let Some(canonical) = canonical
             && !canonical.eq_ignore_ascii_case(repository)
         {
@@ -958,7 +1021,7 @@ impl GitHubCli {
             // does. Follow only that verified canonical name, at most once.
             // Clients adopt the canonical name, so later pages query it directly.
             return self
-                .fetch_scoped_search(&canonical, filter, None)
+                .fetch_scoped_search(host, &[canonical.to_ascii_lowercase()], filter, None)
                 .await
                 .map(|result| result.0);
         }
@@ -967,18 +1030,17 @@ impl GitHubCli {
 
     async fn fetch_scoped_search(
         &self,
-        repository: &str,
+        host: &str,
+        repositories: &[String],
         filter: zeron_proto::ChangeRequestFilter,
         after: Option<&str>,
     ) -> Result<(zeron_proto::ChangeRequestPage, Option<String>), ChangeRequestError> {
-        let (owner, name) = repository
-            .split_once('/')
+        let search =
+            board_search(repositories, filter).ok_or(ChangeRequestError::UnsupportedRepository)?;
+        let (owner, name) = repositories
+            .first()
+            .and_then(|repository| repository.split_once('/'))
             .ok_or(ChangeRequestError::UnsupportedRepository)?;
-        let qualifier = match filter {
-            zeron_proto::ChangeRequestFilter::All => "",
-            zeron_proto::ChangeRequestFilter::Authored => "author:@me ",
-            zeron_proto::ChangeRequestFilter::Reviewing => "review-requested:@me ",
-        };
         let request = ProcessRequest {
             args: vec![
                 "api".into(),
@@ -990,7 +1052,7 @@ impl GitHubCli {
                 "-f".into(),
                 format!("name={name}"),
                 "-f".into(),
-                format!("search=is:pr is:open {qualifier}repo:{repository} sort:updated-desc"),
+                format!("search={search}"),
             ]
             .into_iter()
             .chain(
@@ -1000,7 +1062,7 @@ impl GitHubCli {
             )
             .collect(),
             stdin: None,
-            ..github_request("github.com")
+            ..github_request(host)
         };
         let output = self.runner.run(request).await.map_err(classify_run_error)?;
         let response = (!output.stdout_truncated)
@@ -3176,7 +3238,7 @@ mod tests {
         let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let page = github
             .list_page(
-                "acme/zeron",
+                &board("github.com", &["acme/zeron"]),
                 zeron_proto::ChangeRequestFilter::All,
                 None,
                 false,
@@ -3226,6 +3288,13 @@ mod tests {
         );
     }
 
+    fn board(host: &str, repositories: &[&str]) -> zeron_proto::BoardScope {
+        zeron_proto::BoardScope {
+            host: host.into(),
+            repositories: repositories.iter().map(|r| (*r).to_owned()).collect(),
+        }
+    }
+
     async fn authored(
         github: &GitHubCli,
         repository: &str,
@@ -3233,7 +3302,7 @@ mod tests {
     ) -> Result<Vec<ChangeRequestListItem>, ChangeRequestError> {
         github
             .list_page(
-                repository,
+                &board("github.com", &[repository]),
                 zeron_proto::ChangeRequestFilter::Authored,
                 None,
                 refresh,
@@ -3364,14 +3433,20 @@ mod tests {
         let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         let filter = zeron_proto::ChangeRequestFilter::All;
         let first = github
-            .list_page("acme/zeron", filter, None, false, false)
+            .list_page(
+                &board("github.com", &["acme/zeron"]),
+                filter,
+                None,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(first.next_cursor.as_deref(), Some("Y3Vyc29yOjUw"));
         assert_eq!(first.total_count, Some(120));
         let second = github
             .list_page(
-                "acme/zeron",
+                &board("github.com", &["acme/zeron"]),
                 filter,
                 first.next_cursor.as_deref(),
                 false,
@@ -3391,7 +3466,13 @@ mod tests {
         );
         assert_eq!(
             github
-                .list_page("acme/zeron", filter, Some("x repo:other/x"), false, false)
+                .list_page(
+                    &board("github.com", &["acme/zeron"]),
+                    filter,
+                    Some("x repo:other/x"),
+                    false,
+                    false
+                )
                 .await,
             Err(ChangeRequestError::Decode),
             "cursors cannot smuggle search qualifiers"
@@ -3426,7 +3507,13 @@ mod tests {
         let filter = zeron_proto::ChangeRequestFilter::All;
         // Nothing stored yet: a cached read goes to GitHub and stores it.
         let first = github
-            .list_page("acme/zeron", filter, None, false, true)
+            .list_page(
+                &board("github.com", &["acme/zeron"]),
+                filter,
+                None,
+                false,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(first.items[0].title, "first");
@@ -3440,7 +3527,13 @@ mod tests {
             (Instant::now(), Some("github.com:me".into())),
         );
         let stored = relaunched
-            .list_page("acme/zeron", filter, None, false, true)
+            .list_page(
+                &board("github.com", &["acme/zeron"]),
+                filter,
+                None,
+                false,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(stored.items[0].title, "first");
@@ -3451,12 +3544,24 @@ mod tests {
         );
         // Refresh always reaches GitHub and replaces the stored page.
         let refreshed = relaunched
-            .list_page("acme/zeron", filter, None, true, false)
+            .list_page(
+                &board("github.com", &["acme/zeron"]),
+                filter,
+                None,
+                true,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(refreshed.items[0].title, "refreshed");
         let stored = relaunched
-            .list_page("acme/zeron", filter, None, false, true)
+            .list_page(
+                &board("github.com", &["acme/zeron"]),
+                filter,
+                None,
+                false,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(stored.items[0].title, "refreshed");
@@ -3514,6 +3619,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn board_search_names_every_repository() {
+        let runner = FakeProcessRunner::with_responses([command_success(search_response(vec![]))]);
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["acme.ghe.com"]);
+        github
+            .list_page(
+                &board("acme.ghe.com", &["Infra/b", "infra/a"]),
+                zeron_proto::ChangeRequestFilter::Authored,
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].args.last().unwrap(),
+            "search=is:pr is:open author:@me repo:infra/a repo:infra/b sort:updated-desc"
+        );
+        assert!(
+            requests[0]
+                .env
+                .contains(&("GH_HOST".to_owned(), "acme.ghe.com".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn board_rejects_six_repositories_and_long_queries() {
+        let runner = FakeProcessRunner::with_responses([]);
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
+        let filter = zeron_proto::ChangeRequestFilter::Authored;
+        let six: Vec<String> = (0..6).map(|index| format!("a/r{index}")).collect();
+        let six: Vec<&str> = six.iter().map(String::as_str).collect();
+        assert_eq!(
+            github
+                .list_page(&board("github.com", &six), filter, None, false, false)
+                .await,
+            Err(ChangeRequestError::UnsupportedRepository)
+        );
+        let long: Vec<String> = (0..5)
+            .map(|index| format!("owner{index}/{}", "n".repeat(44)))
+            .collect();
+        let long: Vec<&str> = long.iter().map(String::as_str).collect();
+        assert_eq!(
+            github
+                .list_page(&board("github.com", &long), filter, None, false, false)
+                .await,
+            Err(ChangeRequestError::UnsupportedRepository)
+        );
+        assert!(runner.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn board_rejects_unknown_host() {
+        let runner = FakeProcessRunner::with_responses([]);
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
+        assert_eq!(
+            github
+                .list_page(
+                    &board("acme.ghe.com", &["a/b"]),
+                    zeron_proto::ChangeRequestFilter::All,
+                    None,
+                    false,
+                    false,
+                )
+                .await,
+            Err(ChangeRequestError::UnsupportedRepository)
+        );
+        assert!(runner.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scope_key_ignores_order_and_case() {
+        let runner = FakeProcessRunner::with_responses([command_success(search_response(vec![]))]);
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
+        let filter = zeron_proto::ChangeRequestFilter::All;
+        for repositories in [["b/x", "a/y"], ["A/Y", "b/x"]] {
+            github
+                .list_page(
+                    &board("github.com", &repositories),
+                    filter,
+                    None,
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(runner.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rename_follow_skipped_with_several_repositories() {
+        let response = serde_json::json!({"data": {
+            "repository": {"nameWithOwner": "acme/new-name"},
+            "search": {"nodes": []}
+        }});
+        let runner = FakeProcessRunner::with_responses([command_success(
+            serde_json::to_vec(&response).unwrap(),
+        )]);
+        let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
+        let page = github
+            .list_page(
+                &board("github.com", &["acme/old-name", "acme/other"]),
+                zeron_proto::ChangeRequestFilter::All,
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(runner.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_separates_same_repository_on_two_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeProcessRunner::with_responses([
+            command_success("me\n"),
+            command_success(search_response(vec![search_pull_request(
+                "a/b",
+                1,
+                "on github",
+                "OPEN",
+                "UNKNOWN",
+                "2026-08-10T09:30:00Z",
+                "2026-08-19T12:00:00Z",
+                false,
+                None,
+            )])),
+            command_success("me\n"),
+            command_success(search_response(vec![])),
+        ]);
+        let github = GitHubCli::with_runner(runner.clone())
+            .with_hosts(&["github.com", "acme.ghe.com"])
+            .with_store(dir.path());
+        let filter = zeron_proto::ChangeRequestFilter::All;
+        let saved = github
+            .list_page(&board("github.com", &["a/b"]), filter, None, false, true)
+            .await
+            .unwrap();
+        assert_eq!(saved.items.len(), 1);
+        let other = github
+            .list_page(&board("acme.ghe.com", &["a/b"]), filter, None, false, true)
+            .await
+            .unwrap();
+        assert!(other.items.is_empty());
+        let requests = runner.requests();
+        assert_eq!(
+            requests.len(),
+            4,
+            "the second host reached gh, not the store"
+        );
+        assert!(
+            requests[3]
+                .env
+                .contains(&("GH_HOST".to_owned(), "acme.ghe.com".to_owned()))
+        );
+    }
+
+    #[tokio::test]
     async fn pr_empty_canonical_search_does_not_retry() {
         let response = serde_json::json!({"data": {
             "repository": {"nameWithOwner": "acme/zeron"},
@@ -3534,12 +3801,24 @@ mod tests {
         let github = GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]);
         for (index, filter) in [All, Authored, Reviewing].into_iter().enumerate() {
             github
-                .list_page("acme/zeron", filter, None, false, false)
+                .list_page(
+                    &board("github.com", &["acme/zeron"]),
+                    filter,
+                    None,
+                    false,
+                    false,
+                )
                 .await
                 .unwrap();
             assert_eq!(runner.requests().len(), index + 1);
             github
-                .list_page("ACME/ZERON", filter, None, false, false)
+                .list_page(
+                    &board("github.com", &["ACME/ZERON"]),
+                    filter,
+                    None,
+                    false,
+                    false,
+                )
                 .await
                 .unwrap();
             assert_eq!(runner.requests().len(), index + 1);
@@ -3556,7 +3835,13 @@ mod tests {
             );
         }
         github
-            .list_page("acme/zeron", All, None, false, false)
+            .list_page(
+                &board("github.com", &["acme/zeron"]),
+                All,
+                None,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(runner.requests().len(), 3);
@@ -3728,13 +4013,13 @@ mod tests {
             cache
                 .entries
                 .iter()
-                .all(|entry| entry.0 != "list:a/repo-0:Authored:")
+                .all(|entry| entry.0 != "list:github.com:a/repo-0:Authored:")
         );
         assert!(
             cache
                 .entries
                 .iter()
-                .any(|entry| entry.0 == "list:a/repo-25:Authored:")
+                .any(|entry| entry.0 == "list:github.com:a/repo-25:Authored:")
         );
     }
 

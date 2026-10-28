@@ -6,8 +6,10 @@
 //! order, beside its total and cursor. A pull request seen through any query
 //! therefore reads the same everywhere: the newest copy wins, so refreshing
 //! one filter updates the others. Keyed by the `gh` account so switching
-//! accounts never shows another account's results. Local data only; the
-//! board's own refresh always reaches GitHub and writes back here.
+//! accounts never shows another account's results. The account is `host:login`
+//! and the repository is the board's sorted, lowercased set joined by commas.
+//! Local data only; the board's own refresh always reaches GitHub and writes
+//! back here.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
