@@ -1081,6 +1081,56 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn sidebar_view_menu_offers_projects_only_by_project(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let labels = |organization| {
+            sidebar_view_groups(organization)
+                .iter()
+                .map(|(label, _)| *label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(SidebarOrganization::ByProject),
+            ["Organize", "Projects", "Sort", "Filter", "Show"]
+        );
+        assert_eq!(
+            labels(SidebarOrganization::ByDevice),
+            ["Organize", "Sort", "Filter", "Show"]
+        );
+        assert_eq!(SIDEBAR_VIEW_ROWS.len(), 20);
+        for organization in [
+            SidebarOrganization::ByProject,
+            SidebarOrganization::ByDevice,
+            SidebarOrganization::InOneList,
+        ] {
+            assert!(
+                sidebar_view_groups(organization)
+                    .iter()
+                    .all(|(_, range)| range.end <= SIDEBAR_VIEW_ROWS.len())
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.activate_sidebar_view_row(SidebarViewRow::FilterNeedsMe, cx);
+                shell.activate_sidebar_view_row(SidebarViewRow::SortStatus, cx);
+                shell.activate_sidebar_view_row(SidebarViewRow::ProjectsManual, cx);
+                assert_eq!(
+                    shell.settings.sidebar_status_filter,
+                    SidebarStatusFilter::NeedsMe
+                );
+                assert_eq!(shell.settings.sidebar_sort, SidebarSort::Status);
+                assert_eq!(
+                    shell.settings.sidebar_project_order,
+                    SidebarProjectOrder::Manual
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     fn sidebar_projects_sharing_a_repository_group_only_by_project(cx: &mut gpui::TestAppContext) {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
@@ -2310,8 +2360,16 @@ enum SidebarViewRow {
     ShowProjectLabel,
     ByDevice,
     InOneList,
+    ProjectsManual,
+    ProjectsRecent,
+    ProjectsName,
     LastUpdated,
     Created,
+    SortName,
+    SortStatus,
+    FilterAll,
+    FilterActive,
+    FilterNeedsMe,
     ShowBranch,
     ShowPullRequest,
     ShowHarness,
@@ -2323,22 +2381,58 @@ impl SidebarViewRow {
     /// Radio choices dismiss their submenu after selection. Show toggles
     /// stay open for batch changes.
     fn closes_submenu(self) -> bool {
-        matches!(
+        !matches!(
             self,
-            Self::ByProject | Self::ByDevice | Self::InOneList | Self::LastUpdated | Self::Created
+            Self::Compact
+                | Self::ShowProjectIcon
+                | Self::ShowProjectLabel
+                | Self::ShowBranch
+                | Self::ShowPullRequest
+                | Self::ShowHarness
+                | Self::ShowProjectFilter
+                | Self::ShowArchived
         )
     }
 }
 
-const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
-    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..12)];
+/// The view menu's groups as (label, range of [`SIDEBAR_VIEW_ROWS`]).
+/// Projects orders project groups, so it shows only when grouping by project.
+fn sidebar_view_groups(
+    organization: SidebarOrganization,
+) -> &'static [(&'static str, std::ops::Range<usize>)] {
+    const BY_PROJECT: [(&str, std::ops::Range<usize>); 5] = [
+        ("Organize", 0..3),
+        ("Projects", 3..6),
+        ("Sort", 6..10),
+        ("Filter", 10..13),
+        ("Show", 13..20),
+    ];
+    if organization == SidebarOrganization::ByProject {
+        &BY_PROJECT
+    } else {
+        &[
+            ("Organize", 0..3),
+            ("Sort", 6..10),
+            ("Filter", 10..13),
+            ("Show", 13..20),
+        ]
+    }
+}
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 12] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 20] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
+    SidebarViewRow::ProjectsManual,
+    SidebarViewRow::ProjectsRecent,
+    SidebarViewRow::ProjectsName,
     SidebarViewRow::LastUpdated,
     SidebarViewRow::Created,
+    SidebarViewRow::SortName,
+    SidebarViewRow::SortStatus,
+    SidebarViewRow::FilterAll,
+    SidebarViewRow::FilterActive,
+    SidebarViewRow::FilterNeedsMe,
     SidebarViewRow::ShowBranch,
     SidebarViewRow::ShowPullRequest,
     SidebarViewRow::ShowHarness,
@@ -4150,6 +4244,7 @@ impl Shell {
         }
         self.cancel_sidebar_session_transfer(cx);
         self.cancel_pinned_session_drag(cx);
+        self.cancel_sidebar_section_drag(cx);
         match row {
             SidebarViewRow::ByProject => {
                 self.settings.sidebar_organization = SidebarOrganization::ByProject
@@ -4171,6 +4266,26 @@ impl Shell {
             }
             SidebarViewRow::LastUpdated => self.settings.sidebar_sort = SidebarSort::LastUpdated,
             SidebarViewRow::Created => self.settings.sidebar_sort = SidebarSort::Created,
+            SidebarViewRow::SortName => self.settings.sidebar_sort = SidebarSort::Name,
+            SidebarViewRow::SortStatus => self.settings.sidebar_sort = SidebarSort::Status,
+            SidebarViewRow::ProjectsManual => {
+                self.settings.sidebar_project_order = SidebarProjectOrder::Manual
+            }
+            SidebarViewRow::ProjectsRecent => {
+                self.settings.sidebar_project_order = SidebarProjectOrder::Recent
+            }
+            SidebarViewRow::ProjectsName => {
+                self.settings.sidebar_project_order = SidebarProjectOrder::Name
+            }
+            SidebarViewRow::FilterAll => {
+                self.settings.sidebar_status_filter = SidebarStatusFilter::All
+            }
+            SidebarViewRow::FilterActive => {
+                self.settings.sidebar_status_filter = SidebarStatusFilter::Active
+            }
+            SidebarViewRow::FilterNeedsMe => {
+                self.settings.sidebar_status_filter = SidebarStatusFilter::NeedsMe
+            }
             SidebarViewRow::ShowBranch => {
                 self.settings.sidebar_show_branch = !self.settings.sidebar_show_branch
             }
@@ -4209,10 +4324,11 @@ impl Shell {
     }
 
     fn open_sidebar_view_submenu(&mut self, group: usize, keyboard: bool, cx: &mut Context<Self>) {
+        let groups = sidebar_view_groups(self.settings.sidebar_organization).len();
         if let Some(menu) = self.sidebar_view_menu.open_mut() {
             menu.hover_intent.reset();
             menu.active = Some(group);
-            menu.submenu = (group < SIDEBAR_VIEW_GROUPS.len()).then_some(group);
+            menu.submenu = (group < groups).then_some(group);
             menu.submenu_active = keyboard.then_some(0);
             menu.submenu_bounds = None;
             cx.notify();
@@ -4271,6 +4387,7 @@ impl Shell {
     }
 
     fn sidebar_view_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        let groups = sidebar_view_groups(self.settings.sidebar_organization);
         let Some(menu) = self.sidebar_view_menu.open_mut() else {
             return;
         };
@@ -4297,14 +4414,10 @@ impl Shell {
             "up" | "down" => {
                 let delta = if key == "up" { -1 } else { 1 };
                 if let Some(group) = menu.submenu {
-                    menu.submenu_active = popover::menu_step(
-                        menu.submenu_active,
-                        SIDEBAR_VIEW_GROUPS[group].1.len(),
-                        delta,
-                    );
+                    menu.submenu_active =
+                        popover::menu_step(menu.submenu_active, groups[group].1.len(), delta);
                 } else {
-                    menu.active =
-                        popover::menu_step(menu.active, SIDEBAR_VIEW_GROUPS.len() + 2, delta);
+                    menu.active = popover::menu_step(menu.active, groups.len() + 2, delta);
                 }
                 cx.notify();
             }
@@ -4312,18 +4425,17 @@ impl Shell {
                 if let Some(group) = menu.submenu {
                     if key == "enter" {
                         if let Some(choice) = menu.submenu_active {
-                            let row =
-                                SIDEBAR_VIEW_ROWS[SIDEBAR_VIEW_GROUPS[group].1.start + choice];
+                            let row = SIDEBAR_VIEW_ROWS[groups[group].1.start + choice];
                             self.activate_sidebar_view_row(row, cx);
                         }
                     }
                 } else {
                     let group = menu.active.unwrap_or(0);
-                    if group == SIDEBAR_VIEW_GROUPS.len() + 1 {
+                    if group == groups.len() + 1 {
                         if key != "right" && !event.is_held {
                             self.open_section_dialog(None, cx);
                         }
-                    } else if group == SIDEBAR_VIEW_GROUPS.len() {
+                    } else if group == groups.len() {
                         if key != "right" && !event.is_held {
                             self.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
                         }
@@ -4349,6 +4461,9 @@ impl Shell {
         let focus = menu_state.focus.clone();
         let organization = self.settings.sidebar_organization;
         let sort = self.settings.sidebar_sort;
+        let projects = self.settings.sidebar_project_order;
+        let filter = self.settings.sidebar_status_filter;
+        let view_groups = sidebar_view_groups(organization);
         let show_harness = self.settings.sidebar_show_harness;
         let show_branch = self.settings.sidebar_show_branch;
         let show_pr = self.settings.sidebar_show_pull_request;
@@ -4357,8 +4472,16 @@ impl Shell {
             "By device",
             "By project",
             "None",
+            "Manual",
+            "Recent",
+            "A–Z",
             "Last updated",
             "Created",
+            "Name",
+            "Status",
+            "All",
+            "Active",
+            "Needs me",
             "Branch",
             "Pull request",
             "Harness",
@@ -4371,8 +4494,16 @@ impl Shell {
             icons::LAPTOP,
             icons::FOLDER,
             icons::LIST,
+            icons::DRAG_HANDLE,
+            icons::CLOCK_CIRCLE,
+            icons::SORT_VERTICAL,
             icons::CLOCK_CIRCLE,
             icons::CALENDAR,
+            icons::SORT,
+            icons::CHECKLIST,
+            icons::LIST,
+            icons::ACTION_PLAY,
+            icons::BELL,
             icons::GIT_BRANCH,
             icons::PULL_REQUEST,
             icons::BOT,
@@ -4386,8 +4517,16 @@ impl Shell {
             organization == SidebarOrganization::ByDevice,
             organization == SidebarOrganization::ByProject,
             organization == SidebarOrganization::InOneList,
+            projects == SidebarProjectOrder::Manual,
+            projects == SidebarProjectOrder::Recent,
+            projects == SidebarProjectOrder::Name,
             sort == SidebarSort::LastUpdated,
             sort == SidebarSort::Created,
+            sort == SidebarSort::Name,
+            sort == SidebarSort::Status,
+            filter == SidebarStatusFilter::All,
+            filter == SidebarStatusFilter::Active,
+            filter == SidebarStatusFilter::NeedsMe,
             show_branch,
             show_pr,
             show_harness,
@@ -4396,13 +4535,19 @@ impl Shell {
             self.settings.sidebar_show_project_filter,
             self.settings.sidebar_show_archived,
         ];
-        let values = [
-            labels[selected[..3].iter().position(|v| *v).unwrap_or(0)].to_string(),
-            labels[3 + selected[3..5].iter().position(|v| *v).unwrap_or(0)].to_string(),
-        ];
+        // A radio group's trigger names its current choice; Show's toggles don't.
+        let values: Vec<Option<&str>> = view_groups
+            .iter()
+            .map(|(label, range)| {
+                (*label != "Show").then(|| {
+                    labels
+                        [range.start + selected[range.clone()].iter().position(|v| *v).unwrap_or(0)]
+                })
+            })
+            .collect();
         let mut groups: Vec<AnyElement> = Vec::new();
-        for (group, (label, range)) in SIDEBAR_VIEW_GROUPS.iter().enumerate() {
-            if group == 2 {
+        for (group, (label, range)) in view_groups.iter().enumerate() {
+            if *label == "Show" {
                 groups.push(popover::menu_separator().into_any_element());
             }
             let open = submenu == Some(group);
@@ -4432,12 +4577,8 @@ impl Shell {
                 cx.stop_propagation();
             }))
             .child(div().flex_1().child(*label))
-            .when(group < values.len(), |el| {
-                el.child(
-                    div()
-                        .text_color(theme.text_muted)
-                        .child(values[group].clone()),
-                )
+            .when_some(values[group], |el, value| {
+                el.child(div().text_color(theme.text_muted).child(value))
             })
             .child(
                 icon(icons::ALT_ARROW_RIGHT)
@@ -4584,35 +4725,30 @@ impl Shell {
                 .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
                     if *hovered {
                         this.hover_sidebar_view_group(
-                            SIDEBAR_VIEW_GROUPS.len(),
+                            view_groups.len(),
                             window.mouse_position(),
                             false,
                             cx,
                         );
                     } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
-                        menu.hover_intent.leave(&SIDEBAR_VIEW_GROUPS.len());
+                        menu.hover_intent.leave(&view_groups.len());
                     }
                 }))
                 .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                    this.hover_sidebar_view_group(
-                        SIDEBAR_VIEW_GROUPS.len(),
-                        event.position,
-                        true,
-                        cx,
-                    );
+                    this.hover_sidebar_view_group(view_groups.len(), event.position, true, cx);
                 }))
                 .child(
                     popover::menu_row_nav(
                         theme,
                         false,
-                        active == Some(SIDEBAR_VIEW_GROUPS.len()),
+                        active == Some(view_groups.len()),
                         "sidebar-view-compact",
                     )
                     .id("sidebar-view-compact")
                     .h(px(30.0))
                     .py(px(0.0))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_sidebar_view_submenu(SIDEBAR_VIEW_GROUPS.len(), false, cx);
+                        this.open_sidebar_view_submenu(view_groups.len(), false, cx);
                         this.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
                         cx.stop_propagation();
                     }))
@@ -4630,7 +4766,7 @@ impl Shell {
             div()
                 .id("sidebar-create-section-hover")
                 .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                    let target = SIDEBAR_VIEW_GROUPS.len() + 1;
+                    let target = view_groups.len() + 1;
                     if *hovered {
                         this.hover_sidebar_view_group(target, window.mouse_position(), false, cx);
                     } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
@@ -4638,18 +4774,13 @@ impl Shell {
                     }
                 }))
                 .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                    this.hover_sidebar_view_group(
-                        SIDEBAR_VIEW_GROUPS.len() + 1,
-                        event.position,
-                        true,
-                        cx,
-                    );
+                    this.hover_sidebar_view_group(view_groups.len() + 1, event.position, true, cx);
                 }))
                 .child(
                     popover::menu_row_nav(
                         theme,
                         false,
-                        active == Some(SIDEBAR_VIEW_GROUPS.len() + 1),
+                        active == Some(view_groups.len() + 1),
                         "sidebar-create-section",
                     )
                     .id("sidebar-create-section")
