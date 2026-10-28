@@ -1124,6 +1124,35 @@ pub struct ChangeRequestListItem {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A repository on one provider host, such as `acme.ghe.com` and `octo/app`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryRef {
+    pub host: String,
+    pub repository: String,
+}
+
+/// The repositories of one host that a pull request board lists together.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardScope {
+    pub host: String,
+    pub repositories: Vec<String>,
+}
+
+impl BoardScope {
+    /// Stable identity of the scope, independent of repository order and case.
+    pub fn key(&self) -> String {
+        let mut repositories: Vec<String> = self
+            .repositories
+            .iter()
+            .map(|repository| repository.to_lowercase())
+            .collect();
+        repositories.sort();
+        format!("{}:{}", self.host.to_lowercase(), repositories.join(","))
+    }
+}
+
 /// One page of a repository-scoped listing, newest updates first.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -1722,6 +1751,15 @@ mod tests {
                 status
             );
         }
+    }
+
+    #[test]
+    fn board_scope_key_is_order_and_case_insensitive() {
+        let scope = BoardScope {
+            host: "GHE.example".into(),
+            repositories: vec!["B/x".into(), "a/y".into()],
+        };
+        assert_eq!(scope.key(), "ghe.example:a/y,b/x");
     }
 
     #[test]
