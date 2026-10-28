@@ -10,15 +10,15 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use zeron_doc::{
-    MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
+    CompactionStatus, MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus,
 };
 use zeron_engine::{EngineCore, EngineRpc, HarnessRegistry, RunJournal};
 use zeron_harness::mock::MockHarness;
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, CompactionPhase, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
+    SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use zeron_sync::DocsStore;
 
@@ -2932,6 +2932,264 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
         entries(&core).len(),
         2,
         "usage does not create transcript rows"
+    );
+}
+
+fn compaction_parts_now(core: &EngineCore) -> Vec<MessagePart> {
+    entries_now(core)
+        .into_iter()
+        .flat_map(|entry| entry.parts)
+        .filter(|part| matches!(part, MessagePart::Compaction { .. }))
+        .collect()
+}
+
+fn compaction_part(core: &EngineCore) -> MessagePart {
+    let mut parts: Vec<MessagePart> = entries(core)
+        .into_iter()
+        .flat_map(|entry| entry.parts)
+        .filter(|part| matches!(part, MessagePart::Compaction { .. }))
+        .collect();
+    assert_eq!(parts.len(), 1, "one compaction part expected: {parts:?}");
+    parts.remove(0)
+}
+
+fn compaction_settled(core: &EngineCore) -> bool {
+    compaction_parts_now(core).iter().any(|part| {
+        matches!(
+            part,
+            MessagePart::Compaction {
+                tokens_after: Some(_),
+                ..
+            }
+        )
+    })
+}
+
+fn context_script_harness(script: Vec<AgentEvent>) -> Arc<ScriptedHarness> {
+    Arc::new(ScriptedHarness {
+        script,
+        step_delay: Duration::from_millis(20),
+        hang_until_interrupt: false,
+    })
+}
+
+fn context_reading(tokens: u64, window: Option<u64>) -> AgentEvent {
+    AgentEvent::ContextUsage {
+        tokens: Some(tokens),
+        window,
+    }
+}
+
+fn compaction_event(phase: CompactionPhase) -> AgentEvent {
+    AgentEvent::Compaction {
+        phase,
+        tokens_before: None,
+        tokens_after: None,
+    }
+}
+
+#[tokio::test]
+async fn compaction_after_comes_from_the_reading_inside_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        context_script_harness(vec![
+            context_reading(224_000, Some(1_000_000)),
+            compaction_event(CompactionPhase::Started),
+            compaction_event(CompactionPhase::Finished),
+            context_reading(31_000, None),
+            AgentEvent::TextDelta { text: "ok".into() },
+            done(DoneStatus::Completed),
+        ]),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "compact-in-turn",
+        SessionCommandPayload::Run {
+            request: run_request("compact"),
+            message_id: "compact-in-turn-user".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "the turn to complete",
+    )
+    .await;
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "the session to settle idle",
+    )
+    .await;
+    assert_eq!(
+        compaction_part(&core),
+        MessagePart::Compaction {
+            id: "c0".into(),
+            status: CompactionStatus::Done,
+            tokens_before: Some(224_000),
+            tokens_after: Some(31_000),
+        }
+    );
+}
+
+#[tokio::test]
+async fn compaction_after_inside_an_open_turn_reaches_the_doc_before_the_turn_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                compaction_event(CompactionPhase::Finished),
+                context_reading(31_000, Some(1_000_000)),
+            ],
+            step_delay: Duration::from_millis(250),
+            hang_until_interrupt: true,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "compact-open-turn",
+        SessionCommandPayload::Run {
+            request: run_request("compact"),
+            message_id: "compact-open-turn-user".into(),
+        },
+    );
+    wait_for(
+        || compaction_settled(&core),
+        "the compaction to take its after",
+    )
+    .await;
+    assert_eq!(
+        compaction_part(&core),
+        MessagePart::Compaction {
+            id: "c0".into(),
+            status: CompactionStatus::Done,
+            tokens_before: None,
+            tokens_after: Some(31_000),
+        }
+    );
+    assert!(
+        entries(&core)
+            .iter()
+            .any(|e| e.status == Some(MessageStatus::Streaming)),
+        "the turn is still open"
+    );
+    core.sessions.interrupt(CHAT).await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_after_comes_from_a_reading_after_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        context_script_harness(vec![
+            context_reading(224_000, Some(1_000_000)),
+            compaction_event(CompactionPhase::Finished),
+            done(DoneStatus::Completed),
+            context_reading(31_000, None),
+        ]),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "compact-after-turn",
+        SessionCommandPayload::Run {
+            request: run_request("compact"),
+            message_id: "compact-after-turn-user".into(),
+        },
+    );
+    wait_for(
+        || {
+            handle
+                .doc()
+                .context_usage()
+                .is_some_and(|u| u.tokens == Some(31_000))
+        },
+        "post-turn context reading",
+    )
+    .await;
+    wait_for(
+        || compaction_settled(&core),
+        "the compaction to take its after",
+    )
+    .await;
+    assert_eq!(
+        compaction_part(&core),
+        MessagePart::Compaction {
+            id: "c0".into(),
+            status: CompactionStatus::Done,
+            tokens_before: Some(224_000),
+            tokens_after: Some(31_000),
+        }
+    );
+}
+
+#[tokio::test]
+async fn compaction_after_waits_for_the_next_run_and_takes_only_its_first_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        context_script_harness(vec![
+            context_reading(31_000, Some(1_000_000)),
+            context_reading(40_000, None),
+            AgentEvent::TextDelta {
+                text: "next".into(),
+            },
+            done(DoneStatus::Completed),
+        ]),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle
+        .doc()
+        .push_message(&SessionMessageEntry {
+            id: "compact-reply".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Done,
+                tokens_before: Some(224_463),
+                tokens_after: None,
+            }],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "compact-next-run",
+        SessionCommandPayload::Run {
+            request: run_request("keep going"),
+            message_id: "compact-next-run-user".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.status == Some(MessageStatus::Complete)
+                    && e.parts
+                        .iter()
+                        .any(|p| matches!(p, MessagePart::Text { text, .. } if text == "next"))
+            })
+        },
+        "the next run to complete",
+    )
+    .await;
+    assert_eq!(
+        compaction_part(&core),
+        MessagePart::Compaction {
+            id: "c0".into(),
+            status: CompactionStatus::Done,
+            tokens_before: Some(224_463),
+            tokens_after: Some(31_000),
+        }
     );
 }
 
