@@ -357,6 +357,30 @@ fn program_activity_and_native_outcome_survive_replication_and_restart() {
     assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
 }
 
+#[test]
+fn background_tasks_ride_the_session_row_to_other_devices() {
+    let mut host = RegistryDoc::new("host");
+    let mut viewer = RegistryDoc::new("viewer");
+    let mut row = session("chat", "host", SessionStatus::Working);
+    row.background_tasks = vec![zeron_proto::BackgroundTask {
+        id: "b1".into(),
+        kind: zeron_proto::BackgroundTaskKind::Shell,
+        description: "watch ci".into(),
+        started_at: ts(3_200),
+    }];
+    host.upsert_session(&row).unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row.clone()]);
+    let restored = RegistryDoc::from_bytes(&viewer.to_bytes().unwrap(), "viewer").unwrap();
+    assert_eq!(restored.read_sessions().unwrap(), vec![row.clone()]);
+    row.background_tasks.clear();
+    host.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
+}
+
 /// Stand-in for the server: applies every pushable batch from `docs` to a row
 /// table with the SAME merge fn, acks, and broadcasts merged rows to all.
 fn server_round(

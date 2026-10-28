@@ -498,6 +498,14 @@ impl WorkspaceDoc {
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         row.insert("runningSubagents", i64::from(session.running_subagents))?;
+        if session.background_tasks.is_empty() {
+            row.delete("backgroundTasks")?;
+        } else {
+            row.insert(
+                "backgroundTasks",
+                LoroValue::from(serde_json::to_value(&session.background_tasks)?),
+            )?;
+        }
         match session.last_turn_outcome {
             Some(outcome) => row.insert(
                 "lastTurnOutcome",
@@ -1050,6 +1058,19 @@ mod tests {
         // The running-subagent count rides the row and survives the round trip.
         let mut busy = session("chat-1", "dev-a", SessionStatus::Working);
         busy.running_subagents = 4;
+        ws.upsert_session(&busy).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![busy.clone()]);
+
+        // So does the background-task set, and clearing it clears the row.
+        busy.background_tasks = vec![zeron_proto::BackgroundTask {
+            id: "b1".into(),
+            kind: zeron_proto::BackgroundTaskKind::Shell,
+            description: "watch ci".into(),
+            started_at: ts(2_500),
+        }];
+        ws.upsert_session(&busy).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![busy.clone()]);
+        busy.background_tasks.clear();
         ws.upsert_session(&busy).unwrap();
         assert_eq!(ws.read_sessions().unwrap(), vec![busy]);
         ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))

@@ -1548,6 +1548,7 @@ impl RegistryDoc {
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
             ("runningSubagents", json!(session.running_subagents)),
+            ("backgroundTasks", json!(session.background_tasks)),
         ]);
         self.write(KIND_SESSIONS, &session.chat_id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -1736,6 +1737,7 @@ impl RegistryDoc {
                     ("startedAt", opt_ms(session.started_at)),
                     ("updatedAt", json!(session.updated_at.timestamp_millis())),
                     ("runningSubagents", json!(session.running_subagents)),
+                    ("backgroundTasks", json!(session.background_tasks)),
                 ]),
             );
         }
