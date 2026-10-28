@@ -53,9 +53,9 @@ use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, FILES_PANEL_MIN, JUMP_SLOTS, KeymapConfig,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
-    SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT, TERMINAL_MAX_VH,
-    TERMINAL_MIN_HEIGHT, UiSettings, badge_combo, jump_hints_visible, modifier_send_hint_visible,
-    platform_combo, sidebar_pin_profile_key,
+    SidebarOrganization, SidebarProjectOrder, SidebarSort, SidebarStatusFilter,
+    TERMINAL_DEFAULT_HEIGHT, TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT, UiSettings, badge_combo,
+    jump_hints_visible, modifier_send_hint_visible, platform_combo, sidebar_pin_profile_key,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -94,6 +94,7 @@ mod session_info;
 mod session_lanes;
 mod settings_search;
 mod side_chats;
+mod sidebar_order;
 mod sidebar_pins;
 mod sidebar_sections;
 mod search_warm;
@@ -1372,9 +1373,19 @@ struct PinnedSessionDragState {
     autoscroll_active: bool,
 }
 
-/// Drag payload for reordering custom sections by their header.
+/// What a header drag reorders: custom sections, or project groups (whose
+/// `section_id`/`ids` are project keys, saved to `space_order`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarSectionDragKind {
+    Custom,
+    Project,
+}
+
+/// Drag payload for reordering custom sections or project groups by their
+/// header.
 #[derive(Clone)]
 struct SidebarSectionDrag {
+    kind: SidebarSectionDragKind,
     section_id: String,
     profile_key: String,
     /// The section order the drag started from.
@@ -2311,6 +2322,8 @@ pub struct Shell {
     sidebar_section_drag: Option<SidebarSectionDragState>,
     /// Each custom section's painted bounds, measured every frame.
     sidebar_section_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<Pixels>>>>,
+    /// Each regular group's painted bounds, for the project-group reorder.
+    sidebar_project_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<Pixels>>>>,
     /// Painted height of the Orchestrators section stacked above Pinned.
     orchestrators_height: std::rc::Rc<std::cell::Cell<f32>>,
     /// Pending pin intents are scoped to the active profile and engine attachment.
@@ -2863,6 +2876,7 @@ impl Shell {
             sidebar_session_return: None,
             sidebar_section_drag: None,
             sidebar_section_bounds: Default::default(),
+            sidebar_project_bounds: Default::default(),
             orchestrators_height: Default::default(),
             sidebar_pin_write: None,
             sidebar_pin_write_generation: 0,
@@ -9980,14 +9994,26 @@ impl Shell {
                     .is_none_or(|drag| drag.preview.as_ref().is_none_or(|gap| gap.pinned))
             })
             .map(|drag| (drag.from, drag.over, drag.prev_over, drag.epoch));
-        // A lifted custom section leaves an empty slot behind and paints in
-        // the list's movement layer; its siblings slide around the gap.
+        // A lifted custom section or project group leaves an empty slot
+        // behind and paints in the list's movement layer; its siblings slide
+        // around the gap.
+        let (section_start, section_count) = match self
+            .sidebar_section_drag
+            .as_ref()
+            .map(|drag| drag.payload.kind)
+        {
+            Some(SidebarSectionDragKind::Project) => (
+                pinned_count + custom_count,
+                keyed.len().saturating_sub(pinned_count + custom_count),
+            ),
+            _ => (pinned_count, custom_count),
+        };
         let section_offsets = self
             .sidebar_section_drag_offsets()
-            .filter(|(_, offsets)| offsets.len() == custom_count);
+            .filter(|(_, offsets)| offsets.len() == section_count);
         let lifted_section = section_offsets.as_ref().and_then(|(from, _)| {
             let height = self.sidebar_section_drag.as_ref()?.heights[*from];
-            let (_, _, slot) = keyed.get_mut(pinned_count + from)?;
+            let (_, _, slot) = keyed.get_mut(section_start + from)?;
             let placeholder = div().flex_none().h(px(height)).into_any_element();
             let section = std::mem::replace(slot, placeholder);
             self.render_lifted_sidebar_section(section, theme)
@@ -9998,7 +10024,7 @@ impl Shell {
             .map(|(ix, (key, _, element))| {
                 if let Some((_, offsets)) = &section_offsets
                     && let Some(offset) =
-                        ix.checked_sub(pinned_count).and_then(|ix| offsets.get(ix))
+                        ix.checked_sub(section_start).and_then(|ix| offsets.get(ix))
                 {
                     return div()
                         .relative()
@@ -10085,6 +10111,7 @@ impl Shell {
             let pinned_group = show_pinned_section
                 .then(|| self.render_pinned_section(pinned_items, pinned_body_height, theme, cx));
             let section_bounds = self.sidebar_section_bounds.clone();
+            let project_bounds = self.sidebar_project_bounds.clone();
             div()
                 .id("sidebar-active-sessions")
                 .flex()
@@ -10112,6 +10139,10 @@ impl Shell {
                         el.child(
                             self.render_sessions_section(
                                 div()
+                                    // Each group's painted slot measures the project reorder.
+                                    .on_children_prepainted(move |bounds, _, _| {
+                                        *project_bounds.borrow_mut() = bounds;
+                                    })
                                     .id("sidebar-regular-sessions")
                                     .debug_selector(|| "sidebar-regular-sessions".into())
                                     .on_drag_move::<SidebarSessionDrag>(cx.listener(

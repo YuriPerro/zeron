@@ -8,6 +8,7 @@
 //! management (add via the palette; rename/delete via row context menus).
 //! Child module of `shell` so it renders straight off `Shell`'s private state.
 
+use super::sidebar_order::compare_sidebar_chats;
 use super::*;
 use crate::pickers::{
     breadcrumbs, browser_rows, completion_prefix_len, escape_typed_path, folder_path_key,
@@ -927,6 +928,223 @@ mod pinned_session_tests {
                 );
                 shell.settings.space_filter = Some("a".into());
                 assert_eq!(shell.sidebar_visible_order(cx), ids(&["pin", "a-new"]));
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Projects a and b; "pin" (a) is pinned, then b-new, a-new, b-old from
+    /// newest to oldest. Returns the project keys of a and b.
+    fn project_order_fixture(
+        shell: &mut super::Shell,
+        cx: &mut gpui::Context<super::Shell>,
+    ) -> (String, String) {
+        use super::*;
+        shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+        shell
+            .settings
+            .sidebar_pins_mut("local".into())
+            .push("pin".into());
+        shell.state.update(cx, |state, _| {
+            state.workspace_scope = Some(WorkspaceScope::Local);
+            state.spaces = ["a", "b"].into_iter().map(|id| serde_json::from_value(serde_json::json!({
+                "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+            })).unwrap()).collect();
+            state.chats = [("pin", "a"), ("b-new", "b"), ("a-new", "a"), ("b-old", "b")]
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (id, project))| {
+                    let mut chat = pin_test_chat(id);
+                    chat.space_id = Some(project.into());
+                    chat.created_at = Utc::now() - chrono::Duration::minutes(ix as i64);
+                    chat
+                })
+                .collect();
+        });
+        let state = shell.state.read(cx);
+        let key = |id: &str| zeron_proto::view::project_key(state.space_row(id).unwrap());
+        (key("a"), key("b"))
+    }
+
+    #[gpui::test]
+    fn manual_project_order_holds_when_a_lower_project_gets_a_newer_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                let (a, b) = project_order_fixture(shell, cx);
+                shell.settings.sidebar_project_order = SidebarProjectOrder::Manual;
+                shell.settings.space_order = vec![a, b];
+                assert_eq!(
+                    shell.sidebar_visible_order(cx),
+                    ids(&["pin", "a-new", "b-new", "b-old"])
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn recent_project_order_follows_recency_under_a_name_sort(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                project_order_fixture(shell, cx);
+                shell.settings.sidebar_sort = SidebarSort::Name;
+                // b-new is the newest chat, so b leads although a-new sorts first.
+                assert_eq!(
+                    shell.sidebar_visible_order(cx),
+                    ids(&["pin", "b-new", "b-old", "a-new"])
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn filter_keeps_pins_and_the_open_chat(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                project_order_fixture(shell, cx);
+                shell.settings.sidebar_status_filter = SidebarStatusFilter::NeedsMe;
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("b-old".into());
+                });
+                assert_eq!(shell.sidebar_visible_order(cx), ids(&["pin", "b-old"]));
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn keyboard_order_matches_drawn_order_for_every_view_combination(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        let (a, _) = window
+            .update(cx, |shell, _, cx| {
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, true);
+                project_order_fixture(shell, cx)
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        let every = [
+            ("pin", "session-slot-pin"),
+            ("b-new", "session-slot-b-new"),
+            ("a-new", "session-slot-a-new"),
+            ("b-old", "session-slot-b-old"),
+        ];
+        for organization in [
+            SidebarOrganization::ByProject,
+            SidebarOrganization::ByDevice,
+            SidebarOrganization::InOneList,
+        ] {
+            for projects in [
+                SidebarProjectOrder::Recent,
+                SidebarProjectOrder::Manual,
+                SidebarProjectOrder::Name,
+            ] {
+                for sort in [
+                    SidebarSort::LastUpdated,
+                    SidebarSort::Created,
+                    SidebarSort::Name,
+                    SidebarSort::Status,
+                ] {
+                    for filter in [
+                        SidebarStatusFilter::All,
+                        SidebarStatusFilter::Active,
+                        SidebarStatusFilter::NeedsMe,
+                    ] {
+                        window
+                            .update(&mut cx, |shell, _, cx| {
+                                shell.settings.sidebar_organization = organization;
+                                shell.settings.sidebar_project_order = projects;
+                                shell.settings.sidebar_sort = sort;
+                                shell.settings.sidebar_status_filter = filter;
+                                shell.settings.space_order = vec![a.clone()];
+                                cx.notify();
+                            })
+                            .unwrap();
+                        cx.run_until_parked();
+                        let mut drawn: Vec<(gpui::Pixels, String)> = every
+                            .iter()
+                            .filter_map(|(id, selector)| {
+                                cx.debug_bounds(selector)
+                                    .map(|bounds| (bounds.top(), id.to_string()))
+                            })
+                            .collect();
+                        drawn.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
+                        let drawn: Vec<String> = drawn.into_iter().map(|(_, id)| id).collect();
+                        let keyboard = window
+                            .update(&mut cx, |shell, _, cx| shell.sidebar_visible_order(cx))
+                            .unwrap();
+                        assert_eq!(
+                            keyboard, drawn,
+                            "{organization:?} {projects:?} {sort:?} {filter:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_view_menu_offers_projects_only_by_project(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let labels = |organization| {
+            sidebar_view_groups(organization)
+                .iter()
+                .map(|(label, _)| *label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(SidebarOrganization::ByProject),
+            ["Organize", "Projects", "Sort", "Filter", "Show"]
+        );
+        assert_eq!(
+            labels(SidebarOrganization::ByDevice),
+            ["Organize", "Sort", "Filter", "Show"]
+        );
+        assert_eq!(SIDEBAR_VIEW_ROWS.len(), 20);
+        for organization in [
+            SidebarOrganization::ByProject,
+            SidebarOrganization::ByDevice,
+            SidebarOrganization::InOneList,
+        ] {
+            assert!(
+                sidebar_view_groups(organization)
+                    .iter()
+                    .all(|(_, range)| range.end <= SIDEBAR_VIEW_ROWS.len())
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.activate_sidebar_view_row(SidebarViewRow::FilterNeedsMe, cx);
+                shell.activate_sidebar_view_row(SidebarViewRow::SortStatus, cx);
+                shell.activate_sidebar_view_row(SidebarViewRow::ProjectsManual, cx);
+                assert_eq!(
+                    shell.settings.sidebar_status_filter,
+                    SidebarStatusFilter::NeedsMe
+                );
+                assert_eq!(shell.settings.sidebar_sort, SidebarSort::Status);
+                assert_eq!(
+                    shell.settings.sidebar_project_order,
+                    SidebarProjectOrder::Manual
+                );
             })
             .unwrap();
         cx.run_until_parked();
@@ -2236,21 +2454,6 @@ pub(super) struct ActiveChatRow {
     group: Option<(String, String)>,
 }
 
-pub(super) fn compare_sidebar_chats(
-    sort: SidebarSort,
-    left: &zeron_proto::Chat,
-    right: &zeron_proto::Chat,
-) -> std::cmp::Ordering {
-    let primary = match sort {
-        SidebarSort::Created => right.created_at.cmp(&left.created_at),
-        SidebarSort::LastUpdated => right
-            .last_message_at
-            .unwrap_or(right.created_at)
-            .cmp(&left.last_message_at.unwrap_or(left.created_at)),
-    };
-    primary.then_with(|| left.id.cmp(&right.id))
-}
-
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
@@ -2307,8 +2510,16 @@ enum SidebarViewRow {
     ShowProjectLabel,
     ByDevice,
     InOneList,
+    ProjectsManual,
+    ProjectsRecent,
+    ProjectsName,
     LastUpdated,
     Created,
+    SortName,
+    SortStatus,
+    FilterAll,
+    FilterActive,
+    FilterNeedsMe,
     ShowBranch,
     ShowPullRequest,
     ShowHarness,
@@ -2320,22 +2531,58 @@ impl SidebarViewRow {
     /// Radio choices dismiss their submenu after selection. Show toggles
     /// stay open for batch changes.
     fn closes_submenu(self) -> bool {
-        matches!(
+        !matches!(
             self,
-            Self::ByProject | Self::ByDevice | Self::InOneList | Self::LastUpdated | Self::Created
+            Self::Compact
+                | Self::ShowProjectIcon
+                | Self::ShowProjectLabel
+                | Self::ShowBranch
+                | Self::ShowPullRequest
+                | Self::ShowHarness
+                | Self::ShowProjectFilter
+                | Self::ShowArchived
         )
     }
 }
 
-const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
-    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..12)];
+/// The view menu's groups as (label, range of [`SIDEBAR_VIEW_ROWS`]).
+/// Projects orders project groups, so it shows only when grouping by project.
+fn sidebar_view_groups(
+    organization: SidebarOrganization,
+) -> &'static [(&'static str, std::ops::Range<usize>)] {
+    const BY_PROJECT: [(&str, std::ops::Range<usize>); 5] = [
+        ("Organize", 0..3),
+        ("Projects", 3..6),
+        ("Sort", 6..10),
+        ("Filter", 10..13),
+        ("Show", 13..20),
+    ];
+    if organization == SidebarOrganization::ByProject {
+        &BY_PROJECT
+    } else {
+        &[
+            ("Organize", 0..3),
+            ("Sort", 6..10),
+            ("Filter", 10..13),
+            ("Show", 13..20),
+        ]
+    }
+}
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 12] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 20] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
+    SidebarViewRow::ProjectsManual,
+    SidebarViewRow::ProjectsRecent,
+    SidebarViewRow::ProjectsName,
     SidebarViewRow::LastUpdated,
     SidebarViewRow::Created,
+    SidebarViewRow::SortName,
+    SidebarViewRow::SortStatus,
+    SidebarViewRow::FilterAll,
+    SidebarViewRow::FilterActive,
+    SidebarViewRow::FilterNeedsMe,
     SidebarViewRow::ShowBranch,
     SidebarViewRow::ShowPullRequest,
     SidebarViewRow::ShowHarness,
@@ -2361,7 +2608,7 @@ const ARCHIVED_PAGE_ROWS: usize = 25;
 /// Put this machine's device group first without disturbing the recency-based
 /// order of any remote groups. A targeted promotion is more truthful than a
 /// full name sort: local context leads, then the user's chosen chat sort wins.
-fn promote_local_device_group<T>(
+pub(super) fn promote_local_device_group<T>(
     groups: &mut Vec<(Option<(String, String)>, Vec<T>)>,
     local_device_id: Option<&str>,
 ) {
@@ -2384,7 +2631,10 @@ fn promote_local_device_group<T>(
 /// Project-mode group of a chat as (key, label). Projects sharing a
 /// repository identity fold into one group named for their representative
 /// space; project-less sessions group per device as "No project".
-fn sidebar_project_group(state: &AppState, chat: &zeron_proto::Chat) -> (String, String) {
+pub(super) fn sidebar_project_group(
+    state: &AppState,
+    chat: &zeron_proto::Chat,
+) -> (String, String) {
     match state.space_for_chat(chat) {
         Some(space) => (
             zeron_proto::view::project_key(space),
@@ -3366,6 +3616,10 @@ impl Shell {
         self.chat_status_hover = None;
         self.cancel_pinned_session_drag(cx);
         self.sidebar_session_return = None;
+        // Lifted rows drop their glide wrapper, which restarts on release: a
+        // finished resort kept here would replay as a phantom reorder.
+        self.sidebar_resort.clear();
+        self.sidebar_new_keys.clear();
         self.pinned_session_drag_generation = self.pinned_session_drag_generation.wrapping_add(1);
         let lifted = window.mouse_position() - cursor_offset;
         self.sidebar_session_transfer = Some(SidebarSessionTransfer {
@@ -4266,6 +4520,7 @@ impl Shell {
         }
         self.cancel_sidebar_session_transfer(cx);
         self.cancel_pinned_session_drag(cx);
+        self.cancel_sidebar_section_drag(cx);
         match row {
             SidebarViewRow::ByProject => {
                 self.settings.sidebar_organization = SidebarOrganization::ByProject
@@ -4287,6 +4542,26 @@ impl Shell {
             }
             SidebarViewRow::LastUpdated => self.settings.sidebar_sort = SidebarSort::LastUpdated,
             SidebarViewRow::Created => self.settings.sidebar_sort = SidebarSort::Created,
+            SidebarViewRow::SortName => self.settings.sidebar_sort = SidebarSort::Name,
+            SidebarViewRow::SortStatus => self.settings.sidebar_sort = SidebarSort::Status,
+            SidebarViewRow::ProjectsManual => {
+                self.settings.sidebar_project_order = SidebarProjectOrder::Manual
+            }
+            SidebarViewRow::ProjectsRecent => {
+                self.settings.sidebar_project_order = SidebarProjectOrder::Recent
+            }
+            SidebarViewRow::ProjectsName => {
+                self.settings.sidebar_project_order = SidebarProjectOrder::Name
+            }
+            SidebarViewRow::FilterAll => {
+                self.settings.sidebar_status_filter = SidebarStatusFilter::All
+            }
+            SidebarViewRow::FilterActive => {
+                self.settings.sidebar_status_filter = SidebarStatusFilter::Active
+            }
+            SidebarViewRow::FilterNeedsMe => {
+                self.settings.sidebar_status_filter = SidebarStatusFilter::NeedsMe
+            }
             SidebarViewRow::ShowBranch => {
                 self.settings.sidebar_show_branch = !self.settings.sidebar_show_branch
             }
@@ -4325,10 +4600,11 @@ impl Shell {
     }
 
     fn open_sidebar_view_submenu(&mut self, group: usize, keyboard: bool, cx: &mut Context<Self>) {
+        let groups = sidebar_view_groups(self.settings.sidebar_organization).len();
         if let Some(menu) = self.sidebar_view_menu.open_mut() {
             menu.hover_intent.reset();
             menu.active = Some(group);
-            menu.submenu = (group < SIDEBAR_VIEW_GROUPS.len()).then_some(group);
+            menu.submenu = (group < groups).then_some(group);
             menu.submenu_active = keyboard.then_some(0);
             menu.submenu_bounds = None;
             cx.notify();
@@ -4387,6 +4663,7 @@ impl Shell {
     }
 
     fn sidebar_view_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        let groups = sidebar_view_groups(self.settings.sidebar_organization);
         let Some(menu) = self.sidebar_view_menu.open_mut() else {
             return;
         };
@@ -4413,14 +4690,10 @@ impl Shell {
             "up" | "down" => {
                 let delta = if key == "up" { -1 } else { 1 };
                 if let Some(group) = menu.submenu {
-                    menu.submenu_active = popover::menu_step(
-                        menu.submenu_active,
-                        SIDEBAR_VIEW_GROUPS[group].1.len(),
-                        delta,
-                    );
+                    menu.submenu_active =
+                        popover::menu_step(menu.submenu_active, groups[group].1.len(), delta);
                 } else {
-                    menu.active =
-                        popover::menu_step(menu.active, SIDEBAR_VIEW_GROUPS.len() + 2, delta);
+                    menu.active = popover::menu_step(menu.active, groups.len() + 2, delta);
                 }
                 cx.notify();
             }
@@ -4428,18 +4701,17 @@ impl Shell {
                 if let Some(group) = menu.submenu {
                     if key == "enter" {
                         if let Some(choice) = menu.submenu_active {
-                            let row =
-                                SIDEBAR_VIEW_ROWS[SIDEBAR_VIEW_GROUPS[group].1.start + choice];
+                            let row = SIDEBAR_VIEW_ROWS[groups[group].1.start + choice];
                             self.activate_sidebar_view_row(row, cx);
                         }
                     }
                 } else {
                     let group = menu.active.unwrap_or(0);
-                    if group == SIDEBAR_VIEW_GROUPS.len() + 1 {
+                    if group == groups.len() + 1 {
                         if key != "right" && !event.is_held {
                             self.open_section_dialog(None, cx);
                         }
-                    } else if group == SIDEBAR_VIEW_GROUPS.len() {
+                    } else if group == groups.len() {
                         if key != "right" && !event.is_held {
                             self.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
                         }
@@ -4465,6 +4737,9 @@ impl Shell {
         let focus = menu_state.focus.clone();
         let organization = self.settings.sidebar_organization;
         let sort = self.settings.sidebar_sort;
+        let projects = self.settings.sidebar_project_order;
+        let filter = self.settings.sidebar_status_filter;
+        let view_groups = sidebar_view_groups(organization);
         let show_harness = self.settings.sidebar_show_harness;
         let show_branch = self.settings.sidebar_show_branch;
         let show_pr = self.settings.sidebar_show_pull_request;
@@ -4473,8 +4748,16 @@ impl Shell {
             "By device",
             "By project",
             "None",
+            "Manual",
+            "Recent",
+            "A–Z",
             "Last updated",
             "Created",
+            "Name",
+            "Status",
+            "All",
+            "Active",
+            "Needs me",
             "Branch",
             "Pull request",
             "Harness",
@@ -4487,8 +4770,16 @@ impl Shell {
             icons::LAPTOP,
             icons::FOLDER,
             icons::LIST,
+            icons::DRAG_HANDLE,
+            icons::CLOCK_CIRCLE,
+            icons::SORT_VERTICAL,
             icons::CLOCK_CIRCLE,
             icons::CALENDAR,
+            icons::SORT,
+            icons::CHECKLIST,
+            icons::LIST,
+            icons::ACTION_PLAY,
+            icons::BELL,
             icons::GIT_BRANCH,
             icons::PULL_REQUEST,
             icons::BOT,
@@ -4502,8 +4793,16 @@ impl Shell {
             organization == SidebarOrganization::ByDevice,
             organization == SidebarOrganization::ByProject,
             organization == SidebarOrganization::InOneList,
+            projects == SidebarProjectOrder::Manual,
+            projects == SidebarProjectOrder::Recent,
+            projects == SidebarProjectOrder::Name,
             sort == SidebarSort::LastUpdated,
             sort == SidebarSort::Created,
+            sort == SidebarSort::Name,
+            sort == SidebarSort::Status,
+            filter == SidebarStatusFilter::All,
+            filter == SidebarStatusFilter::Active,
+            filter == SidebarStatusFilter::NeedsMe,
             show_branch,
             show_pr,
             show_harness,
@@ -4512,13 +4811,19 @@ impl Shell {
             self.settings.sidebar_show_project_filter,
             self.settings.sidebar_show_archived,
         ];
-        let values = [
-            labels[selected[..3].iter().position(|v| *v).unwrap_or(0)].to_string(),
-            labels[3 + selected[3..5].iter().position(|v| *v).unwrap_or(0)].to_string(),
-        ];
+        // A radio group's trigger names its current choice; Show's toggles don't.
+        let values: Vec<Option<&str>> = view_groups
+            .iter()
+            .map(|(label, range)| {
+                (*label != "Show").then(|| {
+                    labels
+                        [range.start + selected[range.clone()].iter().position(|v| *v).unwrap_or(0)]
+                })
+            })
+            .collect();
         let mut groups: Vec<AnyElement> = Vec::new();
-        for (group, (label, range)) in SIDEBAR_VIEW_GROUPS.iter().enumerate() {
-            if group == 2 {
+        for (group, (label, range)) in view_groups.iter().enumerate() {
+            if *label == "Show" {
                 groups.push(popover::menu_separator().into_any_element());
             }
             let open = submenu == Some(group);
@@ -4548,12 +4853,8 @@ impl Shell {
                 cx.stop_propagation();
             }))
             .child(div().flex_1().child(*label))
-            .when(group < values.len(), |el| {
-                el.child(
-                    div()
-                        .text_color(theme.text_muted)
-                        .child(values[group].clone()),
-                )
+            .when_some(values[group], |el, value| {
+                el.child(div().text_color(theme.text_muted).child(value))
             })
             .child(
                 icon(icons::ALT_ARROW_RIGHT)
@@ -4700,35 +5001,30 @@ impl Shell {
                 .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
                     if *hovered {
                         this.hover_sidebar_view_group(
-                            SIDEBAR_VIEW_GROUPS.len(),
+                            view_groups.len(),
                             window.mouse_position(),
                             false,
                             cx,
                         );
                     } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
-                        menu.hover_intent.leave(&SIDEBAR_VIEW_GROUPS.len());
+                        menu.hover_intent.leave(&view_groups.len());
                     }
                 }))
                 .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                    this.hover_sidebar_view_group(
-                        SIDEBAR_VIEW_GROUPS.len(),
-                        event.position,
-                        true,
-                        cx,
-                    );
+                    this.hover_sidebar_view_group(view_groups.len(), event.position, true, cx);
                 }))
                 .child(
                     popover::menu_row_nav(
                         theme,
                         false,
-                        active == Some(SIDEBAR_VIEW_GROUPS.len()),
+                        active == Some(view_groups.len()),
                         "sidebar-view-compact",
                     )
                     .id("sidebar-view-compact")
                     .h(px(30.0))
                     .py(px(0.0))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_sidebar_view_submenu(SIDEBAR_VIEW_GROUPS.len(), false, cx);
+                        this.open_sidebar_view_submenu(view_groups.len(), false, cx);
                         this.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
                         cx.stop_propagation();
                     }))
@@ -4746,7 +5042,7 @@ impl Shell {
             div()
                 .id("sidebar-create-section-hover")
                 .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                    let target = SIDEBAR_VIEW_GROUPS.len() + 1;
+                    let target = view_groups.len() + 1;
                     if *hovered {
                         this.hover_sidebar_view_group(target, window.mouse_position(), false, cx);
                     } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
@@ -4754,18 +5050,13 @@ impl Shell {
                     }
                 }))
                 .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                    this.hover_sidebar_view_group(
-                        SIDEBAR_VIEW_GROUPS.len() + 1,
-                        event.position,
-                        true,
-                        cx,
-                    );
+                    this.hover_sidebar_view_group(view_groups.len() + 1, event.position, true, cx);
                 }))
                 .child(
                     popover::menu_row_nav(
                         theme,
                         false,
-                        active == Some(SIDEBAR_VIEW_GROUPS.len() + 1),
+                        active == Some(view_groups.len() + 1),
                         "sidebar-create-section",
                     )
                     .id("sidebar-create-section")
@@ -5255,12 +5546,11 @@ impl Shell {
             .as_ref()
             .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let state = self.state.read(cx);
-        let mut chats: Vec<zeron_proto::Chat> = state
-            .sidebar_chats(Utc::now(), filter.as_deref())
+        let chats: Vec<zeron_proto::Chat> = self
+            .sidebar_sorted_chats(state, Utc::now(), pinned_order)
             .into_iter()
-            .map(|(_, chat)| chat.clone())
+            .map(|(_, chat)| chat)
             .collect();
-        chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
         let (pinned_chats, chats): (Vec<_>, Vec<_>) = chats
             .into_iter()
             .partition(|chat| pinned_order.contains(&chat.id));
@@ -5289,23 +5579,20 @@ impl Shell {
         let ordered = if self.settings.sidebar_organization != SidebarOrganization::InOneList {
             let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
             for chat in chats {
-                let key = Some((
+                let key = Some(
                     if self.settings.sidebar_organization == SidebarOrganization::ByProject {
-                        sidebar_project_group(state, &chat).0
+                        sidebar_project_group(state, &chat)
                     } else {
-                        chat.device_id.clone()
+                        (chat.device_id.clone(), String::new())
                     },
-                    String::new(),
-                ));
+                );
                 if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
                     existing.push(chat);
                 } else {
                     groups.push((key, vec![chat]));
                 }
             }
-            if self.settings.sidebar_organization == SidebarOrganization::ByDevice {
-                promote_local_device_group(&mut groups, state.local_device_id.as_deref());
-            }
+            self.order_sidebar_groups(state, &mut groups);
             groups
                 .into_iter()
                 .flat_map(|(_, rows)| rows)
@@ -5571,24 +5858,16 @@ impl Shell {
                 drag.filter == filter && profile_key.as_deref() == Some(&drag.profile_key)
             })
             .map(|drag| drag.visible_ids.clone());
+        let pinned_order = frozen_pinned
+            .as_ref()
+            .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let mut rows: Vec<ActiveChatRow> = {
             let state = self.state.read(cx);
-            let mut chats: Vec<_> = state
-                .sidebar_chats(now, filter.as_deref())
-                .into_iter()
-                .map(|(status, chat)| (status, chat.clone()))
-                .collect();
-            chats.sort_by(|left, right| {
-                compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
-            });
-            chats
+            self.sidebar_sorted_chats(state, now, pinned_order)
                 .into_iter()
                 .map(|(status, chat)| self.sidebar_chat_data(status, chat, state))
                 .collect()
         };
-        let pinned_order = frozen_pinned
-            .as_ref()
-            .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let base_ids: Vec<String> = rows.iter().map(|row| row.chat.id.clone()).collect();
         let ordered_ids = project_pinned_first(&base_ids, pinned_order);
         let rank: std::collections::HashMap<&str, usize> = ordered_ids
@@ -5674,10 +5953,18 @@ impl Shell {
                     .position(|id| id == &row.chat.id)
             });
         }
-        if self.settings.sidebar_organization == SidebarOrganization::ByDevice {
-            let local_device_id = self.state.read(cx).local_device_id.clone();
-            promote_local_device_group(&mut regular_groups, local_device_id.as_deref());
-        }
+        self.order_sidebar_groups(self.state.read(cx), &mut regular_groups);
+        // Project groups reorder by their header once there are two to order.
+        let project_order = (self.settings.sidebar_organization == SidebarOrganization::ByProject
+            && regular_groups.len() > 1)
+            .then(|| {
+                std::sync::Arc::new(
+                    regular_groups
+                        .iter()
+                        .filter_map(|(group, _)| group.as_ref().map(|(key, _)| key.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            });
         let mut sections = Vec::with_capacity(regular_groups.len() + usize::from(pinned_count > 0));
         if !pinned_rows.is_empty() {
             sections.push((None, pinned_rows));
@@ -6003,6 +6290,7 @@ impl Shell {
                             .clone()
                             .zip(profile_key.clone())
                             .map(|(ids, profile_key)| SidebarSectionDrag {
+                                kind: SidebarSectionDragKind::Custom,
                                 section_id: section.id.clone(),
                                 profile_key,
                                 ids,
@@ -6137,6 +6425,10 @@ impl Shell {
                 )
                     .group(group_name)
                 .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
+                .debug_selector({
+                    let collapse_key = collapse_key.clone();
+                    move || format!("sidebar-group-header-{collapse_key}")
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
                     this.begin_sidebar_disclosure_motion(
@@ -6150,7 +6442,28 @@ impl Shell {
                         this.sidebar_collapsed_groups.remove(&toggle_key);
                     }
                     cx.notify();
-                }));
+                }))
+                .when_some(
+                    project_order
+                        .clone()
+                        .filter(|_| project_group)
+                        .map(|ids| SidebarSectionDrag {
+                            kind: SidebarSectionDragKind::Project,
+                            section_id: key.clone(),
+                            profile_key: String::new(),
+                            ids,
+                        }),
+                    |el, payload| {
+                        let shell = cx.entity();
+                        el.on_drag(payload, move |payload, grab, window, cx| {
+                            shell.update(cx, |shell, cx| {
+                                shell.begin_sidebar_section_drag(payload, grab, window, cx);
+                            });
+                            cx.stop_propagation();
+                            cx.new(|_| DragGhost)
+                        })
+                    },
+                );
             let body = self.render_sidebar_disclosure_body(
                 &motion_key,
                 !collapsed,
@@ -6346,7 +6659,11 @@ impl Shell {
             .filter(|chat| in_filter(chat))
             .cloned()
             .collect();
-        rows.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        // Archived chats are settled: a Status sort falls back to recency.
+        let idle = ChatIndicator::Idle;
+        rows.sort_by(|left, right| {
+            compare_sidebar_chats(self.settings.sidebar_sort, (idle, left), (idle, right))
+        });
         rows
     }
 
@@ -9203,8 +9520,9 @@ impl Shell {
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{compare_sidebar_chats, promote_local_device_group};
+    use super::promote_local_device_group;
     use crate::settings::SidebarSort;
+    use crate::shell::sidebar_order::compare_sidebar_chats;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])
@@ -9238,8 +9556,15 @@ mod tests {
     fn equal_sidebar_timestamps_sort_by_stable_chat_id() {
         let alpha = chat("alpha");
         let beta = chat("beta");
-        assert!(compare_sidebar_chats(SidebarSort::Created, &alpha, &beta).is_lt());
-        assert!(compare_sidebar_chats(SidebarSort::LastUpdated, &alpha, &beta).is_lt());
+        let idle = zeron_proto::ChatIndicator::Idle;
+        for sort in [
+            SidebarSort::Created,
+            SidebarSort::LastUpdated,
+            SidebarSort::Name,
+            SidebarSort::Status,
+        ] {
+            assert!(compare_sidebar_chats(sort, (idle, &alpha), (idle, &beta)).is_lt());
+        }
     }
 
     #[test]
