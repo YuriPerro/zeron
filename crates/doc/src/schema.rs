@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use crate::commands::{SessionCommandEntry, SessionCommandStatus};
 use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
-use crate::parts::{MessagePart, MessageStatus, SubagentStatus};
+use crate::parts::{CompactionStatus, MessagePart, MessageStatus, SubagentStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocError {
@@ -114,6 +114,14 @@ struct DocPartJson {
     from_harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     to_harness: Option<String>,
+    /// Compaction line (`kind: "compaction"`, additive): `"running"` or
+    /// `"done"`, and the context token counts before and after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tokens_before: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tokens_after: Option<u64>,
     /// Tool output summary (additive — absent on old rows and old writers;
     /// pre-strip writers stored up to 4KB of capped output here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,6 +273,25 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             to_harness: to_harness.clone(),
             ..Default::default()
         },
+        MessagePart::Compaction {
+            id,
+            status,
+            tokens_before,
+            tokens_after,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "compaction".into(),
+            compaction_status: Some(
+                match status {
+                    CompactionStatus::Running => "running",
+                    CompactionStatus::Done => "done",
+                }
+                .to_owned(),
+            ),
+            tokens_before: *tokens_before,
+            tokens_after: *tokens_after,
+            ..Default::default()
+        },
     })
 }
 
@@ -338,6 +365,15 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             to: p.to_provider.unwrap_or_default(),
             from_harness: p.from_harness,
             to_harness: p.to_harness,
+        },
+        "compaction" => MessagePart::Compaction {
+            id: p.id,
+            status: match p.compaction_status.as_deref() {
+                Some("running") => CompactionStatus::Running,
+                _ => CompactionStatus::Done,
+            },
+            tokens_before: p.tokens_before,
+            tokens_after: p.tokens_after,
         },
         _ => MessagePart::Text {
             id: p.id,
@@ -942,6 +978,52 @@ impl SessionDoc {
         None
     }
 
+    /// Stamp `tokensAfter` on the newest compaction part, wherever it lives,
+    /// when that part is `done` and still lacks it. Entries are searched
+    /// newest first and each entry's parts last to first; the search stops at
+    /// the first compaction part, so an older pending line is never filled by
+    /// a reading that belongs to a newer one. Returns whether it stamped.
+    pub fn fill_compaction_after(&self, tokens: u64) -> Result<bool, DocError> {
+        let messages = self.doc.get_list("messages");
+        for i in (0..messages.len()).rev() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                continue;
+            };
+            for j in (0..parts.len()).rev() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let is_compaction = matches!(
+                    part.get("kind"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "compaction"
+                );
+                if !is_compaction {
+                    continue;
+                }
+                let is_done = matches!(
+                    part.get("compactionStatus"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "done"
+                );
+                if !is_done || part.get("tokensAfter").is_some() {
+                    return Ok(false);
+                }
+                part.insert("tokensAfter", tokens as i64)?;
+                self.doc.commit();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc
@@ -1074,6 +1156,15 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     }
     if let Some(subagent_tail) = &doc_part.subagent_tail {
         map.insert("subagentTail", subagent_tail.as_str())?;
+    }
+    if let Some(compaction_status) = &doc_part.compaction_status {
+        map.insert("compactionStatus", compaction_status.as_str())?;
+    }
+    if let Some(tokens_before) = doc_part.tokens_before {
+        map.insert("tokensBefore", tokens_before as i64)?;
+    }
+    if let Some(tokens_after) = doc_part.tokens_after {
+        map.insert("tokensAfter", tokens_after as i64)?;
     }
     Ok(())
 }
@@ -1543,6 +1634,15 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(subagent_tail) = &doc_part.subagent_tail {
         map.insert("subagentTail", subagent_tail.as_str())?;
     }
+    if let Some(compaction_status) = &doc_part.compaction_status {
+        map.insert("compactionStatus", compaction_status.as_str())?;
+    }
+    if let Some(tokens_before) = doc_part.tokens_before {
+        map.insert("tokensBefore", tokens_before as i64)?;
+    }
+    if let Some(tokens_after) = doc_part.tokens_after {
+        map.insert("tokensAfter", tokens_after as i64)?;
+    }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
@@ -1654,6 +1754,184 @@ mod tests {
         doc.mark_provider_switched().unwrap();
         assert_eq!(doc.read_entries().unwrap()[0].parts, vec![seam]);
         assert!(doc.provider_switched());
+    }
+
+    fn assistant_entry(id: &str, parts: Vec<MessagePart>) -> SessionMessageEntry {
+        SessionMessageEntry {
+            duration_ms: None,
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        }
+    }
+
+    fn done_compaction(id: &str, before: u64, after: Option<u64>) -> MessagePart {
+        MessagePart::Compaction {
+            id: id.into(),
+            status: CompactionStatus::Done,
+            tokens_before: Some(before),
+            tokens_after: after,
+        }
+    }
+
+    #[test]
+    fn compaction_part_round_trips() {
+        let doc = SessionDoc::init("compaction").unwrap();
+        let running = MessagePart::Compaction {
+            id: "c0".into(),
+            status: CompactionStatus::Running,
+            tokens_before: Some(1),
+            tokens_after: None,
+        };
+        let done = done_compaction("c0", 224_463, Some(31_000));
+        doc.push_message(&assistant_entry("a1", vec![running.clone()]))
+            .unwrap();
+        doc.push_message(&assistant_entry("a2", vec![done.clone()]))
+            .unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries[0].parts, vec![running]);
+        assert_eq!(entries[1].parts, vec![done]);
+    }
+
+    #[test]
+    fn unknown_compaction_status_reads_as_done() {
+        let part = from_doc_part(DocPartJson {
+            id: "c0".into(),
+            kind: "compaction".into(),
+            compaction_status: Some("sideways".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            part,
+            MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Done,
+                tokens_before: None,
+                tokens_after: None,
+            }
+        );
+    }
+
+    #[test]
+    fn streaming_segment_updates_a_compaction_part_in_place() {
+        let doc = SessionDoc::init("compaction-stream").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![];
+        let event = |phase, before, after| AgentEvent::Compaction {
+            phase,
+            tokens_before: before,
+            tokens_after: after,
+        };
+        fold_event_into_parts(
+            &mut parts,
+            &event(zeron_proto::CompactionPhase::Started, Some(224_000), None),
+        );
+        writer.sync(&parts).unwrap();
+        assert_eq!(
+            doc.read_entries().unwrap()[0].parts,
+            vec![MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Running,
+                tokens_before: Some(224_000),
+                tokens_after: None,
+            }]
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &event(zeron_proto::CompactionPhase::Finished, None, Some(31_000)),
+        );
+        writer.sync(&parts).unwrap();
+        assert_eq!(
+            doc.read_entries().unwrap()[0].parts,
+            vec![done_compaction("c0", 224_000, Some(31_000))]
+        );
+    }
+
+    #[test]
+    fn fill_compaction_after_stamps_only_the_newest_pending_part() {
+        let doc = SessionDoc::init("fill").unwrap();
+        doc.push_message(&assistant_entry(
+            "a1",
+            vec![done_compaction("c0", 10, None)],
+        ))
+        .unwrap();
+        doc.push_message(&assistant_entry(
+            "a2",
+            vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "later".into(),
+            }],
+        ))
+        .unwrap();
+        doc.push_message(&assistant_entry(
+            "a3",
+            vec![done_compaction("c0", 224_463, None)],
+        ))
+        .unwrap();
+
+        assert!(doc.fill_compaction_after(31_000).unwrap());
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries[0].parts, vec![done_compaction("c0", 10, None)]);
+        assert_eq!(
+            entries[2].parts,
+            vec![done_compaction("c0", 224_463, Some(31_000))]
+        );
+        assert!(!doc.fill_compaction_after(5).unwrap());
+        assert_eq!(
+            doc.read_entries().unwrap()[2].parts,
+            vec![done_compaction("c0", 224_463, Some(31_000))]
+        );
+    }
+
+    #[test]
+    fn fill_compaction_after_skips_a_running_newest_part_and_a_doc_without_one() {
+        let doc = SessionDoc::init("fill-running").unwrap();
+        assert!(!doc.fill_compaction_after(1).unwrap());
+        doc.push_message(&assistant_entry(
+            "a1",
+            vec![done_compaction("c0", 10, None)],
+        ))
+        .unwrap();
+        doc.push_message(&assistant_entry(
+            "a2",
+            vec![MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Running,
+                tokens_before: Some(20),
+                tokens_after: None,
+            }],
+        ))
+        .unwrap();
+        assert!(!doc.fill_compaction_after(31_000).unwrap());
+        assert_eq!(
+            doc.read_entries().unwrap()[0].parts,
+            vec![done_compaction("c0", 10, None)]
+        );
+    }
+
+    #[test]
+    fn fill_compaction_after_takes_the_last_part_of_an_entry() {
+        let doc = SessionDoc::init("fill-parts").unwrap();
+        doc.push_message(&assistant_entry(
+            "a1",
+            vec![
+                done_compaction("c0", 10, None),
+                MessagePart::Text {
+                    id: "t1".into(),
+                    text: "between".into(),
+                },
+                done_compaction("c2", 20, None),
+            ],
+        ))
+        .unwrap();
+        assert!(doc.fill_compaction_after(7).unwrap());
+        let parts = doc.read_entries().unwrap().remove(0).parts;
+        assert_eq!(parts[0], done_compaction("c0", 10, None));
+        assert_eq!(parts[2], done_compaction("c2", 20, Some(7)));
     }
     use zeron_proto::{AgentEvent, ToolCall};
 

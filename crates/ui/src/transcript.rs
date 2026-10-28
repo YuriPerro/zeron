@@ -40,7 +40,9 @@ use gpui::{
     size,
 };
 
-use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
+use zeron_doc::{
+    CompactionStatus, MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus,
+};
 use zeron_proto::view::{AnswerLine, InputOutcome};
 use zeron_proto::{HarnessId, ToolCall};
 
@@ -1148,6 +1150,11 @@ pub enum RowKind {
         from_harness: Option<HarnessId>,
         to_harness: Option<HarnessId>,
     },
+    /// Context compaction as a full-width divider; `running` shows the spinner.
+    CompactionMarker {
+        label: SharedString,
+        running: bool,
+    },
     /// An engine wake notice about an orchestrator's child, as a compact line.
     ChildEvent {
         chat_id: SharedString,
@@ -1871,6 +1878,31 @@ pub fn rows_for_entry(
                             compact_fold: None,
                         });
                     }
+                    MessagePart::Compaction {
+                        id: part_id,
+                        status,
+                        tokens_before,
+                        tokens_after,
+                    } => {
+                        let label: SharedString = crate::compaction_line::label(
+                            *status,
+                            streaming,
+                            *tokens_before,
+                            *tokens_after,
+                        )
+                        .into();
+                        let running = crate::compaction_line::running(*status, streaming);
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(label.as_bytes()) ^ running as u64,
+                            turn_start: false,
+                            kind: RowKind::CompactionMarker { label, running },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            compact_fold: None,
+                        });
+                    }
                     // Tools and thoughts are grouped by the outer arms;
                     // nothing reaches here.
                     MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
@@ -1949,16 +1981,19 @@ pub fn rows_for_entry(
     if let Some(first) = rows.first_mut() {
         first.turn_start = true;
     }
-    // Timestamp strip under the entry's LAST row once the turn has settled
-    // (chat-view.tsx: "No timestamp hover mid-stream"). The version bit keeps
-    // the diff key honest for last-row kinds whose own version wouldn't
-    // change when streaming flips off (chips).
+    // Timestamp strip under the entry's last non-seam row once the turn has
+    // settled (chat-view.tsx: "No timestamp hover mid-stream"). The version
+    // bit keeps the diff key honest for last-row kinds whose own version
+    // wouldn't change when streaming flips off (chips).
     if !streaming
-        && let Some(last) = rows.last_mut()
-        && !matches!(
-            last.kind,
-            RowKind::ForkMarker { .. } | RowKind::SwitchMarker { .. }
-        )
+        && let Some(last) = rows.iter_mut().rev().find(|row| {
+            !matches!(
+                row.kind,
+                RowKind::ForkMarker { .. }
+                    | RowKind::SwitchMarker { .. }
+                    | RowKind::CompactionMarker { .. }
+            )
+        })
     {
         last.timestamp = Some(entry.created_at);
         last.copy_text = assistant_copy_text(entry);
@@ -3065,6 +3100,19 @@ impl OwnTurnAnchor {
             self.seen_prompt = true;
         }
         exists || !self.seen_prompt
+    }
+
+    fn follow_hidden_bubble(&mut self, hidden: &HashSet<String>, entries: &[SessionMessageEntry]) {
+        if !hidden.contains(&*self.message_id) {
+            return;
+        }
+        if let Some(reply) = entries
+            .iter()
+            .skip_while(|entry| entry.id != *self.message_id)
+            .nth(1)
+        {
+            self.message_id = reply.id.clone().into();
+        }
     }
 }
 
@@ -5203,7 +5251,14 @@ impl Transcript {
                 .chat_id
                 .as_ref()
                 .and_then(|id| state.prepared_transcripts.get(id));
+            let hidden_bubbles = crate::compaction_line::hidden_bubbles(entries);
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.follow_hidden_bubble(&hidden_bubbles, entries);
+            }
             for entry in entries {
+                if hidden_bubbles.contains(&entry.id) {
+                    continue;
+                }
                 if !self.compact_mode
                     && let Some(rows) = prepared.and_then(|p| p.rows.get(&entry.id))
                 {
@@ -7825,6 +7880,19 @@ impl Transcript {
         }
     }
 
+    fn last_reply_compacting(&self, cx: &Context<Self>) -> bool {
+        let state = self.state.read(cx);
+        let entries = match &self.doc_override {
+            Some(doc_id) => state.sub_transcript(doc_id),
+            None => state.transcript.as_slice(),
+        };
+        entries
+            .iter()
+            .rev()
+            .find(|entry| entry.role == MessageRole::Assistant)
+            .is_some_and(crate::compaction_line::compacting_now)
+    }
+
     fn render_working_trailer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let now = chrono::Utc::now();
         // `turn` (the turn's start, ms) keys the rolling word and timer, so a
@@ -7960,6 +8028,9 @@ impl Transcript {
             if let Some(entry_id) = entry_id {
                 self.compact_last_elapsed.insert(entry_id, elapsed_secs);
             }
+        }
+        if !sending && !queued && booting.is_none() && self.last_reply_compacting(cx) {
+            return None;
         }
         let word = if queued {
             "Queued — will send automatically"
@@ -8369,6 +8440,9 @@ impl Transcript {
                 from_harness,
                 to_harness,
             } => switch_marker(from.clone(), to.clone(), *from_harness, *to_harness, &theme),
+            RowKind::CompactionMarker { label, running } => {
+                crate::compaction_line::marker(label.clone(), *running, cx.entity_id(), &theme, cx)
+            }
             RowKind::ChildEvent {
                 chat_id,
                 title,
@@ -11384,6 +11458,27 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
                 acc.push(1);
             }
         }
+        if let MessagePart::Compaction {
+            status,
+            tokens_before,
+            tokens_after,
+            ..
+        } = part
+        {
+            acc.push(match status {
+                CompactionStatus::Running => 0x20,
+                CompactionStatus::Done => 0x21,
+            });
+            for tokens in [tokens_before, tokens_after] {
+                match tokens {
+                    Some(tokens) => {
+                        acc.push(1);
+                        acc.extend_from_slice(&tokens.to_le_bytes());
+                    }
+                    None => acc.push(0),
+                }
+            }
+        }
     }
     fnv1a(&acc)
 }
@@ -13540,6 +13635,299 @@ mod tests {
         assert!(code.starts_with("line 1\nline 2"));
     }
 
+    fn compaction_part(
+        status: CompactionStatus,
+        before: Option<u64>,
+        after: Option<u64>,
+    ) -> MessagePart {
+        MessagePart::Compaction {
+            id: "c1".into(),
+            status,
+            tokens_before: before,
+            tokens_after: after,
+        }
+    }
+
+    fn marker_label(row: &Row) -> (&str, bool) {
+        match &row.kind {
+            RowKind::CompactionMarker { label, running } => (label.as_ref(), *running),
+            _ => panic!("expected a compaction marker row"),
+        }
+    }
+
+    fn compact_prompt(text: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            role: MessageRole::User,
+            ..assistant("u1", MessageStatus::Complete, vec![text_part("p", text)])
+        }
+    }
+
+    fn replay_entries(
+        state: &Entity<AppState>,
+        transcript: &Entity<Transcript>,
+        entries: Vec<SessionMessageEntry>,
+        cx: &mut gpui::App,
+    ) -> Vec<Row> {
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("chat".into());
+            state.transcript_replayed = true;
+            state.transcript = entries;
+            state.transcript_revision += 1;
+        });
+        transcript.update(cx, |this, cx| {
+            this.sync(cx);
+            this.rows.clone()
+        })
+    }
+
+    fn compaction_markers(rows: &[Row]) -> Vec<&Row> {
+        rows.iter()
+            .filter(|row| matches!(row.kind, RowKind::CompactionMarker { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn compaction_row_stays_outside_the_compact_work_group() {
+        use zeron_doc::CompactionStatus::Done;
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                tool_part("t1", "pwd"),
+                compaction_part(Done, Some(224_463), Some(31_000)),
+                tool_part("t2", "ls"),
+                text_part("x", "done"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, true, &mut parse);
+        let markers = compaction_markers(&rows);
+        assert_eq!(markers.len(), 1);
+        assert!(markers[0].compact_fold.is_none());
+        assert_eq!(
+            marker_label(markers[0]),
+            ("Compacted · 224K → 31K tokens", false)
+        );
+    }
+
+    #[test]
+    fn compaction_row_keeps_its_place_between_the_reply_parts() {
+        use zeron_doc::CompactionStatus::Done;
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                text_part("a", "before"),
+                compaction_part(Done, None, None),
+                text_part("b", "after"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0].kind, RowKind::Markdown { .. }));
+        assert_eq!(marker_label(&rows[1]), ("Compacted", false));
+        assert!(matches!(rows[2].kind, RowKind::Markdown { .. }));
+    }
+
+    #[test]
+    fn compaction_row_shows_running_only_while_the_reply_streams() {
+        use zeron_doc::CompactionStatus::Running;
+        let part = || compaction_part(Running, Some(224_463), None);
+        let live = rows_for_entry(
+            &assistant("m1", MessageStatus::Streaming, vec![part()]),
+            false,
+            false,
+            &mut parse,
+        );
+        let stopped = rows_for_entry(
+            &assistant("m1", MessageStatus::Complete, vec![part()]),
+            false,
+            false,
+            &mut parse,
+        );
+        assert_eq!(marker_label(&live[0]), ("Compacting context", true));
+        assert_eq!(marker_label(&stopped[0]), ("Compaction stopped", false));
+        assert_ne!(live[0].version, stopped[0].version);
+    }
+
+    #[test]
+    fn compaction_row_has_no_timestamp_or_copy_text() {
+        use zeron_doc::CompactionStatus::Done;
+        for compact in [false, true] {
+            let entry = assistant(
+                "m1",
+                MessageStatus::Complete,
+                vec![text_part("a", "before"), compaction_part(Done, None, None)],
+            );
+            let rows = rows_for_entry(&entry, false, compact, &mut parse);
+            let marker = rows.last().unwrap();
+            assert_eq!(marker_label(marker).0, "Compacted");
+            assert!(marker.timestamp.is_none());
+            assert!(marker.copy_text.is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn compact_prompt_row_hides_only_when_the_reply_has_the_line(cx: &mut gpui::TestAppContext) {
+        use zeron_doc::CompactionStatus::Done;
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| AppState::new());
+            let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+            let prompt = compact_prompt("/compact");
+            let replay = |entries: Vec<SessionMessageEntry>, cx: &mut gpui::App| {
+                replay_entries(&state, &transcript, entries, cx)
+            };
+            let answered = replay(
+                vec![
+                    prompt.clone(),
+                    assistant(
+                        "a1",
+                        MessageStatus::Complete,
+                        vec![compaction_part(Done, Some(224_463), None)],
+                    ),
+                ],
+                cx,
+            );
+            assert!(
+                !answered
+                    .iter()
+                    .any(|row| matches!(row.kind, RowKind::User { .. }))
+            );
+            assert_eq!(
+                marker_label(compaction_markers(&answered)[0]).0,
+                "Compacted · from 224K tokens"
+            );
+
+            let stamped = replay(
+                vec![
+                    prompt.clone(),
+                    assistant(
+                        "a1",
+                        MessageStatus::Complete,
+                        vec![compaction_part(Done, Some(224_463), Some(31_000))],
+                    ),
+                ],
+                cx,
+            );
+            assert_eq!(
+                marker_label(compaction_markers(&stamped)[0]).0,
+                "Compacted · 224K → 31K tokens",
+                "a token stamp on a completed reply must rebuild its cached rows"
+            );
+
+            let unanswered = replay(
+                vec![
+                    prompt,
+                    assistant("a1", MessageStatus::Complete, vec![text_part("t", "ok")]),
+                ],
+                cx,
+            );
+            assert!(
+                unanswered
+                    .iter()
+                    .any(|row| matches!(row.kind, RowKind::User { .. }))
+            );
+            assert!(compaction_markers(&unanswered).is_empty());
+
+            let with_instructions = replay(
+                vec![
+                    compact_prompt("/compact keep the plan"),
+                    assistant(
+                        "a1",
+                        MessageStatus::Complete,
+                        vec![compaction_part(Done, Some(224_463), None)],
+                    ),
+                ],
+                cx,
+            );
+            assert!(
+                with_instructions
+                    .iter()
+                    .any(|row| matches!(row.kind, RowKind::User { .. })),
+                "a /compact with instructions keeps what the user typed"
+            );
+            assert_eq!(compaction_markers(&with_instructions).len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn own_turn_follows_the_hidden_compact_bubble_to_its_reply(cx: &mut gpui::TestAppContext) {
+        use zeron_doc::CompactionStatus::Running;
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        for (text, anchored_on) in [("/compact", "a1"), ("hello", "u1")] {
+            cx.update(|cx| {
+                let state = cx.new(|_| AppState::new());
+                let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+                let prompt = compact_prompt(text);
+                replay_entries(&state, &transcript, vec![prompt.clone()], cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "u1".into(), cx)
+                });
+                replay_entries(
+                    &state,
+                    &transcript,
+                    vec![
+                        prompt,
+                        assistant(
+                            "a1",
+                            MessageStatus::Streaming,
+                            vec![compaction_part(Running, None, None)],
+                        ),
+                    ],
+                    cx,
+                );
+                transcript.update(cx, |this, _| {
+                    let anchor = this.own_turn.as_ref().expect("the runway must survive");
+                    assert_eq!(anchor.message_id.as_ref(), anchored_on, "{text}");
+                    let ix = this.own_turn_anchor_ix().expect("the anchor row exists");
+                    assert!(this.rows[ix].turn_start);
+                    assert_eq!(this.rows[ix].entry_id.as_ref(), anchored_on);
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn reply_ending_on_the_compaction_line_keeps_its_timestamp_and_copy_text() {
+        use zeron_doc::CompactionStatus::Running;
+        for compact in [false, true] {
+            let mut entry = assistant(
+                "m1",
+                MessageStatus::Complete,
+                vec![
+                    text_part("a", "answer"),
+                    compaction_part(Running, Some(224_463), None),
+                ],
+            );
+            entry.created_at = 42;
+            let rows = rows_for_entry(&entry, false, compact, &mut parse);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(marker_label(&rows[1]), ("Compaction stopped", false));
+            assert!(rows[1].timestamp.is_none());
+            assert!(rows[1].copy_text.is_none());
+            assert!(matches!(rows[0].kind, RowKind::Markdown { .. }));
+            assert_eq!(rows[0].timestamp, Some(42));
+            assert_eq!(rows[0].copy_text.as_deref(), Some("answer"));
+        }
+        let alone = assistant(
+            "m2",
+            MessageStatus::Complete,
+            vec![compaction_part(Running, None, None)],
+        );
+        let rows = rows_for_entry(&alone, false, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].timestamp.is_none());
+        assert!(rows[0].copy_text.is_none());
+    }
+
     #[test]
     fn generated_image_owner_candidates_and_same_length_corrections() {
         assert_eq!(
@@ -13588,6 +13976,34 @@ mod tests {
             );
             assert!(rows[0].copy_text.is_none());
         }
+        use zeron_doc::CompactionStatus::{Done, Running};
+        let line = assistant(
+            "compact",
+            MessageStatus::Complete,
+            vec![compaction_part(Running, None, None)],
+        );
+        let line_original = entry_fingerprint(&line, false);
+        for (status, before, after) in [
+            (Done, None, None),
+            (Running, Some(224_463), None),
+            (Running, None, Some(31_000)),
+        ] {
+            let mut changed = line.clone();
+            changed.parts = vec![compaction_part(status, before, after)];
+            assert_ne!(entry_fingerprint(&changed, false), line_original);
+        }
+        let stamped = |after| {
+            assistant(
+                "compact",
+                MessageStatus::Complete,
+                vec![compaction_part(Done, Some(224_463), after)],
+            )
+        };
+        assert_ne!(
+            entry_fingerprint(&stamped(None), false),
+            entry_fingerprint(&stamped(Some(31_000)), false),
+            "stamping tokens_after in place must change the cache key"
+        );
     }
 
     #[gpui::test]

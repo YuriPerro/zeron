@@ -6,7 +6,8 @@
 use serde::{Deserialize, Serialize};
 
 use zeron_proto::{
-    AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputAnswer, UserInputQuestion,
+    AgentEvent, CompactionPhase, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputAnswer,
+    UserInputQuestion,
 };
 
 use crate::constants::MSG_INLINE_MAX;
@@ -119,6 +120,13 @@ pub enum SubagentStatus {
     Running,
     Done,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompactionStatus {
+    Running,
+    Done,
 }
 
 /// One rendered part of an assistant message.
@@ -252,6 +260,19 @@ pub enum MessagePart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_harness: Option<String>,
     },
+    /// The provider compacted the conversation context. Written by the fold
+    /// from [`AgentEvent::Compaction`]; the counts are the context occupancy
+    /// before and after, absent while the provider has not reported them.
+    /// Old builds' unknown-kind fallback yields an invisible empty text part.
+    #[serde(rename_all = "camelCase")]
+    Compaction {
+        id: String,
+        status: CompactionStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+    },
 }
 
 impl MessagePart {
@@ -265,7 +286,8 @@ impl MessagePart {
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. }
             | MessagePart::Fork { id, .. }
-            | MessagePart::Switch { id, .. } => id,
+            | MessagePart::Switch { id, .. }
+            | MessagePart::Compaction { id, .. } => id,
         }
     }
 
@@ -310,6 +332,7 @@ impl MessagePart {
                 ..
             } => source_chat_id.len() + source_title.len(),
             MessagePart::Switch { from, to, .. } => from.len() + to.len(),
+            MessagePart::Compaction { .. } => 0,
         }
     }
 }
@@ -328,6 +351,8 @@ impl MessagePart {
 /// - `InputRequested` appends an input part; `InputResolved` marks it resolved and records the
 ///   answers it carries.
 /// - `Error` and `Done{error}` become visible error parts.
+/// - `Compaction` `Started` opens a running compaction part (a repeat while one runs changes
+///   nothing); `Finished` settles the last running one, or appends an already-done part.
 pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
         AgentEvent::SessionStarted { .. } | AgentEvent::Steered { .. } => {
@@ -558,6 +583,60 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
             }
         }
+        AgentEvent::Compaction {
+            phase,
+            tokens_before,
+            tokens_after,
+        } => match phase {
+            CompactionPhase::Started => {
+                if !out.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Compaction {
+                            status: CompactionStatus::Running,
+                            ..
+                        }
+                    )
+                }) {
+                    let id = format!("c{}", out.len());
+                    out.push(MessagePart::Compaction {
+                        id,
+                        status: CompactionStatus::Running,
+                        tokens_before: *tokens_before,
+                        tokens_after: None,
+                    });
+                }
+            }
+            CompactionPhase::Finished => {
+                let running = out.iter_mut().rev().find_map(|p| match p {
+                    MessagePart::Compaction {
+                        status: status @ CompactionStatus::Running,
+                        tokens_before: before,
+                        tokens_after: after,
+                        ..
+                    } => Some((status, before, after)),
+                    _ => None,
+                });
+                match running {
+                    Some((status, before, after)) => {
+                        *status = CompactionStatus::Done;
+                        if tokens_before.is_some() {
+                            *before = *tokens_before;
+                        }
+                        *after = *tokens_after;
+                    }
+                    None => {
+                        let id = format!("c{}", out.len());
+                        out.push(MessagePart::Compaction {
+                            id,
+                            status: CompactionStatus::Done,
+                            tokens_before: *tokens_before,
+                            tokens_after: *tokens_after,
+                        });
+                    }
+                }
+            }
+        },
         // AvailableCommands feeds the engine's per-harness command cache, not
         // the transcript. UserMessage becomes its own doc ENTRY (the engine's
         // subagent sink writes it), never a part of the assistant message.
@@ -1449,5 +1528,125 @@ mod tests {
         .unwrap();
         assert_eq!(payload.part_id, "t");
         assert_eq!(payload.output.as_deref(), Some("full output"));
+    }
+
+    fn compaction(phase: CompactionPhase, before: Option<u64>, after: Option<u64>) -> AgentEvent {
+        AgentEvent::Compaction {
+            phase,
+            tokens_before: before,
+            tokens_after: after,
+        }
+    }
+
+    #[test]
+    fn compaction_started_then_finished_folds_into_one_done_part() {
+        let mut out = vec![MessagePart::Text {
+            id: "t0".into(),
+            text: "hi".into(),
+        }];
+        fold_event_into_parts(
+            &mut out,
+            &compaction(CompactionPhase::Started, Some(224_000), None),
+        );
+        fold_event_into_parts(&mut out, &compaction(CompactionPhase::Started, None, None));
+        fold_event_into_parts(
+            &mut out,
+            &compaction(CompactionPhase::Finished, None, Some(31_000)),
+        );
+        assert_eq!(
+            out[1],
+            MessagePart::Compaction {
+                id: "c1".into(),
+                status: CompactionStatus::Done,
+                tokens_before: Some(224_000),
+                tokens_after: Some(31_000),
+            }
+        );
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn compaction_finished_alone_folds_a_done_part() {
+        let mut out = Vec::new();
+        fold_event_into_parts(
+            &mut out,
+            &compaction(CompactionPhase::Finished, Some(224_463), None),
+        );
+        assert_eq!(
+            out,
+            vec![MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Done,
+                tokens_before: Some(224_463),
+                tokens_after: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn compaction_finished_overrides_before_only_when_it_has_one() {
+        let mut out = Vec::new();
+        fold_event_into_parts(
+            &mut out,
+            &compaction(CompactionPhase::Started, Some(100), None),
+        );
+        fold_event_into_parts(
+            &mut out,
+            &compaction(CompactionPhase::Finished, Some(120), Some(10)),
+        );
+        assert_eq!(
+            out,
+            vec![MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Done,
+                tokens_before: Some(120),
+                tokens_after: Some(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn compaction_finished_closes_only_the_last_running_part() {
+        let mut out = Vec::new();
+        fold_event_into_parts(
+            &mut out,
+            &compaction(CompactionPhase::Finished, Some(1), Some(2)),
+        );
+        fold_event_into_parts(
+            &mut out,
+            &compaction(CompactionPhase::Started, Some(50), None),
+        );
+        fold_event_into_parts(&mut out, &compaction(CompactionPhase::Finished, None, None));
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0],
+            MessagePart::Compaction {
+                id: "c0".into(),
+                status: CompactionStatus::Done,
+                tokens_before: Some(1),
+                tokens_after: Some(2),
+            }
+        );
+        assert_eq!(
+            out[1],
+            MessagePart::Compaction {
+                id: "c1".into(),
+                status: CompactionStatus::Done,
+                tokens_before: Some(50),
+                tokens_after: None,
+            }
+        );
+    }
+
+    #[test]
+    fn compaction_parts_weigh_nothing_for_splitting() {
+        let part = MessagePart::Compaction {
+            id: "c0".into(),
+            status: CompactionStatus::Running,
+            tokens_before: Some(1),
+            tokens_after: None,
+        };
+        assert_eq!(part.byte_len(), 0);
+        assert_eq!(part.id(), "c0");
     }
 }

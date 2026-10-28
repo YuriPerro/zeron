@@ -26,6 +26,7 @@ pub mod changes;
 pub mod cloud;
 mod comment_ui;
 pub mod comments;
+mod compaction_line;
 pub mod composer;
 mod composer_dock;
 mod composer_markdown;

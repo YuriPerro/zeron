@@ -14,8 +14,8 @@ use zeron_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AccessMode, AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel,
-    TodoItem, TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
+    AccessMode, AgentEvent, CompactionPhase, DoneStatus, HarnessId, ReasoningLevel, RunRequest,
+    SandboxLevel, TodoItem, TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -1943,18 +1943,25 @@ async fn native_commands_use_rpc_operations_and_render_results() {
         name: "review".into(),
     }
     .link();
-    for (prompt, resume, expected) in [
-        ("/compact", true, "Context compacted."),
-        ("/review", true, "Review fixture result"),
+    for (prompt, resume, expected, expected_phases) in [
+        (
+            "/compact",
+            true,
+            "",
+            vec![CompactionPhase::Started, CompactionPhase::Finished],
+        ),
+        ("/review", true, "Review fixture result", vec![]),
         (
             "/review check error handling",
             true,
             "Review fixture result",
+            vec![],
         ),
         (
             format!("  {selected_review} inspect errors").as_str(),
             false,
             "Review fixture result",
+            vec![],
         ),
     ] {
         let (controls, steer, _) = controls("Yes");
@@ -1964,9 +1971,11 @@ async fn native_commands_use_rpc_operations_and_render_results() {
         let events = run_to_end(&harness(), req, controls).await;
         let mut text = String::new();
         let mut completions = 0;
+        let mut phases = Vec::new();
         for event in events {
             match event {
                 AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                AgentEvent::Compaction { phase, .. } => phases.push(phase),
                 AgentEvent::Done { status, error, .. } => {
                     assert_eq!(status, DoneStatus::Completed, "{prompt}: {error:?}");
                     completions += 1;
@@ -1976,6 +1985,7 @@ async fn native_commands_use_rpc_operations_and_render_results() {
         }
         assert_eq!(completions, 1, "{prompt}");
         assert_eq!(text, expected, "{prompt}");
+        assert_eq!(phases, expected_phases, "{prompt}");
     }
 }
 

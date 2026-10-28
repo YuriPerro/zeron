@@ -122,6 +122,7 @@ tid=$(rid "$turnline")
 if has "$turnline" '"method":"thread/compact/start"'; then
   emit "{\"id\":$tid,\"result\":{}}"
   emit '{"method":"turn/started","params":{"turn":{"id":"native-1"}}}'
+  emit '{"method":"item/started","params":{"item":{"id":"compact-1","type":"contextCompaction"}}}'
   emit '{"method":"item/completed","params":{"item":{"id":"compact-1","type":"contextCompaction"}}}'
   emit '{"method":"turn/completed","params":{"turn":{"id":"native-1","status":"completed"}}}'
   exec sleep 30

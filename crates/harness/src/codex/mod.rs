@@ -81,9 +81,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AccessMode, AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice,
-    ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AccessMode, AgentEvent, CompactionPhase, DoneStatus, HarnessId, Model, ModelOption,
+    ModelOptionChoice, ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient, transport_lost};
@@ -1929,12 +1929,24 @@ async fn run_session(session: Session) {
                                 }
                             }
                         }
+                        if item_type(item) == "contextCompaction" {
+                            let phase = match phase {
+                                Phase::Started => CompactionPhase::Started,
+                                Phase::Completed => CompactionPhase::Finished,
+                            };
+                            if !send(&event_tx, AgentEvent::Compaction {
+                                phase,
+                                tokens_before: None,
+                                tokens_after: None,
+                            }).await {
+                                break 'main;
+                            }
+                        }
                         if phase == Phase::Completed {
                             let output = match item_type(item) {
                                 "exitedReviewMode" => {
                                     item.get("review").and_then(Value::as_str).map(str::to_owned)
                                 }
-                                "contextCompaction" => Some("Context compacted.".to_owned()),
                                 // Plan mode's proposed plan: Codex lifts it
                                 // out of the agent message into its own item
                                 // (the completed one is authoritative, its

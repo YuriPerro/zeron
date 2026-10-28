@@ -796,6 +796,13 @@ pub enum DoneStatus {
     Errored,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompactionPhase {
+    Started,
+    Finished,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors zeron's `AgentEvent` tagged enum.
@@ -866,6 +873,15 @@ pub enum AgentEvent {
     ContextUsage {
         tokens: Option<u64>,
         window: Option<u64>,
+    },
+    /// The provider compacted the conversation context. `Started` opens the
+    /// transcript line, `Finished` settles it; counts the provider did not
+    /// send stay `None` and are filled by the engine from context readings.
+    #[serde(rename_all = "camelCase")]
+    Compaction {
+        phase: CompactionPhase,
+        tokens_before: Option<u64>,
+        tokens_after: Option<u64>,
     },
     /// The subscription's usage as the provider reported it mid-run (Muse's
     /// `usage/changed`): the engine records it on the account the run used,
@@ -963,6 +979,26 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn compaction_event_uses_camel_case_on_the_wire() {
+        let ev = AgentEvent::Compaction {
+            phase: CompactionPhase::Finished,
+            tokens_before: Some(224_463),
+            tokens_after: None,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "compaction",
+                "phase": "finished",
+                "tokensBefore": 224_463,
+                "tokensAfter": null,
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), ev);
     }
 
     /// Drivers spell the key differently; the chip must not care which one
