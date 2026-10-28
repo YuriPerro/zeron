@@ -6,6 +6,7 @@ mod handoff;
 #[path = "pull_request_interactions.rs"]
 mod interactions;
 use crate::{
+    pull_request_hosts::{DEFAULT_HOST, PullRequestHosts},
     settings::{self, PullRequestDestination, widgets},
     state::AppState,
     theme::Theme,
@@ -16,9 +17,9 @@ use gpui::{
 };
 #[cfg(test)]
 use std::time::Duration;
-use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
+use std::{borrow::Cow, cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 use zeron_proto::change_request_assessment::{CiState, Facts, check_failed, check_status};
-use zeron_proto::{ChangeRequestDetail, ChangeRequestListItem};
+use zeron_proto::{ChangeRequestDetail, ChangeRequestListItem, RepositoryRef};
 use zeron_rpc::methods;
 
 #[derive(Clone, PartialEq, Action)]
@@ -54,41 +55,46 @@ pub struct AddPullRequestProject(pub String);
 
 /// What went wrong and what to do, in words. Error codes and transport
 /// details never reach the reader.
-fn failure_reason(error: &zeron_rpc::RpcError) -> &'static str {
+fn failure_reason(error: &zeron_rpc::RpcError, host: &str) -> Cow<'static, str> {
     use zeron_rpc::{RpcError, capability_errors as codes};
     match error {
         RpcError::Capability(code) if code == codes::PULL_REQUESTS_CLI_UNAVAILABLE => {
-            "Install GitHub CLI (gh) on this device and sign in."
+            "Install GitHub CLI (gh) on this device and sign in.".into()
+        }
+        RpcError::Capability(code)
+            if code == codes::PULL_REQUESTS_AUTHENTICATION && host != DEFAULT_HOST =>
+        {
+            format!("Run gh auth login -h {host} on this device, then refresh.").into()
         }
         RpcError::Capability(code) if code == codes::PULL_REQUESTS_AUTHENTICATION => {
-            "Run gh auth login on this device, then refresh."
+            "Run gh auth login on this device, then refresh.".into()
         }
         RpcError::Capability(code) if code == codes::PULL_REQUESTS_RATE_LIMITED => {
-            "GitHub’s rate limit was reached. Try again in 15 minutes."
+            "GitHub’s rate limit was reached. Try again in 15 minutes.".into()
         }
         RpcError::Capability(code) if code == codes::PULL_REQUESTS_TIMEOUT => {
-            "GitHub didn’t respond in time. Try again."
+            "GitHub didn’t respond in time. Try again.".into()
         }
         RpcError::Capability(code) if code == codes::PULL_REQUESTS_DECODE => {
-            "GitHub’s response was too large or unreadable. Open it on GitHub instead."
+            "GitHub’s response was too large or unreadable. Open it on GitHub instead.".into()
         }
-        RpcError::UnknownMethod(_) => "Update Zeron on the selected device.",
-        _ => "Check the link and your connection, then try again.",
+        RpcError::UnknownMethod(_) => "Update Zeron on the selected device.".into(),
+        _ => "Check the link and your connection, then try again.".into(),
     }
 }
 
-/// The canonical `https://github.com/owner/repo/pull/N` a link points into,
-/// e.g. from its Files tab or a review comment; `None` for anything else.
-pub(crate) fn pull_request_link(url: &str) -> Option<String> {
+/// The repository and number of a pull request link on any https host, e.g.
+/// from its Files tab or a review comment; `None` for anything else.
+fn parse_pull_request_link(url: &str) -> Option<(RepositoryRef, u64)> {
     let url = url::Url::parse(url).ok()?;
     if url.scheme() != "https"
-        || url.host_str() != Some("github.com")
         || url.port().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
     {
         return None;
     }
+    let host = url.host_str()?.to_lowercase();
     let mut segments = url.path_segments()?;
     let (owner, repository) = (segments.next()?, segments.next()?);
     let number = (segments.next()? == "pull")
@@ -100,28 +106,81 @@ pub(crate) fn pull_request_link(url: &str) -> Option<String> {
     if owner.is_empty() || repository.is_empty() {
         return None;
     }
-    Some(format!(
-        "https://github.com/{owner}/{repository}/pull/{number}"
+    Some((
+        RepositoryRef {
+            host,
+            repository: format!("{owner}/{repository}"),
+        },
+        number,
     ))
 }
 
-pub fn open(url: &str, window: &mut Window, cx: &mut App) {
-    open_on_device(url, None, window, cx);
+/// The canonical `https://{host}/owner/repo/pull/N` a link points into;
+/// `None` for anything else.
+pub(crate) fn pull_request_link(url: &str) -> Option<String> {
+    let (repository, number) = parse_pull_request_link(url)?;
+    Some(format!(
+        "https://{}/{}/pull/{number}",
+        repository.host, repository.repository
+    ))
 }
 
-/// Open `url` where Settings sends pull requests.
+/// The host and `owner/name` a pull request link points into.
+pub(crate) fn pull_request_repository(url: &str) -> Option<RepositoryRef> {
+    parse_pull_request_link(url).map(|(repository, _)| repository)
+}
+
+/// The host a pull request link points at, `github.com` when it names none.
+fn link_host(url: &str) -> String {
+    pull_request_repository(url).map_or_else(|| DEFAULT_HOST.to_owned(), |link| link.host)
+}
+
+/// Whether pull requests open in Zeron's own view, per Settings.
+pub(crate) fn opens_natively(cx: &App) -> bool {
+    settings::current(cx).pull_request_destination == PullRequestDestination::Native
+}
+
+/// Where a pull request link opens.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PullRequestOpening {
+    /// In Zeron's own view, read by the named device's engine; `None` for
+    /// this device.
+    Native(Option<String>),
+    /// In the browser: Settings send pull requests there, or `gh` isn't
+    /// signed in to the link's host on that device.
+    Browser,
+}
+
+/// Decides where `url` opens when read from `device`. This device's own id
+/// (`local_device`) counts as `None`, the key its host list is kept under.
+pub(crate) fn pull_request_opening(
+    url: &str,
+    device: Option<String>,
+    local_device: Option<&str>,
+    cx: &App,
+) -> PullRequestOpening {
+    let device = device.filter(|device| Some(device.as_str()) != local_device);
+    let known_host = pull_request_repository(url)
+        .is_some_and(|link| PullRequestHosts::hosts(cx, device.as_deref()).contains(&link.host));
+    if known_host && opens_natively(cx) {
+        PullRequestOpening::Native(device)
+    } else {
+        PullRequestOpening::Browser
+    }
+}
+
+/// Opens `url`, read from `device`, where Settings sends pull requests. For
+/// the native view the shell decides through [`pull_request_opening`] whether
+/// it opens here or in the default browser.
 pub fn open_on_device(url: &str, device: Option<String>, window: &mut Window, cx: &mut App) {
-    // The native view reads github.com through `gh`; pull requests on other
-    // hosts open in the default browser.
-    let on_github = url::Url::parse(url).is_ok_and(|url| url.host_str() == Some("github.com"));
     match settings::current(cx).pull_request_destination {
-        PullRequestDestination::Native if on_github => {
+        PullRequestDestination::Native => {
             window.dispatch_action(Box::new(OpenPullRequest(url.to_owned(), device)), cx);
         }
         PullRequestDestination::Browser => {
             window.dispatch_action(Box::new(OpenPullRequestInBrowser(url.to_owned())), cx);
         }
-        PullRequestDestination::Native | PullRequestDestination::External => cx.open_url(url),
+        PullRequestDestination::External => cx.open_url(url),
     }
 }
 
@@ -878,9 +937,10 @@ impl PullRequestDetailPage {
         };
         self.loading = true;
         self.error = None;
+        let host = link_host(&self.url);
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::GET_CHANGE_REQUEST, params).await
-                .map_err(|error| format!("Couldn’t load this pull request. {}", failure_reason(&error)))
+                .map_err(|error| format!("Couldn’t load this pull request. {}", failure_reason(&error, &host)))
                 .and_then(|value| serde_json::from_value::<ChangeRequestDetail>(value).map_err(|_| "The device sent a pull request this version can’t read. Update Zeron on the selected device.".to_owned()));
             // Large descriptions and review threads must not stall the UI thread.
             let result = cx.background_executor().spawn(async move {
@@ -948,12 +1008,15 @@ impl PullRequestDetailPage {
         let params = self.params(refresh);
         let detail = self.detail.as_ref().unwrap();
         let revisions = (detail.base_ref_oid.clone(), detail.head_ref_oid.clone());
+        let host = link_host(&self.url);
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::GET_CHANGE_REQUEST_DIFF, params)
                 .await
-                .map_err(|error| format!("Couldn’t load the diff. {}", failure_reason(&error)))
+                .map_err(|error| {
+                    format!("Couldn’t load the diff. {}", failure_reason(&error, &host))
+                })
                 .and_then(|value| {
                     serde_json::from_value::<String>(value)
                         .map_err(|_| "The device returned an invalid diff.".to_owned())
@@ -3236,15 +3299,16 @@ mod tests {
             RpcError::Transport("socket reset by peer".into()),
             RpcError::UnknownMethod(methods::GET_CHANGE_REQUEST.into()),
         ] {
-            let reason = failure_reason(&error);
+            let reason = failure_reason(&error, "github.com");
             assert!(!reason.contains("pull_requests."), "{reason}");
             assert!(!reason.contains("socket"), "{reason}");
             assert!(!reason.contains("GetChangeRequest"), "{reason}");
         }
         assert_eq!(
-            failure_reason(&RpcError::Capability(
-                codes::PULL_REQUESTS_AUTHENTICATION.into()
-            )),
+            failure_reason(
+                &RpcError::Capability(codes::PULL_REQUESTS_AUTHENTICATION.into()),
+                "github.com"
+            ),
             "Run gh auth login on this device, then refresh."
         );
     }
@@ -3333,6 +3397,75 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_link_keeps_host() {
+        assert_eq!(
+            pull_request_link("https://Acme.ghe.com/a/b/pull/12/files").as_deref(),
+            Some("https://acme.ghe.com/a/b/pull/12")
+        );
+    }
+
+    #[test]
+    fn pull_request_repository_names_host_and_repository() {
+        assert_eq!(
+            pull_request_repository("https://acme.ghe.com/a/b/pull/1"),
+            Some(zeron_proto::RepositoryRef {
+                host: "acme.ghe.com".into(),
+                repository: "a/b".into(),
+            })
+        );
+        assert_eq!(pull_request_repository("https://acme.ghe.com/a/b"), None);
+    }
+
+    #[test]
+    fn authentication_failure_names_a_non_default_host() {
+        let error = zeron_rpc::RpcError::Capability(
+            zeron_rpc::capability_errors::PULL_REQUESTS_AUTHENTICATION.into(),
+        );
+        assert_eq!(
+            failure_reason(&error, "acme.ghe.com"),
+            "Run gh auth login -h acme.ghe.com on this device, then refresh."
+        );
+        assert_eq!(
+            failure_reason(&error, "github.com"),
+            "Run gh auth login on this device, then refresh."
+        );
+    }
+
+    #[gpui::test]
+    fn pull_requests_open_natively_on_the_devices_signed_in_hosts(cx: &mut gpui::TestAppContext) {
+        let _settings = fixture::settings(cx, settings::UiSettings::default());
+        cx.update(|cx| {
+            PullRequestHosts::set(cx, None, vec!["github.com".into(), "acme.ghe.com".into()]);
+            PullRequestHosts::set(cx, Some("remote".into()), vec!["corp.ghe.com".into()]);
+            let ghe = "https://acme.ghe.com/a/b/pull/1";
+            let opening = |url: &str, device: Option<&str>, cx: &App| {
+                pull_request_opening(url, device.map(str::to_owned), Some("local"), cx)
+            };
+            assert_eq!(
+                opening(ghe, Some("local"), cx),
+                PullRequestOpening::Native(None)
+            );
+            assert_eq!(opening(ghe, None, cx), PullRequestOpening::Native(None));
+            assert_eq!(
+                opening(ghe, Some("remote"), cx),
+                PullRequestOpening::Browser
+            );
+            assert_eq!(
+                opening("https://corp.ghe.com/a/b/pull/1", Some("remote"), cx),
+                PullRequestOpening::Native(Some("remote".into()))
+            );
+            assert_eq!(
+                opening("https://other.example.com/a/b/pull/1", Some("local"), cx),
+                PullRequestOpening::Browser
+            );
+            settings::update(settings::SavePolicy::Immediate, cx, |settings| {
+                settings.pull_request_destination = PullRequestDestination::External;
+            });
+            assert_eq!(opening(ghe, None, cx), PullRequestOpening::Browser);
+        });
+    }
+
+    #[test]
     fn pull_request_links_resolve_to_their_pull_request() {
         for link in [
             "https://github.com/a/b/pull/12",
@@ -3348,7 +3481,6 @@ mod tests {
         }
         for link in [
             "http://github.com/a/b/pull/12",
-            "https://gitlab.com/a/b/pull/12",
             "https://github.com/a/b/issues/12",
             "https://github.com/a/b/pull/0",
             "https://github.com/a/b/pull/x",
@@ -3396,16 +3528,18 @@ mod tests {
             [(github.to_owned(), Some("remote".to_owned()))]
         );
         assert_eq!(cx.opened_url(), None);
-        // The view reads github.com only; other hosts go to the browser.
+        // Any host reaches the shell, which sends hosts `gh` isn't signed in
+        // to on that device to the default browser.
         open(cx, PullRequestDestination::Native, elsewhere);
-        assert_eq!(cx.opened_url().as_deref(), Some(elsewhere));
+        assert_eq!(cx.opened_url(), None);
+        assert_eq!(native.borrow().len(), 2);
         // A Browser tab can show any host.
         open(cx, PullRequestDestination::Browser, github);
         open(cx, PullRequestDestination::Browser, elsewhere);
         assert_eq!(*browser.borrow(), [github, elsewhere]);
         open(cx, PullRequestDestination::External, github);
         assert_eq!(cx.opened_url().as_deref(), Some(github));
-        assert_eq!(native.borrow().len(), 1);
+        assert_eq!(native.borrow().len(), 2);
         assert_eq!(browser.borrow().len(), 2);
     }
 

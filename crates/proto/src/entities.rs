@@ -1130,6 +1130,47 @@ pub struct ChangeRequestListItem {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A repository on one provider host, such as `acme.ghe.com` and `octo/app`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryRef {
+    pub host: String,
+    pub repository: String,
+}
+
+/// The repositories of one host that a pull request board lists together.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardScope {
+    pub host: String,
+    pub repositories: Vec<String>,
+}
+
+impl BoardScope {
+    /// The repositories lowercased, sorted and de-duplicated, so the same set
+    /// is always one search, one cache entry and one stored page.
+    pub fn repositories_normalized(&self) -> Vec<String> {
+        let mut repositories: Vec<String> = self
+            .repositories
+            .iter()
+            .map(|repository| repository.to_lowercase())
+            .collect();
+        repositories.sort();
+        repositories.dedup();
+        repositories
+    }
+
+    /// Stable identity of the scope, independent of repository order, case
+    /// and repeats.
+    pub fn key(&self) -> String {
+        format!(
+            "{}:{}",
+            self.host.to_lowercase(),
+            self.repositories_normalized().join(",")
+        )
+    }
+}
+
 /// One page of a repository-scoped listing, newest updates first.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -1735,6 +1776,25 @@ mod tests {
                 status
             );
         }
+    }
+
+    #[test]
+    fn board_scope_key_is_order_and_case_insensitive() {
+        let scope = BoardScope {
+            host: "GHE.example".into(),
+            repositories: vec!["B/x".into(), "a/y".into()],
+        };
+        assert_eq!(scope.key(), "ghe.example:a/y,b/x");
+    }
+
+    #[test]
+    fn board_scope_normalizes_to_sorted_unique_lowercase_repositories() {
+        let scope = BoardScope {
+            host: "GHE.example".into(),
+            repositories: vec!["B/x".into(), "a/y".into(), "b/X".into()],
+        };
+        assert_eq!(scope.repositories_normalized(), ["a/y", "b/x"]);
+        assert_eq!(scope.key(), "ghe.example:a/y,b/x");
     }
 
     #[test]

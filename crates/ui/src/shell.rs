@@ -4128,13 +4128,19 @@ impl Shell {
             };
         }
         // A pull request that stays opens Zeron's own view in this session's
-        // pane when Settings asks for it, else a Browser tab like any link.
+        // pane when Settings asks for it and `gh` is signed in to its host on
+        // the session's device, else a Browser tab like any link.
         if resolved.action == LinkAction::Internal
-            && settings.pull_request_destination == PullRequestDestination::Native
             && self.chat_pull_requests_available()
             && let Some(url) = pull_request
+            && let crate::pull_request_detail::PullRequestOpening::Native(target) =
+                crate::pull_request_detail::pull_request_opening(
+                    &url,
+                    self.chat_pull_request_device(None, cx),
+                    self.state.read(cx).local_device_id.as_deref(),
+                    cx,
+                )
         {
-            let target = self.chat_pull_request_device(None, cx);
             self.open_chat_pull_request(url, target, window, cx);
             return LinkOutcome::Internal;
         }
@@ -14058,28 +14064,35 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(
                 |this, action: &crate::pull_request_detail::OpenPullRequest, window, cx| {
+                    let device = action.1.clone().or_else(|| {
+                        if matches!(this.route, Route::PullRequests) {
+                            this.pull_requests_page
+                                .as_ref()
+                                .and_then(|page| page.read(cx).target_device())
+                        } else {
+                            let state = this.state.read(cx);
+                            state.selected_chat_row().map(|chat| chat.device_id.clone())
+                        }
+                    });
+                    let local_device = this.state.read(cx).local_device_id.clone();
+                    let crate::pull_request_detail::PullRequestOpening::Native(target) =
+                        crate::pull_request_detail::pull_request_opening(
+                            &action.0,
+                            device,
+                            local_device.as_deref(),
+                            cx,
+                        )
+                    else {
+                        cx.open_url(&action.0);
+                        return;
+                    };
                     // From a chat (a sidebar badge, the composer's badge), the
                     // pull request opens beside the focused session, so
                     // several can be compared in one conversation.
                     if this.chat_pull_requests_available() {
-                        let target = this.chat_pull_request_device(action.1.clone(), cx);
                         this.open_chat_pull_request(action.0.clone(), target, window, cx);
                         return;
                     }
-                    let target = if let Some(device) = action.1.clone() {
-                        (Some(device.as_str()) != this.state.read(cx).local_device_id.as_deref())
-                            .then_some(device)
-                    } else if matches!(this.route, Route::PullRequests) {
-                        this.pull_requests_page
-                            .as_ref()
-                            .and_then(|page| page.read(cx).target_device())
-                    } else {
-                        let state = this.state.read(cx);
-                        state.selected_chat_row().and_then(|chat| {
-                            (Some(chat.device_id.as_str()) != state.local_device_id.as_deref())
-                                .then(|| chat.device_id.clone())
-                        })
-                    };
                     // Back from a pull request returns to wherever it was
                     // opened from: a chat, the board, or another pull request.
                     this.enter_pull_requests_route(cx);
@@ -16458,7 +16471,9 @@ mod exit_regressions {
                         settings.open_web_links_in_zeron = open_links_in_zeron;
                         settings.pull_request_destination =
                             settings::PullRequestDestination::External;
-                        settings.last_pull_request_repository = Some("acme/zeron".into());
+                        settings.last_pull_request_host = Some("acme.ghe.com".into());
+                        settings.last_pull_request_repositories =
+                            [("acme.ghe.com".to_owned(), vec!["infra/a".to_owned()])].into();
                         settings.last_pull_request_device = Some("remote-pr-device".into());
                         settings.terminal_font_family = terminal_family.clone();
                         settings.terminal_font_size = terminal_size;
@@ -16492,8 +16507,12 @@ mod exit_regressions {
                             Some(dir.path().join("wallpapers/current.png"))
                         );
                         assert_eq!(
-                            current.last_pull_request_repository.as_deref(),
-                            Some("acme/zeron")
+                            current.last_pull_request_host.as_deref(),
+                            Some("acme.ghe.com")
+                        );
+                        assert_eq!(
+                            current.last_pull_request_repositories["acme.ghe.com"],
+                            ["infra/a"]
                         );
                         assert_eq!(
                             current.last_pull_request_device.as_deref(),
@@ -16526,8 +16545,12 @@ mod exit_regressions {
                     settings::flush(cx);
                     let loaded = settings::UiSettings::load(dir.path());
                     assert_eq!(
-                        loaded.last_pull_request_repository.as_deref(),
-                        Some("acme/zeron")
+                        loaded.last_pull_request_host.as_deref(),
+                        Some("acme.ghe.com")
+                    );
+                    assert_eq!(
+                        loaded.last_pull_request_repositories["acme.ghe.com"],
+                        ["infra/a"]
                     );
                     assert_eq!(
                         loaded.last_pull_request_device.as_deref(),
@@ -17011,6 +17034,58 @@ mod exit_regressions {
             );
         });
         cx.run_until_parked();
+    }
+
+    /// Opens `url` the way a chat badge does, naming this device by its id,
+    /// with `acme.ghe.com` signed in here. Returns the pane's tabs and the
+    /// URL handed to the browser.
+    fn open_from_local_chat_badge(
+        cx: &mut TestAppContext,
+        url: &str,
+    ) -> (Vec<(String, Option<String>)>, Option<String>) {
+        let (shell, cx, _dir) = pull_request_shell(cx);
+        cx.update(|_, cx| {
+            motion::set_reduced_motion(cx, true);
+            crate::pull_request_hosts::PullRequestHosts::set(
+                cx,
+                None,
+                vec!["github.com".into(), "acme.ghe.com".into()],
+            );
+        });
+        shell.update(cx, |shell, cx| {
+            shell
+                .state
+                .update(cx, |state, _| state.local_device_id = Some("local".into()));
+        });
+        cx.update(|window, cx| {
+            crate::pull_request_detail::open_on_device(url, Some("local".into()), window, cx)
+        });
+        cx.run_until_parked();
+        let tabs = shell.read_with(cx, |shell, _| {
+            shell
+                .pull_request_pane
+                .tabs
+                .iter()
+                .map(|tab| (tab.url.clone(), tab.device.clone()))
+                .collect()
+        });
+        (tabs, cx.opened_url())
+    }
+
+    #[gpui::test]
+    fn ghe_badge_from_a_local_chat_opens_natively(cx: &mut TestAppContext) {
+        let url = "https://acme.ghe.com/a/b/pull/1";
+        let (tabs, opened) = open_from_local_chat_badge(cx, url);
+        assert_eq!(tabs, [(url.to_owned(), None)]);
+        assert_eq!(opened, None);
+    }
+
+    #[gpui::test]
+    fn badge_on_an_unknown_host_opens_the_browser(cx: &mut TestAppContext) {
+        let url = "https://other.example.com/a/b/pull/1";
+        let (tabs, opened) = open_from_local_chat_badge(cx, url);
+        assert!(tabs.is_empty());
+        assert_eq!(opened.as_deref(), Some(url));
     }
 
     #[gpui::test]
@@ -18187,6 +18262,75 @@ mod exit_regressions {
             cx.opened_url().as_deref(),
             Some("https://github.com/e/f/pull/3")
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[gpui::test]
+    fn transcript_pull_request_links_open_natively_only_on_signed_in_hosts(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::markdown::render::{LinkAction, LinkActivation, LinkOutcome, LinkTarget};
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::pull_request_hosts::PullRequestHosts::set(
+                cx,
+                None,
+                vec!["github.com".into(), "acme.ghe.com".into()],
+            );
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                shell.active_chat = "first-session".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("first-session".into())
+                });
+                let activate =
+                    |shell: &mut Shell, url: &str, window: &mut Window, cx: &mut Context<Shell>| {
+                        let activation = LinkActivation {
+                            target: LinkTarget::new("Pull request", url),
+                            action: LinkAction::Primary,
+                            source_session: Some("first-session".into()),
+                        };
+                        shell.activate_session_link(&activation, window, cx)
+                    };
+                assert_eq!(
+                    activate(shell, "https://other.example.com/a/b/pull/1", window, cx),
+                    LinkOutcome::Internal
+                );
+                assert!(shell.chat_pull_requests.is_empty());
+                assert_eq!(
+                    shell.browsers.len(),
+                    1,
+                    "an unknown host opens as a web page"
+                );
+                assert_eq!(
+                    activate(shell, "https://acme.ghe.com/a/b/pull/1", window, cx),
+                    LinkOutcome::Internal
+                );
+                assert_eq!(shell.chat_pull_requests.len(), 1);
+                assert_eq!(shell.browsers.len(), 1);
+            })
+            .unwrap();
     }
 
     /// Encoded destinations open the decoded path, and an absolute

@@ -1282,8 +1282,12 @@ pub struct UiSettings {
     /// `pullRequestDestination` for older builds sharing this file.
     #[serde(rename = "pullRequestOpenIn")]
     pub pull_request_destination: PullRequestDestination,
-    /// Last explicitly selected PR scope, restored when no project is selected.
-    pub last_pull_request_repository: Option<String>,
+    /// Host of the last explicitly selected PR scope, restored when no
+    /// project is selected.
+    pub last_pull_request_host: Option<String>,
+    /// The repositories last chosen on each host, restored when the board
+    /// returns to that host.
+    pub last_pull_request_repositories: std::collections::BTreeMap<String, Vec<String>>,
     pub last_pull_request_device: Option<String>,
     /// Device-local bookmarks, keyed by provider/repository/PR, never GitHub mutations.
     pub pull_request_stars: Vec<String>,
@@ -1410,7 +1414,8 @@ impl Default for UiSettings {
             open_web_links_in_zeron: true,
             transcript_compact_mode: false,
             pull_request_destination: PullRequestDestination::Native,
-            last_pull_request_repository: None,
+            last_pull_request_host: None,
+            last_pull_request_repositories: Default::default(),
             last_pull_request_device: None,
             pull_request_stars: Vec::new(),
             files_autosave_enabled: false,
@@ -2275,7 +2280,8 @@ impl UiSettings {
             codex_voice_device,
             legacy_accent_color,
             pull_request_destination,
-            last_pull_request_repository,
+            last_pull_request_host,
+            last_pull_request_repositories,
             last_pull_request_device,
             pull_request_stars,
         );
@@ -3465,7 +3471,12 @@ mod tests {
             open_web_links_in_zeron: false,
             transcript_compact_mode: true,
             pull_request_destination: PullRequestDestination::External,
-            last_pull_request_repository: Some("acme/zeron".into()),
+            last_pull_request_host: Some("acme.ghe.com".into()),
+            last_pull_request_repositories: [(
+                "acme.ghe.com".to_owned(),
+                vec!["infra/a".to_owned(), "infra/b".to_owned()],
+            )]
+            .into(),
             last_pull_request_device: Some("remote-device".into()),
             pull_request_stars: vec!["https://github.com/acme/zeron/pull/123".into()],
             files_autosave_enabled: true,
@@ -3504,6 +3515,9 @@ mod tests {
         let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(json.contains(r#""diffWrap": true"#));
         assert_eq!(UiSettings::load(dir.path()), settings);
+        assert!(json.contains(r#""lastPullRequestHost": "acme.ghe.com""#));
+        assert!(json.contains(r#""lastPullRequestRepositories": {"#));
+        assert!(!json.contains("lastPullRequestRepository\""));
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""renderMath": false"#));
         assert!(json.contains(r#""mathFont": "stixTwo""#));
@@ -3520,6 +3534,17 @@ mod tests {
         assert!(json.contains(r#""terminalFontSize": 15.0"#));
         assert!(json.contains(r#""codeFontFamily": "geist""#));
         assert!(json.contains(r#""codeFontSize": 11.0"#));
+    }
+
+    #[test]
+    fn single_pull_request_repository_from_older_settings_is_dropped() {
+        let settings: UiSettings = serde_json::from_str(
+            r#"{"lastPullRequestRepository": "acme/zeron", "lastPullRequestDevice": "remote"}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.last_pull_request_host, None);
+        assert!(settings.last_pull_request_repositories.is_empty());
+        assert_eq!(settings.last_pull_request_device.as_deref(), Some("remote"));
     }
 
     #[test]

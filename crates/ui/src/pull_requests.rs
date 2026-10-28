@@ -10,8 +10,8 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Task, Window, div, list, prelude::*, px,
 };
 use zeron_proto::{
-    ChangeRequestFilter, ChangeRequestListItem, ChangeRequestMergeability, ChangeRequestPage,
-    ChangeRequestReviewDecision, Device,
+    BoardScope, ChangeRequestFilter, ChangeRequestListItem, ChangeRequestMergeability,
+    ChangeRequestPage, ChangeRequestReviewDecision, Device, RepositoryRef,
 };
 use zeron_rpc::{RpcError, capability_errors, methods};
 
@@ -20,6 +20,7 @@ use zeron_proto::change_request_assessment::{Blocker, CiState, Facts};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::popover;
+use crate::pull_request_hosts::{DEFAULT_HOST, PullRequestHosts};
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -37,6 +38,8 @@ const PR_SCROLL_FADE_BAND: f32 = 24.0;
 const STORED_PAGE_FRESH: std::time::Duration = std::time::Duration::from_secs(60);
 /// Every control in the board's header and filter rows shares one height.
 const HEADER_CONTROL_HEIGHT: f32 = 32.0;
+/// A board lists at most this many repositories, all on one host.
+const MAX_BOARD_REPOSITORIES: usize = 5;
 
 /// Where the loaded listing stands relative to everything GitHub matched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -295,16 +298,22 @@ pub struct PullRequestsPage {
     search: Entity<ComposerInput>,
     query: String,
     repository_input: Entity<ComposerInput>,
-    repository: Option<String>,
+    /// The repositories listed, all on [`Self::host`]; `None` until chosen.
+    scope: Option<BoardScope>,
+    /// The `gh` host the board lists, even while no repository is chosen.
+    host: String,
     initial_scope_attempted: bool,
     initial_scope_task: Option<Task<()>>,
     resolving_project: Option<ProjectRef>,
-    project_repositories: HashMap<ProjectRef, String>,
+    project_repositories: HashMap<ProjectRef, RepositoryRef>,
     project_icons: crate::shell::project_icon::ProjectIcons,
     /// The project the board was last opened from. Opening it from another
     /// project follows that project; an explicit choice stands until then.
     seen_context: Option<ProjectRef>,
     _repository_events: Subscription,
+    /// The target device's host list, while it loads.
+    hosts_task: Option<Task<()>>,
+    /// Keyed on the target device, [`BoardScope::key`] and the filter.
     snapshots: Vec<(
         (Option<String>, String, ChangeRequestFilter),
         Vec<ChangeRequestListItem>,
@@ -336,6 +345,7 @@ pub struct PullRequestsPage {
     /// A new repository starts on Authored; only this automatic choice may
     /// fall back to All. Explicit choices and settled defaults survive visits.
     automatic_filter: bool,
+    /// Keyed on the target device and [`BoardScope::key`].
     scope_filters: Vec<((Option<String>, String), ChangeRequestFilter)>,
     filter_fades: crate::motion::HoverFades,
     load_state: PullRequestsLoadState,
@@ -349,13 +359,15 @@ pub struct PullRequestsPage {
     content_width: Option<f32>,
     device_menu: popover::Popup<()>,
     sort_menu: popover::Popup<()>,
+    host_menu: popover::Popup<()>,
     repository_menu: popover::Popup<()>,
     repository_scroll: widgets::PageScroll,
     /// Menu triggers, so a menu closed from the keyboard hands focus back.
+    host_focus: gpui::FocusHandle,
     repository_focus: gpui::FocusHandle,
     sort_focus: gpui::FocusHandle,
     device_focus: gpui::FocusHandle,
-    /// The current option of an open sort or device menu, so a menu opened
+    /// The current option of an open sort, host or device menu, so a menu opened
     /// from the keyboard starts there and Tab walks its options.
     option_focus: gpui::FocusHandle,
     return_focus: Option<gpui::FocusHandle>,
@@ -551,10 +563,7 @@ impl PullRequestsPage {
             cx.subscribe(
                 &repository_input,
                 |page: &mut Self, _, event, cx| match event {
-                    ComposerInputEvent::Submitted => {
-                        page.return_focus = Some(page.repository_focus.clone());
-                        page.select_repository(cx);
-                    }
+                    ComposerInputEvent::Submitted => page.add_typed_repository(cx),
                     ComposerInputEvent::Edited => {
                         page.cancel_project_detection();
                         cx.notify();
@@ -576,7 +585,8 @@ impl PullRequestsPage {
             search,
             query: String::new(),
             repository_input,
-            repository: None,
+            scope: None,
+            host: DEFAULT_HOST.to_owned(),
             initial_scope_attempted: false,
             initial_scope_task: None,
             resolving_project: None,
@@ -584,6 +594,7 @@ impl PullRequestsPage {
             project_icons: Default::default(),
             seen_context: None,
             _repository_events: repository_events,
+            hosts_task: None,
             snapshots: Vec::new(),
             paging: Paging::default(),
             more_task: None,
@@ -615,8 +626,10 @@ impl PullRequestsPage {
             content_width: None,
             device_menu: popover::Popup::default(),
             sort_menu: popover::Popup::default(),
+            host_menu: popover::Popup::default(),
             repository_menu: popover::Popup::default(),
             repository_scroll: widgets::PageScroll::default(),
+            host_focus: cx.focus_handle().tab_stop(true),
             repository_focus: cx.focus_handle().tab_stop(true),
             sort_focus: cx.focus_handle().tab_stop(true),
             device_focus: cx.focus_handle().tab_stop(true),
@@ -632,7 +645,7 @@ impl PullRequestsPage {
     /// from (sidebar project, else the open session's), else the repository
     /// viewed last, else the most recently active local Git project.
     fn initialize_repository(&mut self, cx: &mut Context<Self>) {
-        if self.repository.is_some() || self.initial_scope_attempted || !self.visible {
+        if self.scope.is_some() || self.initial_scope_attempted || !self.visible {
             return;
         }
         let state = self.state.read(cx);
@@ -650,10 +663,9 @@ impl PullRequestsPage {
             .local_device_id
             .clone()
             .unwrap_or_else(|| engine.engine_info().device_id.clone());
-        let fallback = saved
-            .last_pull_request_repository
-            .filter(|repo| valid_repository_filter(repo))
-            .map(|repo| (repo, saved.last_pull_request_device));
+        let fallback =
+            saved_scope(&saved).map(|scope| (scope, saved.last_pull_request_device.clone()));
+        let selections = saved.last_pull_request_repositories;
         let candidates =
             match &context {
                 Some(project) => {
@@ -681,8 +693,8 @@ impl PullRequestsPage {
             };
         self.seen_context = context;
         if candidates.is_empty() {
-            if let Some((repo, target)) = fallback {
-                self.apply_initial_repository(repo, target, cx);
+            if let Some((scope, target)) = fallback {
+                self.apply_initial_scope(scope, target, cx);
             }
             return;
         }
@@ -706,9 +718,9 @@ impl PullRequestsPage {
                 discovery_failed |= result.is_err();
                 if let Some(repository) = result
                     .ok()
-                    .and_then(|value| serde_json::from_value::<Option<String>>(value).ok())
+                    .and_then(|value| serde_json::from_value::<Option<RepositoryRef>>(value).ok())
                     .flatten()
-                    .filter(|repo| valid_repository_filter(repo))
+                    .filter(|repo| valid_repository_filter(&repo.repository))
                 {
                     found = Some((repository, target, project));
                     break;
@@ -717,16 +729,16 @@ impl PullRequestsPage {
             let _ = this.update(cx, |page, cx| {
                 page.initial_scope_task = None;
                 // User selection cancels this task; never override their scope.
-                if page.repository.is_some() {
+                if page.scope.is_some() {
                     return;
                 }
                 page.load_state = PullRequestsLoadState::Idle;
                 let found = found.map(|(repo, target, project)| {
                     page.project_repositories.insert(project, repo.clone());
-                    (repo, target)
+                    (detected_scope(repo, &selections), target)
                 });
-                if let Some((repo, target)) = found.or(fallback) {
-                    page.apply_initial_repository(repo, target, cx);
+                if let Some((scope, target)) = found.or(fallback) {
+                    page.apply_initial_scope(scope, target, cx);
                 } else if discovery_failed && explicit_context {
                     crate::toast::error(cx, "Couldn’t detect this project’s repository. Choose a repository to continue.");
                 }
@@ -738,7 +750,7 @@ impl PullRequestsPage {
     /// Opened from a different project than last time: show that project's
     /// pull requests instead of whatever the board held.
     fn follow_context(&mut self, cx: &mut Context<Self>) {
-        if self.repository.is_none() {
+        if self.scope.is_none() {
             return;
         }
         let saved = crate::settings::current(cx);
@@ -751,23 +763,34 @@ impl PullRequestsPage {
             return;
         }
         self.cancel_project_detection();
-        self.repository = None;
+        self.scope = None;
         self.automatic_filter = true;
         self.initial_scope_task = None;
         self.initial_scope_attempted = false;
         self.reset_for_target(self.target_device.clone(), cx);
     }
 
-    fn apply_initial_repository(
+    /// Show `scope` on `target` as the whole selection: the board's own
+    /// choice on open, or the saved one.
+    fn apply_initial_scope(
         &mut self,
-        repository: String,
+        scope: BoardScope,
         target: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.target_device = target;
-        self.repository_input
-            .update(cx, |input, cx| input.set_text(&repository, cx));
-        self.select_repository(cx);
+        self.cancel_project_detection();
+        if self.target_device != target {
+            self.reset_for_target(target, cx);
+        }
+        self.host = scope.host.to_ascii_lowercase();
+        self.apply_scope(
+            scope
+                .repositories
+                .iter()
+                .map(|repository| repository.to_ascii_lowercase())
+                .collect(),
+            cx,
+        );
     }
 
     pub(crate) fn on_project_scope_changed(&mut self, cx: &mut Context<Self>) {
@@ -775,7 +798,7 @@ impl PullRequestsPage {
         if self.visible {
             self.follow_context(cx);
         }
-        if self.repository.is_none() {
+        if self.scope.is_none() {
             self.initial_scope_task = None;
             self.initial_scope_attempted = false;
             self.load_state = PullRequestsLoadState::Idle;
@@ -787,7 +810,9 @@ impl PullRequestsPage {
     /// Called whenever shell navigation makes the already-owned entity visible again.
     pub fn on_visible(&mut self, cx: &mut Context<Self>) {
         self.visible = true;
-        self.reconcile_target_device(cx);
+        if !self.reconcile_target_device(cx) {
+            self.fetch_hosts(cx);
+        }
         // Returning from the same project reuses the board as it was.
         self.follow_context(cx);
         self.initialize_repository(cx);
@@ -799,6 +824,7 @@ impl PullRequestsPage {
         self.cancel_project_detection();
         self.visible = false;
         self.sort_menu = popover::Popup::default();
+        self.host_menu = popover::Popup::default();
         self.repository_menu = popover::Popup::default();
         if self.initial_scope_task.take().is_some() {
             self.initial_scope_attempted = false;
@@ -826,16 +852,51 @@ impl PullRequestsPage {
         cx.notify();
     }
 
+    /// Ask the target device which hosts `gh` is signed in to, then make
+    /// sure the board's host is still one of them.
+    fn fetch_hosts(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let fetch = PullRequestHosts::fetch(engine, self.target_device.clone(), cx);
+        self.hosts_task = Some(cx.spawn(async move |this, cx| {
+            fetch.await;
+            this.update(cx, |page, cx| {
+                page.hosts_task = None;
+                page.reconcile_host(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// A host signed out of (`gh auth logout`) leaves the chip; the board
+    /// moves to the first host the device still knows, keeping the saved
+    /// choice for when it signs back in.
+    fn reconcile_host(&mut self, cx: &mut Context<Self>) {
+        let Some(hosts) = PullRequestHosts::known(cx, self.target_device.as_deref()) else {
+            return;
+        };
+        if hosts.contains(&self.host) {
+            return;
+        }
+        if let Some(first) = hosts.first().cloned() {
+            self.switch_host(first, false, cx);
+        }
+    }
+
     fn reset_for_target(&mut self, target: Option<String>, cx: &mut Context<Self>) {
         self.generation = self.generation.wrapping_add(1);
         self.request_task = None;
+        let target_changed = self.target_device != target;
         self.target_device = target;
-        let remembered = self.repository.as_ref().and_then(|repository| {
+        if target_changed {
+            self.fetch_hosts(cx);
+        }
+        let remembered = self.scope.as_ref().map(BoardScope::key).and_then(|key| {
             self.scope_filters
                 .iter()
-                .find(|((target, repo), _)| {
-                    target == &self.target_device && repo.eq_ignore_ascii_case(repository)
-                })
+                .find(|((target, scope), _)| target == &self.target_device && scope == &key)
                 .map(|(_, filter)| *filter)
         });
         self.automatic_filter = remembered.is_none();
@@ -853,16 +914,14 @@ impl PullRequestsPage {
     }
 
     fn restore_snapshot(&mut self) {
-        let Some(repository) = &self.repository else {
+        let Some(key) = self.scope.as_ref().map(BoardScope::key) else {
             return;
         };
         if let Some(index) = self
             .snapshots
             .iter()
-            .position(|((target, repo, filter), ..)| {
-                target == &self.target_device
-                    && repo.eq_ignore_ascii_case(repository)
-                    && filter == &self.filter
+            .position(|((target, scope, filter), ..)| {
+                target == &self.target_device && scope == &key && filter == &self.filter
             })
         {
             let snapshot = self.snapshots.remove(index);
@@ -874,7 +933,64 @@ impl PullRequestsPage {
         }
     }
 
-    fn select_repository(&mut self, cx: &mut Context<Self>) {
+    /// The trigger's label: the first repository alphabetically, and how
+    /// many more there are.
+    fn scope_label(&self) -> String {
+        let Some(scope) = self.scope.as_ref() else {
+            return if self.initial_scope_task.is_some() {
+                "Detecting repository…".into()
+            } else {
+                "Choose repository".into()
+            };
+        };
+        let first = scope
+            .repositories
+            .iter()
+            .min_by_key(|repository| repository.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default();
+        match scope.repositories.len() {
+            0 | 1 => first,
+            count => format!("{first} +{}", count - 1),
+        }
+    }
+
+    fn scope_contains(&self, repository: &str) -> bool {
+        self.scope.as_ref().is_some_and(|scope| {
+            scope
+                .repositories
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(repository))
+        })
+    }
+
+    /// Add `repository` to the board, or take it off when it is already
+    /// there. The menu stays open for the next choice.
+    fn toggle_repository(&mut self, repository: String, cx: &mut Context<Self>) {
+        self.cancel_project_detection();
+        let repository = repository.to_ascii_lowercase();
+        let mut repositories = self
+            .scope
+            .as_ref()
+            .map(|scope| scope.repositories.clone())
+            .unwrap_or_default();
+        if let Some(index) = repositories
+            .iter()
+            .position(|known| known.eq_ignore_ascii_case(&repository))
+        {
+            repositories.remove(index);
+        } else if repositories.len() >= MAX_BOARD_REPOSITORIES {
+            crate::toast::error(cx, "Choose up to 5 repositories.");
+            cx.notify();
+            return;
+        } else {
+            repositories.push(repository);
+        }
+        self.apply_scope(repositories, cx);
+    }
+
+    /// Add the repository typed in the menu's search row.
+    fn add_typed_repository(&mut self, cx: &mut Context<Self>) {
         self.cancel_project_detection();
         let repository = self
             .repository_input
@@ -887,23 +1003,77 @@ impl PullRequestsPage {
             cx.notify();
             return;
         }
-        self.close_repository_menu(cx);
-        self.initial_scope_task = None;
-        self.initial_scope_attempted = true;
-        let saved_repository = repository.clone();
+        self.repository_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        if !self.scope_contains(&repository) {
+            self.toggle_repository(repository, cx);
+        }
+        cx.notify();
+    }
+
+    fn select_host(&mut self, host: String, cx: &mut Context<Self>) {
+        self.close_host_menu(cx);
+        self.switch_host(host, true, cx);
+    }
+
+    /// List another host: the repositories last chosen there, or none.
+    /// `remember` saves it as the board's host; an automatic switch leaves
+    /// the saved choice alone.
+    fn switch_host(&mut self, host: String, remember: bool, cx: &mut Context<Self>) {
+        let host = host.to_ascii_lowercase();
+        if host == self.host {
+            return;
+        }
+        self.cancel_project_detection();
+        let saved = crate::settings::current(cx)
+            .last_pull_request_repositories
+            .remove(&host)
+            .unwrap_or_default();
+        self.host = host;
+        let repositories = saved
+            .into_iter()
+            .filter(|repository| valid_repository_filter(repository))
+            .take(MAX_BOARD_REPOSITORIES)
+            .collect();
+        if remember {
+            self.apply_scope(repositories, cx);
+        } else {
+            self.show_scope(repositories, cx);
+        }
+    }
+
+    /// Make `repositories` the board's selection on [`Self::host`], save it
+    /// for that host, and load it. An empty list leaves the board unscoped.
+    fn apply_scope(&mut self, repositories: Vec<String>, cx: &mut Context<Self>) {
+        let host = self.host.clone();
+        let saved_repositories = repositories.clone();
         let saved_device = self.target_device.clone();
         crate::settings::update(crate::settings::SavePolicy::Debounced, cx, |settings| {
-            settings.last_pull_request_repository = Some(saved_repository);
+            settings.last_pull_request_host = Some(host.clone());
+            if saved_repositories.is_empty() {
+                settings.last_pull_request_repositories.remove(&host);
+            } else {
+                settings
+                    .last_pull_request_repositories
+                    .insert(host.clone(), saved_repositories);
+            }
             settings.last_pull_request_device = saved_device;
         });
-        // GitHub's casing, adopted after a load, names the same repository.
-        if !self
-            .repository
-            .as_deref()
-            .is_some_and(|current| current.eq_ignore_ascii_case(&repository))
-        {
-            let unscoped_choice = self.repository.is_none() && !self.automatic_filter;
-            self.repository = Some(repository);
+        self.show_scope(repositories, cx);
+    }
+
+    /// Show `repositories` on [`Self::host`] and load them, without saving.
+    fn show_scope(&mut self, repositories: Vec<String>, cx: &mut Context<Self>) {
+        self.initial_scope_task = None;
+        self.initial_scope_attempted = true;
+        let scope = (!repositories.is_empty()).then(|| BoardScope {
+            host: self.host.clone(),
+            repositories,
+        });
+        // GitHub's casing, adopted after a load, names the same repositories.
+        if self.scope.as_ref().map(BoardScope::key) != scope.as_ref().map(BoardScope::key) {
+            let unscoped_choice = self.scope.is_none() && !self.automatic_filter;
+            self.scope = scope;
             if unscoped_choice {
                 self.remember_filter(self.filter);
             }
@@ -937,7 +1107,7 @@ impl PullRequestsPage {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.repository.is_none() && self.initial_scope_task.is_none() {
+        if self.scope.is_none() && self.initial_scope_task.is_none() {
             self.initial_scope_attempted = false;
             self.initialize_repository(cx);
         }
@@ -954,7 +1124,7 @@ impl PullRequestsPage {
             return;
         }
         self.set_filter(filter, cx);
-        if self.repository.is_none() {
+        if self.scope.is_none() {
             cx.notify();
             return;
         }
@@ -966,14 +1136,13 @@ impl PullRequestsPage {
     }
 
     fn remember_filter(&mut self, filter: ChangeRequestFilter) {
-        let Some(repository) = self.repository.clone() else {
+        let Some(key) = self.scope.as_ref().map(BoardScope::key) else {
             return;
         };
-        self.scope_filters.retain(|((target, repo), _)| {
-            target != &self.target_device || !repo.eq_ignore_ascii_case(&repository)
-        });
         self.scope_filters
-            .push(((self.target_device.clone(), repository), filter));
+            .retain(|((target, scope), _)| target != &self.target_device || scope != &key);
+        self.scope_filters
+            .push(((self.target_device.clone(), key), filter));
         if self.scope_filters.len() > 12 {
             self.scope_filters.remove(0);
         }
@@ -1006,7 +1175,7 @@ impl PullRequestsPage {
     fn cancel_project_detection(&mut self) {
         if self.resolving_project.take().is_some() {
             self.initial_scope_task = None;
-            if self.repository.is_none() {
+            if self.scope.is_none() {
                 self.load_state = PullRequestsLoadState::Idle;
             }
         }
@@ -1046,9 +1215,9 @@ impl PullRequestsPage {
             futures::pin_mut!(request, deadline);
             let repository = match futures::future::select(request, deadline).await {
                 futures::future::Either::Left((Ok(value), _)) => {
-                    serde_json::from_value::<Option<String>>(value)
+                    serde_json::from_value::<Option<RepositoryRef>>(value)
                         .map_err(|_| "The device returned an unreadable repository. Try again.")
-                        .and_then(|repo| repo.filter(|repo| valid_repository_filter(repo))
+                        .and_then(|repo| repo.filter(|repo| valid_repository_filter(&repo.repository))
                             .ok_or("This project has no GitHub remote. Enter owner/repository to open it directly."))
                 }
                 futures::future::Either::Left((Err(_), _)) => Err("Couldn’t read this project’s repository. Check the device connection and try again."),
@@ -1066,8 +1235,13 @@ impl PullRequestsPage {
                         if page.target_device != target {
                             page.reset_for_target(target.clone(), cx);
                         }
-                        page.return_focus = Some(page.repository_focus.clone());
-                        page.apply_initial_repository(repository, target, cx);
+                        let host = repository.host.to_ascii_lowercase();
+                        if host == page.host {
+                            page.toggle_repository(repository.repository, cx);
+                        } else {
+                            page.host = host;
+                            page.apply_scope(vec![repository.repository.to_ascii_lowercase()], cx);
+                        }
                     }
                     Err(error) => crate::toast::error(cx, error),
                 }
@@ -1080,26 +1254,33 @@ impl PullRequestsPage {
     fn project_is_selected(&self, project: &ProjectRef, local: Option<&str>) -> bool {
         self.target_device.as_deref().or(local) == Some(project.device.as_str())
             && self.project_repositories.get(project).is_some_and(|repo| {
-                self.repository
-                    .as_ref()
-                    .is_some_and(|current| current.eq_ignore_ascii_case(repo))
+                repo.host.eq_ignore_ascii_case(&self.host) && self.scope_contains(&repo.repository)
             })
     }
 
-    fn recent_repositories(&self) -> Vec<String> {
-        let mut seen = HashSet::new();
-        self.repository
+    /// The current host's repositories: the selection, then those loaded
+    /// recently on this device, then the selection saved for the host.
+    fn recent_repositories(&self, cx: &gpui::App) -> Vec<String> {
+        let saved = crate::settings::current(cx)
+            .last_pull_request_repositories
+            .remove(&self.host)
+            .unwrap_or_default();
+        let loaded = self
+            .snapshots
             .iter()
-            .chain(
-                self.snapshots
-                    .iter()
-                    .rev()
-                    .filter(|((target, _, _), ..)| target == &self.target_device)
-                    .map(|((_, repo, _), ..)| repo),
-            )
-            .filter(|repo| seen.insert(repo.to_ascii_lowercase()))
-            .take(5)
-            .cloned()
+            .rev()
+            .filter(|((target, _, _), ..)| target == &self.target_device)
+            .filter_map(|((_, key, _), ..)| key.rsplit_once(':'))
+            .filter(|(host, _)| *host == self.host)
+            .flat_map(|(_, repositories)| repositories.split(',').map(str::to_owned));
+        let mut seen = HashSet::new();
+        self.scope
+            .iter()
+            .flat_map(|scope| scope.repositories.iter().cloned())
+            .chain(loaded)
+            .chain(saved)
+            .filter(|repo| valid_repository_filter(repo) && seen.insert(repo.to_ascii_lowercase()))
+            .take(MAX_BOARD_REPOSITORIES)
             .collect()
     }
 
@@ -1109,13 +1290,22 @@ impl PullRequestsPage {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let label = self.repository.clone().unwrap_or_else(|| {
-            if self.initial_scope_task.is_some() {
-                "Detecting repository…".into()
-            } else {
-                "Choose repository".into()
-            }
-        });
+        let label = self.scope_label();
+        let repositories = self
+            .scope
+            .as_ref()
+            .map(|scope| scope.repositories.clone())
+            .unwrap_or_default();
+        let tooltip = if repositories.is_empty() {
+            label.clone()
+        } else {
+            repositories.join("\n")
+        };
+        let aria_label = if repositories.is_empty() {
+            label.clone()
+        } else {
+            repositories.join(", ")
+        };
         let (projects, local, profile, selected_space) = {
             let state = self.state.read(cx);
             let local = state.local_device_id.clone().or_else(|| {
@@ -1161,7 +1351,8 @@ impl PullRequestsPage {
                 .spaces
                 .iter()
                 .find(|space| {
-                    space.git_detected
+                    repositories.len() == 1
+                        && space.git_detected
                         && self.project_is_selected(
                             &ProjectRef {
                                 path: space.path.clone(),
@@ -1198,10 +1389,10 @@ impl PullRequestsPage {
                 .max_w(px(220.0))
                 .min_w_0()
                 .text_size(crate::typography::ui_rems(12.0))
-                .aria_label(format!("Repository: {label}"))
+                .aria_label(format!("Repository: {aria_label}"))
                 .aria_expanded(self.repository_menu.is_open())
                 .track_focus(&self.repository_focus)
-                .tooltip(widgets::text_tooltip(label.clone()))
+                .tooltip(widgets::text_tooltip(tooltip))
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(|page, _, _, _| page.repository_menu.note_trigger_press()),
@@ -1237,27 +1428,29 @@ impl PullRequestsPage {
                         .text_color(theme.text_muted),
                 );
         if self.repository_menu.get().is_some() {
-            let recent: Vec<_> = self
-                .recent_repositories()
-                .into_iter()
-                .filter(|repo| {
-                    !projects
-                        .iter()
-                        .flat_map(|(_, members)| members)
-                        .any(|(space, _, _)| {
-                            let project = ProjectRef {
-                                path: space.path.clone(),
-                                device: space.device_id.clone(),
-                            };
-                            Some(space.device_id.as_str())
-                                == self.target_device.as_deref().or(local.as_deref())
-                                && self
-                                    .project_repositories
-                                    .get(&project)
-                                    .is_some_and(|known| known.eq_ignore_ascii_case(repo))
-                        })
-                })
-                .collect();
+            let recent: Vec<_> =
+                self.recent_repositories(cx)
+                    .into_iter()
+                    .filter(|repo| {
+                        !projects
+                            .iter()
+                            .flat_map(|(_, members)| members)
+                            .any(|(space, _, _)| {
+                                let project = ProjectRef {
+                                    path: space.path.clone(),
+                                    device: space.device_id.clone(),
+                                };
+                                Some(space.device_id.as_str())
+                                    == self.target_device.as_deref().or(local.as_deref())
+                                    && self.project_repositories.get(&project).is_some_and(
+                                        |known| {
+                                            known.host.eq_ignore_ascii_case(&self.host)
+                                                && known.repository.eq_ignore_ascii_case(repo)
+                                        },
+                                    )
+                            })
+                    })
+                    .collect();
             // The project picker's rows: one 32pt line each, artwork and
             // name. Only checkouts that share a name say where they live.
             let mut options: Vec<AnyElement> = Vec::new();
@@ -1294,10 +1487,13 @@ impl PullRequestsPage {
                             .role(gpui::Role::Button)
                             .aria_selected(selected)
                             .tab_index(0)
-                            .aria_label(format!(
-                                "Open {name} repository on {device}: {}{}",
-                                space.path,
-                                if online { "" } else { ", offline" }
+                            .aria_label(toggle_label(
+                                selected,
+                                &format!(
+                                    "{name} repository on {device}: {}{}",
+                                    space.path,
+                                    if online { "" } else { ", offline" }
+                                ),
                             ))
                             .tooltip(widgets::text_tooltip(format!(
                                 "{name}\n{device}\n{}",
@@ -1358,18 +1554,16 @@ impl PullRequestsPage {
                         .into_any_element(),
                 );
                 for repo in recent {
-                    let selected = self
-                        .repository
-                        .as_ref()
-                        .is_some_and(|current| current.eq_ignore_ascii_case(&repo));
+                    let selected = self.scope_contains(&repo);
+                    let selector = format!("pr-recent-{repo}");
                     options.push(
-                        popover::picker_row(theme, selected, false, format!("pr-recent-{repo}"))
-                            .id(SharedString::from(format!("pr-recent-{repo}")))
-                            .debug_selector(|| "pr-recent-option".into())
+                        popover::picker_row(theme, selected, false, selector.clone())
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector(move || selector.clone())
                             .role(gpui::Role::Button)
                             .aria_selected(selected)
                             .tab_index(0)
-                            .aria_label(format!("Open {repo}"))
+                            .aria_label(toggle_label(selected, &repo))
                             .child(popover::picker_icon_slot(
                                 icon(icons::FOLDER)
                                     .size(px(14.0))
@@ -1379,10 +1573,7 @@ impl PullRequestsPage {
                             .child(div().flex_1().min_w_0().truncate().child(repo.clone()))
                             .on_click(cx.listener(move |page, _, _, cx| {
                                 cx.stop_propagation();
-                                page.return_focus = Some(page.repository_focus.clone());
-                                page.repository_input
-                                    .update(cx, |input, cx| input.set_text(&repo, cx));
-                                page.select_repository(cx);
+                                page.toggle_repository(repo.clone(), cx);
                             }))
                             .into_any_element(),
                     );
@@ -1410,15 +1601,14 @@ impl PullRequestsPage {
                         // edge, like the row's own text.
                         .pr(px(popover::CARD_INSET + 2.0))
                         // Enter is unbound in a "PaletteSearch" input and
-                        // bubbles here: it opens the typed repository, like
-                        // the Open button.
+                        // bubbles here: it adds the typed repository, like
+                        // the Add button.
                         .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
                             if event.keystroke.key == "enter"
                                 && !event.keystroke.modifiers.modified()
                             {
                                 cx.stop_propagation();
-                                page.return_focus = Some(page.repository_focus.clone());
-                                page.select_repository(cx);
+                                page.add_typed_repository(cx);
                             }
                         }))
                         .child(
@@ -1434,12 +1624,11 @@ impl PullRequestsPage {
                                 .px(px(10.0))
                                 .flex_none()
                                 .text_size(crate::typography::ui_rems(12.0))
-                                .aria_label("Open repository")
-                                .child("Open")
+                                .aria_label("Add repository")
+                                .child("Add")
                                 .on_click(cx.listener(|page, _, _, cx| {
                                     cx.stop_propagation();
-                                    page.return_focus = Some(page.repository_focus.clone());
-                                    page.select_repository(cx);
+                                    page.add_typed_repository(cx);
                                 })),
                         ),
                 )
@@ -1474,6 +1663,107 @@ impl PullRequestsPage {
                 "pr-repository-menu",
                 menu.into_any_element(),
                 self.repository_menu.closing_since(),
+            ));
+        }
+        trigger.into_any_element()
+    }
+
+    fn close_host_menu(&mut self, cx: &mut Context<Self>) {
+        if self.host_menu.begin_close() {
+            popover::reap_popup(cx, |page: &mut Self| &mut page.host_menu);
+            cx.notify();
+        }
+    }
+
+    /// The `gh` host chip, shown once the target device knows two hosts.
+    fn render_host_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let hosts = PullRequestHosts::hosts(cx, self.target_device.as_deref());
+        if hosts.len() < 2 {
+            return div().into_any_element();
+        }
+        let label = self.host.clone();
+        let mut trigger = crate::surface_chrome::tab("pr-host", self.host_menu.is_open(), theme)
+            .debug_selector(|| "pr-host".into())
+            .h(px(HEADER_CONTROL_HEIGHT))
+            .px(px(8.0))
+            .max_w(px(200.0))
+            .min_w_0()
+            .text_size(crate::typography::ui_rems(12.0))
+            .aria_label(format!("GitHub host: {label}"))
+            .aria_expanded(self.host_menu.is_open())
+            .track_focus(&self.host_focus)
+            .tooltip(widgets::text_tooltip(label.clone()))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|page, _, _, _| page.host_menu.note_trigger_press()),
+            )
+            .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && page.host_menu.is_open() {
+                    cx.stop_propagation();
+                    page.return_focus = Some(page.host_focus.clone());
+                    page.close_host_menu(cx);
+                }
+            }))
+            .on_click(cx.listener(|page, event, window, cx| {
+                cx.stop_propagation();
+                let keyboard = matches!(event, gpui::ClickEvent::Keyboard(_));
+                let open = if keyboard {
+                    page.host_menu.is_open()
+                } else {
+                    page.host_menu.take_press_was_open()
+                };
+                if open {
+                    page.close_host_menu(cx);
+                } else {
+                    page.host_menu.open(());
+                    if keyboard {
+                        window.focus(&page.option_focus, cx);
+                    }
+                }
+                cx.notify();
+            }))
+            .child(
+                icon(icons::REMOTE_SERVER)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(div().min_w_0().truncate().child(label))
+            .child(
+                icon(icons::ALT_ARROW_DOWN)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted),
+            );
+        if self.host_menu.get().is_some() {
+            let menu = popover::popover_card(theme)
+                .w(px(240.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .on_mouse_down_out(cx.listener(|page, _, _, cx| page.close_host_menu(cx)))
+                .child(repository_menu_label(theme, "GitHub hosts"))
+                .children(hosts.into_iter().map(|host| {
+                    let active = host == self.host;
+                    let id = format!("pr-host-{host}");
+                    let selector = id.clone();
+                    popover::menu_row(theme, active, id.clone())
+                        .id(SharedString::from(id))
+                        .when(active, |row| row.track_focus(&self.option_focus))
+                        .debug_selector(move || selector.clone())
+                        .role(gpui::Role::Button)
+                        .tab_index(0)
+                        .aria_selected(active)
+                        .aria_label(host.clone())
+                        .child(div().flex_1().min_w_0().truncate().child(host.clone()))
+                        .on_click(cx.listener(move |page, _, _, cx| {
+                            cx.stop_propagation();
+                            page.return_focus = Some(page.host_focus.clone());
+                            page.select_host(host.clone(), cx);
+                        }))
+                }));
+            trigger = trigger.child(popover::anchored_menu_below_end(
+                "pr-host-menu",
+                menu.into_any_element(),
+                self.host_menu.closing_since(),
             ));
         }
         trigger.into_any_element()
@@ -1625,7 +1915,7 @@ impl PullRequestsPage {
     /// stored page older than [`STORED_PAGE_FRESH`] is shown and then
     /// replaced by a GitHub read in the background.
     fn load_with(&mut self, refresh: bool, cached: bool, cx: &mut Context<Self>) {
-        if self.repository.is_none() || matches!(self.load_state, PullRequestsLoadState::Loading) {
+        if self.scope.is_none() || matches!(self.load_state, PullRequestsLoadState::Loading) {
             return;
         }
         self.reconcile_target_device(cx);
@@ -1647,8 +1937,7 @@ impl PullRequestsPage {
 
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        let mut params = params_for_target(self.target_device.as_deref());
-        params["repository"] = self.repository.clone().unwrap().into();
+        let mut params = self.scope_params();
         params["refresh"] = refresh.into();
         params["cached"] = cached.into();
         params["filter"] = serde_json::to_value(self.filter).unwrap();
@@ -1709,18 +1998,21 @@ impl PullRequestsPage {
                             .items
                             .iter()
                             .all(|item| item.repository == first.repository)
-                        && page.repository.as_deref() != Some(first.repository.as_str())
+                        && let Some(scope) = page.scope.as_mut()
+                        && scope.repositories.len() == 1
+                        && scope.repositories[0] != first.repository
                     {
                         let canonical = first.repository.clone();
-                        page.repository = Some(canonical.clone());
-                        page.repository_input
-                            .update(cx, |input, cx| input.set_text(&canonical, cx));
+                        scope.repositories = vec![canonical.clone()];
+                        let host = scope.host.clone();
                         let device = page.target_device.clone();
                         crate::settings::update(
                             crate::settings::SavePolicy::Debounced,
                             cx,
                             |settings| {
-                                settings.last_pull_request_repository = Some(canonical);
+                                settings
+                                    .last_pull_request_repositories
+                                    .insert(host, vec![canonical]);
                                 settings.last_pull_request_device = device;
                             },
                         );
@@ -1742,14 +2034,22 @@ impl PullRequestsPage {
         cx.notify();
     }
 
+    /// The listing request's target device, host and repositories.
+    fn scope_params(&self) -> serde_json::Value {
+        let mut params = params_for_target(self.target_device.as_deref());
+        if let Some(scope) = &self.scope {
+            params["host"] = scope.host.clone().into();
+            params["repositories"] = scope.repositories.clone().into();
+        }
+        params
+    }
+
     fn store_snapshot(&mut self, at: Instant) {
-        let Some(repository) = self.repository.clone() else {
+        let Some(scope) = self.scope.as_ref().map(BoardScope::key) else {
             return;
         };
-        let key = (self.target_device.clone(), repository, self.filter);
-        self.snapshots.retain(|((target, repo, filter), ..)| {
-            !(target == &key.0 && repo.eq_ignore_ascii_case(&key.1) && filter == &key.2)
-        });
+        let key = (self.target_device.clone(), scope, self.filter);
+        self.snapshots.retain(|(snapshot, ..)| snapshot != &key);
         self.snapshots
             .push((key, self.items.clone(), at, self.paging.clone()));
         if self.snapshots.len() > 12 {
@@ -1764,21 +2064,20 @@ impl PullRequestsPage {
             return;
         };
         if self.more_task.is_some()
-            || self.repository.is_none()
+            || self.scope.is_none()
             || matches!(self.load_state, PullRequestsLoadState::Loading)
         {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.more_error = Some(PullRequestsPageError::Network);
-            toast_page_error(&PullRequestsPageError::Network, None, cx);
+            toast_page_error(&PullRequestsPageError::Network, &self.host, None, cx);
             cx.notify();
             return;
         };
         let target_name = selected_device_name(&self.state.read(cx), self.target_device.as_deref());
         let generation = self.generation;
-        let mut params = params_for_target(self.target_device.as_deref());
-        params["repository"] = self.repository.clone().unwrap().into();
+        let mut params = self.scope_params();
         params["filter"] = serde_json::to_value(self.filter).unwrap();
         params["after"] = cursor.into();
         // Pages after a refreshed first page must be as fresh as it is.
@@ -1809,7 +2108,7 @@ impl PullRequestsPage {
                     }
                     Err(error) => {
                         let error = map_rpc_error(&error, &target_name);
-                        toast_page_error(&error, None, cx);
+                        toast_page_error(&error, &page.host, None, cx);
                         page.more_error = Some(error);
                     }
                 }
@@ -2045,8 +2344,8 @@ impl PullRequestsPage {
             _ => icons::PULL_REQUEST,
         };
         let (title, body) = match &self.load_state {
-            PullRequestsLoadState::Failed(error) => error_copy(error),
-            _ if self.repository.is_none() => (
+            PullRequestsLoadState::Failed(error) => error_copy(error, &self.host),
+            _ if self.scope.is_none() => (
                 "Choose a repository".into(),
                 "No GitHub repository was found for this project. Choose one to load your open pull requests.".into(),
             ),
@@ -2106,7 +2405,7 @@ impl PullRequestsPage {
                     .child(SharedString::from(body)),
             )
             .when(
-                self.repository.is_none()
+                self.scope.is_none()
                     && !matches!(self.load_state, PullRequestsLoadState::Failed(_)),
                 |el| {
                     el.child(
@@ -2132,7 +2431,7 @@ impl PullRequestsPage {
                 },
             )
             .when(
-                self.repository.is_some() && matches!(self.load_state, PullRequestsLoadState::Idle),
+                self.scope.is_some() && matches!(self.load_state, PullRequestsLoadState::Idle),
                 |el| {
                     el.child(
                         empty_action("pr-empty-load", "Load pull requests", theme)
@@ -2277,8 +2576,9 @@ impl Render for PullRequestsPage {
         if refresh_error && !self.refresh_error_shown {
             if let PullRequestsLoadState::Failed(error) = &self.load_state {
                 let error = error.clone();
+                let host = self.host.clone();
                 cx.defer(move |cx| {
-                    toast_page_error(&error, Some("Showing the last loaded results."), cx)
+                    toast_page_error(&error, &host, Some("Showing the last loaded results."), cx)
                 });
             }
         }
@@ -2397,6 +2697,7 @@ impl Render for PullRequestsPage {
                                     })
                                     .tooltip(widgets::text_tooltip(freshness)),
                             )
+                            .child(self.render_host_menu(&theme, cx))
                             .child(self.render_repository_menu(&theme, window, cx))
                             .child(self.render_device_switcher(&theme, cx)),
                     ),
@@ -2808,6 +3109,7 @@ impl PullRequestsPage {
                         first,
                         last,
                         self.selected_url.as_deref() == Some(item.url.as_str()),
+                        self.target_device.clone(),
                         &theme,
                         cx,
                     ))
@@ -2973,6 +3275,7 @@ fn render_table_row(
     first: bool,
     last: bool,
     selected: bool,
+    target: Option<String>,
     theme: &Theme,
     cx: &gpui::App,
 ) -> AnyElement {
@@ -2998,7 +3301,7 @@ fn render_table_row(
         .hover(|style| style.bg(theme.glass_hover()))
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
-            crate::pull_request_detail::open(&url, window, cx);
+            crate::pull_request_detail::open_on_device(&url, target.clone(), window, cx);
         });
     let (date_label, timestamp) = if sort_field == PullRequestSortField::Opened {
         ("Opened", item.created_at)
@@ -3435,13 +3738,68 @@ fn repository_menu_label(theme: &Theme, label: &str) -> gpui::Div {
 }
 
 /// A page-level failure as a toast: its title and explanation.
-fn toast_page_error(error: &PullRequestsPageError, suffix: Option<&str>, cx: &mut gpui::App) {
-    let (title, body) = error_copy(error);
+fn toast_page_error(
+    error: &PullRequestsPageError,
+    host: &str,
+    suffix: Option<&str>,
+    cx: &mut gpui::App,
+) {
+    let (title, body) = error_copy(error, host);
     let message = match suffix {
         Some(suffix) => format!("{title}. {body} {suffix}"),
         None => format!("{title}. {body}"),
     };
     crate::toast::error(cx, message);
+}
+
+/// The accessible name of a menu row that adds `subject` to the board's
+/// selection, or removes it when `selected`.
+fn toggle_label(selected: bool, subject: &str) -> String {
+    format!("{} {subject}", if selected { "Remove" } else { "Add" })
+}
+
+/// The scope a detected repository opens: the selection saved on its host
+/// when that selection holds it, else the repository alone.
+fn detected_scope(
+    repository: RepositoryRef,
+    selections: &std::collections::BTreeMap<String, Vec<String>>,
+) -> BoardScope {
+    let host = repository.host.to_ascii_lowercase();
+    let saved: Vec<String> = selections
+        .get(&host)
+        .into_iter()
+        .flatten()
+        .filter(|saved| valid_repository_filter(saved))
+        .take(MAX_BOARD_REPOSITORIES)
+        .cloned()
+        .collect();
+    let repositories = if saved
+        .iter()
+        .any(|saved| saved.eq_ignore_ascii_case(&repository.repository))
+    {
+        saved
+    } else {
+        vec![repository.repository]
+    };
+    BoardScope { host, repositories }
+}
+
+/// The selection saved for the last chosen host, if it still holds a valid
+/// repository.
+fn saved_scope(settings: &crate::settings::UiSettings) -> Option<BoardScope> {
+    let host = settings
+        .last_pull_request_host
+        .clone()
+        .unwrap_or_else(|| DEFAULT_HOST.to_owned());
+    let repositories: Vec<String> = settings
+        .last_pull_request_repositories
+        .get(&host)?
+        .iter()
+        .filter(|repository| valid_repository_filter(repository))
+        .take(MAX_BOARD_REPOSITORIES)
+        .cloned()
+        .collect();
+    (!repositories.is_empty()).then_some(BoardScope { host, repositories })
 }
 
 fn valid_repository_filter(value: &str) -> bool {
@@ -3457,7 +3815,7 @@ fn valid_repository_filter(value: &str) -> bool {
         })
 }
 
-fn params_for_target(target: Option<&str>) -> serde_json::Value {
+pub(crate) fn params_for_target(target: Option<&str>) -> serde_json::Value {
     match target {
         Some(target) => serde_json::json!({ "targetDeviceId": target }),
         None => serde_json::json!({}),
@@ -3495,11 +3853,17 @@ fn map_rpc_error(error: &RpcError, target_name: &str) -> PullRequestsPageError {
     }
 }
 
-fn error_copy(error: &PullRequestsPageError) -> (String, String) {
+/// `host` is the board's host, named in the sign-in command when it is not
+/// github.com.
+fn error_copy(error: &PullRequestsPageError, host: &str) -> (String, String) {
     match error {
         PullRequestsPageError::CliUnavailable => (
             "GitHub CLI isn’t available on this device".into(),
             "Install gh and sign in to view your pull requests.".into(),
+        ),
+        PullRequestsPageError::Authentication if host != DEFAULT_HOST => (
+            "Sign in to GitHub on this device".into(),
+            format!("Run gh auth login -h {host}, then refresh this page."),
         ),
         PullRequestsPageError::Authentication => (
             "Sign in to GitHub on this device".into(),
@@ -3668,23 +4032,64 @@ mod tests {
 
     struct RowLayoutFixture {
         item: ChangeRequestListItem,
+        target: Option<String>,
+        opened: Vec<(String, Option<String>)>,
+    }
+
+    impl RowLayoutFixture {
+        fn new(item: ChangeRequestListItem) -> Self {
+            Self {
+                item,
+                target: None,
+                opened: Vec::new(),
+            }
+        }
     }
 
     impl Render for RowLayoutFixture {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let width = f32::from(window.viewport_size().width);
-            div().w_full().child(render_table_row(
-                &self.item,
-                table_layout(width),
-                width < PR_TIGHT_ROW_WIDTH,
-                PullRequestSortField::Updated,
-                true,
-                true,
-                false,
-                Theme::of(cx),
-                cx,
-            ))
+            div()
+                .w_full()
+                .on_action(cx.listener(
+                    |fixture, action: &crate::pull_request_detail::OpenPullRequest, _, _| {
+                        fixture.opened.push((action.0.clone(), action.1.clone()));
+                    },
+                ))
+                .child(render_table_row(
+                    &self.item,
+                    table_layout(width),
+                    width < PR_TIGHT_ROW_WIDTH,
+                    PullRequestSortField::Updated,
+                    true,
+                    true,
+                    false,
+                    self.target.clone(),
+                    Theme::of(cx),
+                    cx,
+                ))
         }
+    }
+
+    #[gpui::test]
+    fn rows_open_on_the_boards_device(cx: &mut gpui::TestAppContext) {
+        fixture::init(cx);
+        let item = pull_request("owner/repo", 7, 1, 1, 1);
+        let url = item.url.clone();
+        let (fixture, cx) = cx.add_window_view(|_, _| RowLayoutFixture {
+            target: Some("remote".into()),
+            ..RowLayoutFixture::new(item)
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(480.0)));
+        cx.run_until_parked();
+        let row = cx.debug_bounds("pull-request-row").expect("row rendered");
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            fixture.read_with(cx, |fixture, _| fixture.opened.clone()),
+            [(url, Some("remote".to_owned()))]
+        );
+        assert_eq!(cx.opened_url(), None);
     }
 
     fn space(id: &str, device: &str, git: bool, created_minutes_ago: i64) -> zeron_proto::Space {
@@ -3823,7 +4228,8 @@ mod tests {
                 assert_eq!(method, methods::LIST_CHANGE_REQUEST_PAGE);
                 let filter = params["filter"].as_str().unwrap().to_owned();
                 recorded.lock().unwrap().push(filter.clone());
-                let repository = params["repository"].as_str().unwrap();
+                assert_eq!(params["host"], "github.com");
+                let repository = params["repositories"][0].as_str().unwrap();
                 if repository == "failed/repo" {
                     return Err(RpcError::Capability(
                         capability_errors::PULL_REQUESTS_AUTHENTICATION.into(),
@@ -3852,7 +4258,7 @@ mod tests {
             PullRequestsPage::new(state, cx)
         });
         page.update(cx, |page, cx| {
-            page.apply_initial_repository("owner/repo".into(), None, cx)
+            page.apply_initial_scope(github("owner/repo"), None, cx)
         });
         settle(
             cx,
@@ -3893,8 +4299,8 @@ mod tests {
             ["authored", "all", "authored", "authored"]
         );
         page.update(cx, |page, cx| {
-            page.apply_initial_repository("other/repo".into(), None, cx);
-            page.apply_initial_repository("owner/repo".into(), None, cx);
+            page.apply_initial_scope(github("other/repo"), None, cx);
+            page.apply_initial_scope(github("owner/repo"), None, cx);
             assert_eq!(page.filter, ChangeRequestFilter::Authored);
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
             assert!(page.items.is_empty());
@@ -3902,7 +4308,7 @@ mod tests {
         calls.lock().unwrap().clear();
         for repository in ["authored/repo", "failed/repo", "empty/repo"] {
             page.update(cx, |page, cx| {
-                page.apply_initial_repository(repository.into(), None, cx)
+                page.apply_initial_scope(github(repository), None, cx)
             });
             settle(
                 cx,
@@ -3935,7 +4341,7 @@ mod tests {
         );
         calls.lock().unwrap().clear();
         page.update(cx, |page, cx| {
-            page.apply_initial_repository("slow/repo".into(), None, cx)
+            page.apply_initial_scope(github("slow/repo"), None, cx)
         });
         rpc.settle(cx, &runtime, |_| !calls.lock().unwrap().is_empty());
         page.update(cx, |page, cx| {
@@ -3991,29 +4397,33 @@ mod tests {
             page.snapshots.push((
                 (
                     Some("remote".into()),
-                    "saved/repo".into(),
+                    "github.com:saved/repo".into(),
                     ChangeRequestFilter::Authored,
                 ),
                 vec![pull_request("saved/repo", 10, 1, 1, 1)],
                 Instant::now(),
                 Paging::default(),
             ));
-            page.apply_initial_repository("saved/repo".into(), Some("remote".into()), cx);
+            page.apply_initial_scope(github("saved/repo"), Some("remote".into()), cx);
             assert_eq!(page.items[0].number, 10);
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
             let settings = crate::settings::current(cx);
             let restored: crate::settings::UiSettings =
                 serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
             assert_eq!(
-                restored.last_pull_request_repository.as_deref(),
-                Some("saved/repo")
+                restored.last_pull_request_host.as_deref(),
+                Some("github.com")
+            );
+            assert_eq!(
+                restored.last_pull_request_repositories["github.com"],
+                ["saved/repo"]
             );
             assert_eq!(restored.last_pull_request_device.as_deref(), Some("remote"));
         });
     }
 
     #[gpui::test]
-    fn enter_opens_the_typed_repository(cx: &mut gpui::TestAppContext) {
+    fn enter_adds_the_typed_repository(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext;
         fixture::init(cx);
         let (page, cx) = cx.add_window_view(|_, cx| {
@@ -4023,7 +4433,11 @@ mod tests {
         page.update(cx, |page, _| {
             // A cached board, so opening it needs no engine.
             page.snapshots.push((
-                (None, "acme/zeron".into(), ChangeRequestFilter::Authored),
+                (
+                    None,
+                    "github.com:acme/zeron".into(),
+                    ChangeRequestFilter::Authored,
+                ),
                 vec![pull_request("acme/zeron", 10, 1, 1, 1)],
                 Instant::now(),
                 Paging::default(),
@@ -4041,9 +4455,13 @@ mod tests {
         });
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
-        page.read_with(cx, |page, _| {
-            assert_eq!(page.repository.as_deref(), Some("acme/zeron"));
-            assert!(!page.repository_menu.is_open());
+        page.read_with(cx, |page, cx| {
+            assert_eq!(scoped_repositories(page), ["acme/zeron"]);
+            assert!(
+                page.repository_menu.is_open(),
+                "the menu stays open for the next one"
+            );
+            assert!(page.repository_input.read(cx).text().is_empty());
             assert_eq!(page.items[0].number, 10);
         });
     }
@@ -4064,14 +4482,18 @@ mod tests {
             assert_eq!(page.load_state, PullRequestsLoadState::Idle);
             // No engine exists. Any accidental request would produce Network.
             page.snapshots.push((
-                (None, "acme/zeron".into(), ChangeRequestFilter::Authored),
+                (
+                    None,
+                    "github.com:acme/zeron".into(),
+                    ChangeRequestFilter::Authored,
+                ),
                 vec![pull_request("acme/zeron", 10, 1, 1, 1)],
                 Instant::now(),
                 Paging::default(),
             ));
             page.repository_input
                 .update(cx, |input, cx| input.set_text("ACME/ZERON", cx));
-            page.select_repository(cx);
+            page.add_typed_repository(cx);
             assert_eq!(page.items[0].number, 10);
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
             page.on_visible(cx);
@@ -4084,13 +4506,13 @@ mod tests {
             page.repository_input.update(cx, |input, cx| {
                 input.set_text("acme/zeron repo:other/repo", cx)
             });
-            page.select_repository(cx);
+            page.add_typed_repository(cx);
             assert!(
                 crate::toast::messages(cx)
                     .iter()
                     .any(|message| message.contains("owner/name"))
             );
-            assert_eq!(page.repository.as_deref(), Some("acme/zeron"));
+            assert_eq!(scoped_repositories(page), ["acme/zeron"]);
         });
     }
 
@@ -4101,6 +4523,9 @@ mod tests {
         ScriptedRpc::new(move |method, params| {
             let calls = calls.clone();
             async move {
+                if let Some(reply) = fixture::hosts_reply(&method) {
+                    return Ok(reply);
+                }
                 calls.lock().unwrap().push(method.clone());
                 assert!(
                     params.get("targetDeviceId").is_none(),
@@ -4112,10 +4537,19 @@ mod tests {
                         if stalled {
                             return futures::future::pending().await;
                         }
-                        zeron_rpc::RpcReply::value(&Some("owner/repo"))
+                        zeron_rpc::RpcReply::value(&Some(RepositoryRef {
+                            host: "github.com".into(),
+                            repository: "owner/repo".into(),
+                        }))
                     }
                     methods::LIST_CHANGE_REQUEST_PAGE => {
-                        assert_eq!(params["repository"], "owner/repo");
+                        assert_eq!(params["host"], "github.com");
+                        assert!(
+                            params["repositories"]
+                                .as_array()
+                                .unwrap()
+                                .contains(&"owner/repo".into())
+                        );
                         assert_eq!(params["filter"], "authored");
                         zeron_rpc::RpcReply::value(&ChangeRequestPage {
                             items: vec![pull_request("owner/canonical", 7, 1, 1, 1)],
@@ -4146,6 +4580,9 @@ mod tests {
                 let calls = calls.clone();
                 let release = release.clone();
                 async move {
+                    if let Some(reply) = fixture::hosts_reply(&method) {
+                        return Ok(reply);
+                    }
                     match method.as_str() {
                         methods::GET_CHANGE_REQUEST_REPOSITORY => {
                             let path = params["cwd"].as_str().unwrap().to_owned();
@@ -4153,14 +4590,17 @@ mod tests {
                             if path == "/slow" {
                                 release.notified().await;
                             }
-                            zeron_rpc::RpcReply::value(
-                                &(path != "/scratch").then(|| format!("owner{}", path)),
-                            )
+                            zeron_rpc::RpcReply::value(&(path != "/scratch").then(|| {
+                                RepositoryRef {
+                                    host: "github.com".into(),
+                                    repository: format!("owner{}", path),
+                                }
+                            }))
                         }
                         methods::LIST_CHANGE_REQUEST_PAGE => {
                             zeron_rpc::RpcReply::value(&ChangeRequestPage {
                                 items: vec![pull_request(
-                                    params["repository"].as_str().unwrap(),
+                                    params["repositories"][0].as_str().unwrap(),
                                     7,
                                     1,
                                     1,
@@ -4179,7 +4619,7 @@ mod tests {
         let (page, cx) = cx.add_window_view(|_, cx| {
             let state = fixture::state(cx, None);
             let mut page = PullRequestsPage::new(state.clone(), cx);
-            page.repository = Some("owner/current".into());
+            page.scope = Some(github("owner/current"));
             page.load_state = PullRequestsLoadState::Ready;
             state.update(cx, |state, _| {
                 state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
@@ -4194,7 +4634,11 @@ mod tests {
                 state.spaces[3].repository_id = Some("next-repository".into());
             });
             page.snapshots.push((
-                (None, "OWNER/CURRENT".into(), ChangeRequestFilter::All),
+                (
+                    None,
+                    github("OWNER/CURRENT").key(),
+                    ChangeRequestFilter::All,
+                ),
                 Vec::new(),
                 Instant::now(),
                 Paging::default(),
@@ -4202,14 +4646,24 @@ mod tests {
             page.snapshots.push((
                 (
                     Some("remote".into()),
-                    "remote/repo".into(),
+                    github("remote/repo").key(),
                     ChangeRequestFilter::All,
                 ),
                 Vec::new(),
                 Instant::now(),
                 Paging::default(),
             ));
-            assert_eq!(page.recent_repositories(), ["owner/current"]);
+            page.snapshots.push((
+                (
+                    None,
+                    board_scope("acme.ghe.com", &["infra/a"]).key(),
+                    ChangeRequestFilter::All,
+                ),
+                Vec::new(),
+                Instant::now(),
+                Paging::default(),
+            ));
+            assert_eq!(page.recent_repositories(cx), ["owner/current"]);
             page
         });
         let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
@@ -4249,7 +4703,7 @@ mod tests {
             assert!(!page.repository_menu.is_open());
             assert!(page.resolving_project.is_none());
             assert!(page.initial_scope_task.is_none());
-            assert_eq!(page.repository.as_deref(), Some("owner/current"));
+            assert_eq!(scoped_repositories(page), ["owner/current"]);
         });
         let focus = page.read_with(cx, |page, _| page.repository_focus.clone());
         cx.update(|window, _| assert!(focus.is_focused(window)));
@@ -4267,8 +4721,7 @@ mod tests {
         click("pr-project-next", cx);
         rpc.settle(cx, &runtime, |cx| {
             page.read_with(cx, |page, _| {
-                page.repository.as_deref() == Some("owner/next")
-                    && page.load_state == PullRequestsLoadState::Ready
+                page.scope_contains("owner/next") && page.load_state == PullRequestsLoadState::Ready
             })
         });
         release.notify_one();
@@ -4276,18 +4729,12 @@ mod tests {
         // that old result must never replace the later selection.
         rpc.settle(cx, &runtime, |_| rpc.completed() >= 3);
         page.read_with(cx, |page, _| {
-            assert_eq!(page.repository.as_deref(), Some("owner/next"))
-        });
-        cx.simulate_keystrokes("enter");
-        cx.update(|window, cx| {
-            window.dispatch_event(
-                gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
-                    keystroke: gpui::Keystroke::parse("enter").unwrap(),
-                }),
-                cx,
+            assert_eq!(scoped_repositories(page), ["owner/current", "owner/next"]);
+            assert!(
+                page.repository_menu.is_open(),
+                "a project row keeps the menu open"
             );
         });
-        cx.run_until_parked();
         click("pr-project-scratch", cx);
         rpc.settle(cx, &runtime, |cx| {
             page.read_with(cx, |_, cx| !crate::toast::messages(cx).is_empty())
@@ -4299,7 +4746,7 @@ mod tests {
                     .iter()
                     .any(|message| message.contains("no GitHub remote"))
             );
-            assert_eq!(page.repository.as_deref(), Some("owner/next"));
+            assert_eq!(scoped_repositories(page), ["owner/current", "owner/next"]);
         });
         page.update(cx, |page, cx| {
             page.repository_input
@@ -4317,11 +4764,18 @@ mod tests {
         cx.run_until_parked();
         let scroll = page.read_with(cx, |page, _| page.repository_scroll.scroll.clone());
         assert!(scroll.max_offset().y > px(0.0));
-        let input = cx.debug_bounds("pr-repository-load").unwrap();
+        // Relative to the card: the card's entrance animation runs on the
+        // wall clock and may move it between the two frames.
+        let input_in_card = |cx: &mut gpui::VisualTestContext| {
+            let card = cx.debug_bounds("pr-repository-card").unwrap();
+            let input = cx.debug_bounds("pr-repository-load").unwrap();
+            (input.origin - card.origin, input.size)
+        };
+        let input = input_in_card(cx);
         scroll.set_offset(gpui::point(px(0.0), -scroll.max_offset().y));
         cx.update(|window, cx| window.draw(cx).clear());
         assert_eq!(
-            cx.debug_bounds("pr-repository-load").unwrap(),
+            input_in_card(cx),
             input,
             "the input stays above the scroll region"
         );
@@ -4375,14 +4829,15 @@ mod tests {
         page.update(cx, |page, cx| {
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
             assert_eq!(page.items[0].number, 7);
-            assert_eq!(page.repository.as_deref(), Some("owner/canonical"));
+            assert_eq!(page.scope, Some(github("owner/canonical")));
             assert_eq!(
-                crate::settings::current(cx)
-                    .last_pull_request_repository
-                    .as_deref(),
-                Some("owner/canonical")
+                crate::settings::current(cx).last_pull_request_repositories["github.com"],
+                ["owner/canonical"]
             );
-            assert_eq!(page.snapshots.last().unwrap().0.1, "owner/canonical");
+            assert_eq!(
+                page.snapshots.last().unwrap().0.1,
+                "github.com:owner/canonical"
+            );
             page.on_hidden();
             page.on_visible(cx);
         });
@@ -4404,7 +4859,11 @@ mod tests {
             })
         });
         page.read_with(cx, |page, cx| {
-            assert_eq!(page.repository.as_deref(), Some("owner/canonical"));
+            assert_eq!(
+                scoped_repositories(page),
+                ["owner/canonical", "owner/repo"],
+                "the project's repository joins the board"
+            );
             assert!(crate::toast::messages(cx).is_empty());
             assert!(page.target_device.is_none());
         });
@@ -4417,6 +4876,48 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn detected_repository_keeps_the_saved_selection_holding_it(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let saved = vec!["owner/a".to_owned(), "Owner/Repo".into(), "owner/b".into()];
+        let _settings = fixture::settings(cx, {
+            let mut settings = crate::settings::UiSettings::default();
+            settings.space_filter = Some("project".into());
+            settings.last_pull_request_host = Some("github.com".into());
+            settings
+                .last_pull_request_repositories
+                .insert("github.com".into(), saved.clone());
+            settings
+        });
+        let rpc = initial_repository_rpc(Default::default(), false);
+        let state = cx.new(|_| AppState::new());
+        let page = cx.new(|cx| PullRequestsPage::new(state.clone(), cx));
+        state.update(cx, |state, cx| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
+            state.spaces = vec![space("project", "local", true, 0)];
+            state.spaces[0].path = "/checkout".into();
+            state.selected_space = Some("project".into());
+            state.no_project = false;
+            cx.notify();
+        });
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| {
+                page.load_state == PullRequestsLoadState::Ready
+            })
+        });
+        page.read_with(cx, |page, cx| {
+            assert_eq!(
+                scoped_repositories(page),
+                ["owner/a", "owner/repo", "owner/b"]
+            );
+            assert_eq!(
+                crate::settings::current(cx).last_pull_request_repositories["github.com"],
+                ["owner/a", "owner/repo", "owner/b"]
+            );
+        });
+    }
+
     /// `/<name>` checkouts belong to `owner/<name>`, except `/scratch`.
     fn project_repository_rpc(
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -4424,17 +4925,21 @@ mod tests {
         ScriptedRpc::new(move |method, params| {
             let calls = calls.clone();
             async move {
+                if let Some(reply) = fixture::hosts_reply(&method) {
+                    return Ok(reply);
+                }
                 match method.as_str() {
                     methods::GET_CHANGE_REQUEST_REPOSITORY => {
                         let cwd = params["cwd"].as_str().unwrap().to_owned();
                         calls.lock().unwrap().push(cwd.clone());
                         let name = cwd.trim_start_matches('/');
-                        zeron_rpc::RpcReply::value(
-                            &(name != "scratch").then(|| format!("owner/{name}")),
-                        )
+                        zeron_rpc::RpcReply::value(&(name != "scratch").then(|| RepositoryRef {
+                            host: "github.com".into(),
+                            repository: format!("owner/{name}"),
+                        }))
                     }
                     methods::LIST_CHANGE_REQUEST_PAGE => {
-                        let repository = params["repository"].as_str().unwrap();
+                        let repository = params["repositories"][0].as_str().unwrap();
                         zeron_rpc::RpcReply::value(&ChangeRequestPage {
                             items: vec![pull_request(repository, 7, 1, 1, 1)],
                             next_cursor: None,
@@ -4484,7 +4989,7 @@ mod tests {
         // First run, All projects, nothing saved: the newest Git project that
         // is on GitHub, without asking.
         page.read_with(cx, |page, cx| {
-            assert_eq!(page.repository.as_deref(), Some("owner/comet"));
+            assert_eq!(page.scope, Some(github("owner/comet")));
             assert!(crate::toast::messages(cx).is_empty());
         });
         assert_eq!(*lookups.lock().unwrap(), ["/scratch", "/comet"]);
@@ -4498,14 +5003,14 @@ mod tests {
         page.update(cx, |page, cx| page.on_visible(cx));
         settle(cx);
         page.read_with(cx, |page, _| {
-            assert_eq!(page.repository.as_deref(), Some("owner/docs"))
+            assert_eq!(page.scope, Some(github("owner/docs")))
         });
 
         // An explicit choice stands while the board reopens from the same project.
         page.update(cx, |page, cx| {
             page.repository_input
                 .update(cx, |input, cx| input.set_text("elsewhere/repo", cx));
-            page.select_repository(cx);
+            page.add_typed_repository(cx);
         });
         settle(cx);
         page.update(cx, |page, cx| {
@@ -4514,7 +5019,7 @@ mod tests {
         });
         settle(cx);
         page.read_with(cx, |page, _| {
-            assert_eq!(page.repository.as_deref(), Some("elsewhere/repo"))
+            assert_eq!(scoped_repositories(page), ["owner/docs", "elsewhere/repo"])
         });
         assert_eq!(*lookups.lock().unwrap(), ["/scratch", "/comet", "/docs"]);
     }
@@ -4526,7 +5031,8 @@ mod tests {
         let _settings = fixture::settings(cx, {
             let mut settings = crate::settings::UiSettings::default();
             settings.space_filter = Some("project".into());
-            settings.last_pull_request_repository = Some("owner/repo".into());
+            settings.last_pull_request_repositories =
+                [("github.com".to_owned(), vec!["owner/repo".to_owned()])].into();
             settings
         });
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4562,14 +5068,15 @@ mod tests {
         page.update(cx, |page, cx| {
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
             assert_eq!(page.items[0].number, 7);
-            assert_eq!(page.repository.as_deref(), Some("owner/canonical"));
+            assert_eq!(page.scope, Some(github("owner/canonical")));
             assert_eq!(
-                crate::settings::current(cx)
-                    .last_pull_request_repository
-                    .as_deref(),
-                Some("owner/canonical")
+                crate::settings::current(cx).last_pull_request_repositories["github.com"],
+                ["owner/canonical"]
             );
-            assert_eq!(page.snapshots.last().unwrap().0.1, "owner/canonical");
+            assert_eq!(
+                page.snapshots.last().unwrap().0.1,
+                "github.com:owner/canonical"
+            );
             page.on_hidden();
             page.on_visible(cx);
         });
@@ -4589,7 +5096,8 @@ mod tests {
         let _guard = runtime.enter();
         let _settings = fixture::settings(cx, {
             let mut settings = crate::settings::UiSettings::default();
-            settings.last_pull_request_repository = Some("owner/repo".into());
+            settings.last_pull_request_repositories =
+                [("github.com".to_owned(), vec!["owner/repo".to_owned()])].into();
             settings
         });
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4622,14 +5130,15 @@ mod tests {
         page.update(cx, |page, cx| {
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
             assert_eq!(page.items[0].number, 7);
-            assert_eq!(page.repository.as_deref(), Some("owner/canonical"));
+            assert_eq!(page.scope, Some(github("owner/canonical")));
             assert_eq!(
-                crate::settings::current(cx)
-                    .last_pull_request_repository
-                    .as_deref(),
-                Some("owner/canonical")
+                crate::settings::current(cx).last_pull_request_repositories["github.com"],
+                ["owner/canonical"]
             );
-            assert_eq!(page.snapshots.last().unwrap().0.1, "owner/canonical");
+            assert_eq!(
+                page.snapshots.last().unwrap().0.1,
+                "github.com:owner/canonical"
+            );
             page.on_hidden();
             page.on_visible(cx);
         });
@@ -4645,14 +5154,14 @@ mod tests {
             PullRequestsPage::new(state, cx)
         });
         page.update(cx, |page, cx| {
-            page.repository = Some("owner/repo".into());
+            page.scope = Some(github("owner/repo"));
             for (filter, number) in [
                 (ChangeRequestFilter::All, 1),
                 (ChangeRequestFilter::Authored, 2),
                 (ChangeRequestFilter::Reviewing, 3),
             ] {
                 page.snapshots.push((
-                    (None, "owner/repo".into(), filter),
+                    (None, "github.com:owner/repo".into(), filter),
                     vec![pull_request("owner/repo", number, 1, 1, 1)],
                     Instant::now(),
                     Paging::default(),
@@ -4683,7 +5192,7 @@ mod tests {
         assert!(row_status(&item, false).starts_with("Draft · "));
         assert!(!row_status(&item, true).contains("Draft"));
         assert!(row_status(&item, true).contains("Merge conflicts"));
-        let (_, cx) = cx.add_window_view(|_, _| RowLayoutFixture { item });
+        let (_, cx) = cx.add_window_view(|_, _| RowLayoutFixture::new(item));
         for (width, diff) in [(360.0, false), (600.0, true)] {
             cx.simulate_resize(gpui::size(px(width), px(480.0)));
             cx.run_until_parked();
@@ -4711,7 +5220,7 @@ mod tests {
         item.is_draft = true;
         item.mergeability = ChangeRequestMergeability::Conflicting;
         item.review_decision = ChangeRequestReviewDecision::ChangesRequested;
-        let (_, cx) = cx.add_window_view(|_, _| RowLayoutFixture { item });
+        let (_, cx) = cx.add_window_view(|_, _| RowLayoutFixture::new(item));
         for width in [272.0, 639.0, 640.0, 899.0, 900.0, 1072.0] {
             cx.simulate_resize(gpui::size(px(width), px(480.0)));
             cx.run_until_parked();
@@ -4927,7 +5436,7 @@ mod tests {
             gpui::Modifiers::default(),
         );
         page.read_with(cx, |page, _| {
-            assert_eq!(page.repository.as_deref(), Some("another/repo"))
+            assert_eq!(scoped_repositories(page), ["another/repo"])
         });
     }
 
@@ -5272,7 +5781,7 @@ mod tests {
             PullRequestsPage::new(state, cx)
         });
         page.update(cx, |page, cx| {
-            page.repository = Some("owner/repo".into());
+            page.scope = Some(github("owner/repo"));
             page.load(false, cx);
         });
         (page, cx, calls, release, rpc)
@@ -5359,10 +5868,10 @@ mod tests {
         // GitHub's casing was adopted; reselecting the repository as typed
         // reuses the loaded board instead of fetching it again.
         page.update(cx, |page, cx| {
-            assert_eq!(page.repository.as_deref(), Some("Owner/Repo"));
+            assert_eq!(scoped_repositories(page), ["Owner/Repo"]);
             page.repository_input
                 .update(cx, |input, cx| input.set_text("owner/repo", cx));
-            page.select_repository(cx);
+            page.add_typed_repository(cx);
             assert_eq!(page.items.len(), 52);
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
         });
@@ -5426,7 +5935,7 @@ mod tests {
             PullRequestsPage::new(state, cx)
         });
         page.update(cx, |page, cx| {
-            page.repository = Some("owner/repo".into());
+            page.scope = Some(github("owner/repo"));
             page.load(false, cx);
         });
         settle(
@@ -5494,6 +6003,427 @@ mod tests {
             assert_eq!(page.filter, ChangeRequestFilter::Authored);
             assert_eq!(page.items.len(), 50, "the late Reviewing reply is ignored");
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
+        });
+    }
+
+    fn board_scope(host: &str, repositories: &[&str]) -> BoardScope {
+        BoardScope {
+            host: host.into(),
+            repositories: repositories.iter().map(|repo| (*repo).to_owned()).collect(),
+        }
+    }
+
+    fn github(repository: &str) -> BoardScope {
+        board_scope("github.com", &[repository])
+    }
+
+    fn scoped_repositories(page: &PullRequestsPage) -> Vec<String> {
+        page.scope
+            .as_ref()
+            .map(|scope| scope.repositories.clone())
+            .unwrap_or_default()
+    }
+
+    #[gpui::test]
+    fn toggling_rows_builds_scope_params(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let rpc = ScriptedRpc::new({
+            let requests = requests.clone();
+            move |method, params| {
+                let requests = requests.clone();
+                async move {
+                    if let Some(reply) = fixture::hosts_reply(&method) {
+                        return Ok(reply);
+                    }
+                    assert_eq!(method, methods::LIST_CHANGE_REQUEST_PAGE);
+                    requests.lock().unwrap().push(params.clone());
+                    let first = params["repositories"][0].as_str().unwrap().to_owned();
+                    zeron_rpc::RpcReply::value(&ChangeRequestPage {
+                        items: vec![pull_request(&first, 7, 1, 1, 1)],
+                        next_cursor: None,
+                        total_count: Some(1),
+                        fetched_at: None,
+                    })
+                }
+            }
+        });
+        let client = rpc.client();
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = fixture::state(cx, Some(client));
+            PullRequestsPage::new(state, cx)
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+        page.update(cx, |page, cx| {
+            page.host = "acme.ghe.com".into();
+            page.snapshots.push((
+                (
+                    None,
+                    "acme.ghe.com:infra/b".into(),
+                    ChangeRequestFilter::All,
+                ),
+                Vec::new(),
+                Instant::now(),
+                Paging::default(),
+            ));
+            page.repository_menu.open(());
+            page.toggle_repository("infra/a".into(), cx);
+        });
+        settle(
+            cx,
+            &runtime,
+            |page| page.load_state == PullRequestsLoadState::Ready,
+            &page,
+            &rpc,
+        );
+        let row = cx.debug_bounds("pr-recent-infra/b").unwrap();
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        settle(
+            cx,
+            &runtime,
+            |page| {
+                scoped_repositories(page).len() == 2
+                    && page.load_state == PullRequestsLoadState::Ready
+            },
+            &page,
+            &rpc,
+        );
+        let last = requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last["host"], "acme.ghe.com");
+        assert_eq!(
+            last["repositories"],
+            serde_json::json!(["infra/a", "infra/b"])
+        );
+        assert!(last.get("repository").is_none());
+        page.read_with(cx, |page, _| assert!(page.repository_menu.is_open()));
+    }
+
+    #[gpui::test]
+    fn sixth_repository_is_refused(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            PullRequestsPage::new(state, cx)
+        });
+        page.update(cx, |page, cx| {
+            for repository in ["o/a", "o/b", "o/c", "o/d", "o/e"] {
+                page.toggle_repository(repository.into(), cx);
+            }
+            assert!(crate::toast::messages(cx).is_empty());
+            page.toggle_repository("o/f".into(), cx);
+            assert!(
+                crate::toast::messages(cx)
+                    .iter()
+                    .any(|message| message == "Choose up to 5 repositories.")
+            );
+            assert_eq!(
+                scoped_repositories(page),
+                ["o/a", "o/b", "o/c", "o/d", "o/e"]
+            );
+            page.toggle_repository("O/A".into(), cx);
+            assert_eq!(scoped_repositories(page), ["o/b", "o/c", "o/d", "o/e"]);
+            for repository in ["o/b", "o/c", "o/d", "o/e"] {
+                page.toggle_repository(repository.into(), cx);
+            }
+            assert!(
+                page.scope.is_none(),
+                "removing the last one unscopes the board"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn host_switch_restores_saved_selection(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _settings = fixture::settings(cx, {
+            let mut settings = crate::settings::UiSettings::default();
+            settings.last_pull_request_repositories = [
+                ("acme.ghe.com".to_owned(), vec!["infra/a".to_owned()]),
+                ("github.com".to_owned(), vec!["owner/repo".to_owned()]),
+            ]
+            .into();
+            settings
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            PullRequestsPage::new(state, cx)
+        });
+        page.update(cx, |page, cx| {
+            page.select_host("acme.ghe.com".into(), cx);
+            assert_eq!(page.host, "acme.ghe.com");
+            assert_eq!(page.scope.as_ref().unwrap().host, "acme.ghe.com");
+            assert_eq!(scoped_repositories(page), ["infra/a"]);
+            assert_eq!(
+                crate::settings::current(cx)
+                    .last_pull_request_host
+                    .as_deref(),
+                Some("acme.ghe.com")
+            );
+            page.select_host("github.com".into(), cx);
+            assert_eq!(scoped_repositories(page), ["owner/repo"]);
+            assert_eq!(
+                crate::settings::current(cx)
+                    .last_pull_request_host
+                    .as_deref(),
+                Some("github.com")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn project_on_other_host_switches_host(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        let rpc = ScriptedRpc::new(|method, params| async move {
+            if let Some(reply) = fixture::hosts_reply(&method) {
+                return Ok(reply);
+            }
+            match method.as_str() {
+                methods::GET_CHANGE_REQUEST_REPOSITORY => {
+                    assert_eq!(params["cwd"], "/infra");
+                    zeron_rpc::RpcReply::value(&serde_json::json!({
+                        "host": "acme.ghe.com",
+                        "repository": "infra/a",
+                    }))
+                }
+                methods::LIST_CHANGE_REQUEST_PAGE => {
+                    assert_eq!(params["host"], "acme.ghe.com");
+                    zeron_rpc::RpcReply::value(&ChangeRequestPage::default())
+                }
+                other => panic!("unexpected request {other}"),
+            }
+        });
+        let client = rpc.client();
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = fixture::state(cx, Some(client));
+            state.update(cx, |state, _| {
+                state.local_device_id = Some("local".into());
+                state.spaces = vec![space("infra", "local", true, 1)];
+            });
+            let mut page = PullRequestsPage::new(state, cx);
+            page.scope = Some(board_scope("github.com", &["owner/repo"]));
+            page.initial_scope_attempted = true;
+            page.load_state = PullRequestsLoadState::Ready;
+            page
+        });
+        page.update(cx, |page, cx| {
+            page.select_project("/infra".into(), "local".into(), cx)
+        });
+        settle(
+            cx,
+            &runtime,
+            |page| page.initial_scope_task.is_none() && page.host == "acme.ghe.com",
+            &page,
+            &rpc,
+        );
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.scope, Some(board_scope("acme.ghe.com", &["infra/a"])));
+        });
+    }
+
+    #[gpui::test]
+    fn snapshots_key_on_host(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            PullRequestsPage::new(state, cx)
+        });
+        page.update(cx, |page, cx| {
+            page.snapshots.push((
+                (None, "github.com:a/b".into(), ChangeRequestFilter::Authored),
+                vec![pull_request("a/b", 10, 1, 1, 1)],
+                Instant::now(),
+                Paging::default(),
+            ));
+            page.apply_initial_scope(board_scope("acme.ghe.com", &["a/b"]), None, cx);
+            assert!(page.items.is_empty(), "another host's board is not reused");
+            page.apply_initial_scope(board_scope("github.com", &["a/b"]), None, cx);
+            assert_eq!(page.items[0].number, 10);
+            assert_eq!(page.load_state, PullRequestsLoadState::Ready);
+        });
+    }
+
+    /// The board on `acme.ghe.com` with a cached host list that omits it,
+    /// shown while the device reports `signed_in`. Returns the board's host
+    /// and the host saved in settings once the refresh settles.
+    fn host_after_refresh(
+        cx: &mut gpui::TestAppContext,
+        signed_in: &'static [&'static str],
+    ) -> (String, Option<String>) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, {
+            let mut settings = crate::settings::UiSettings::default();
+            settings.last_pull_request_host = Some("acme.ghe.com".into());
+            settings
+                .last_pull_request_repositories
+                .insert("acme.ghe.com".into(), vec!["infra/a".into()]);
+            settings
+        });
+        let rpc = ScriptedRpc::new(move |method, _| async move {
+            match method.as_str() {
+                methods::LIST_CHANGE_REQUEST_HOSTS => zeron_rpc::RpcReply::value(&signed_in),
+                methods::LIST_CHANGE_REQUEST_PAGE => {
+                    zeron_rpc::RpcReply::value(&ChangeRequestPage::default())
+                }
+                other => panic!("unexpected request {other}"),
+            }
+        });
+        let client = rpc.client();
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            crate::pull_request_hosts::PullRequestHosts::set(cx, None, vec!["github.com".into()]);
+            let state = fixture::state(cx, Some(client));
+            let mut page = PullRequestsPage::new(state, cx);
+            page.host = "acme.ghe.com".into();
+            page.scope = Some(board_scope("acme.ghe.com", &["infra/a"]));
+            page.initial_scope_attempted = true;
+            page
+        });
+        page.update(cx, |page, cx| {
+            page.on_visible(cx);
+            assert_eq!(page.host, "acme.ghe.com", "the cached list may be stale");
+        });
+        settle(cx, &runtime, |page| page.hosts_task.is_none(), &page, &rpc);
+        page.read_with(cx, |page, cx| {
+            let saved = crate::settings::current(cx);
+            assert_eq!(
+                saved.last_pull_request_repositories["acme.ghe.com"],
+                ["infra/a"]
+            );
+            (page.host.clone(), saved.last_pull_request_host)
+        })
+    }
+
+    #[gpui::test]
+    fn host_signed_in_since_the_cached_list_is_kept(cx: &mut gpui::TestAppContext) {
+        assert_eq!(
+            host_after_refresh(cx, &["github.com", "acme.ghe.com"]),
+            ("acme.ghe.com".into(), Some("acme.ghe.com".into()))
+        );
+    }
+
+    #[test]
+    fn repository_rows_name_what_a_click_does() {
+        assert_eq!(toggle_label(false, "owner/repo"), "Add owner/repo");
+        assert_eq!(toggle_label(true, "owner/repo"), "Remove owner/repo");
+    }
+
+    #[gpui::test]
+    fn saved_scope_on_another_device_fetches_its_hosts(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        let targets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rpc = ScriptedRpc::new({
+            let targets = targets.clone();
+            move |method, params| {
+                let targets = targets.clone();
+                async move {
+                    match method.as_str() {
+                        methods::LIST_CHANGE_REQUEST_HOSTS => {
+                            targets
+                                .lock()
+                                .unwrap()
+                                .push(params.get("targetDeviceId").cloned());
+                            zeron_rpc::RpcReply::value(&["github.com"])
+                        }
+                        methods::LIST_CHANGE_REQUEST_PAGE => {
+                            zeron_rpc::RpcReply::value(&ChangeRequestPage::default())
+                        }
+                        other => panic!("unexpected request {other}"),
+                    }
+                }
+            }
+        });
+        let client = rpc.client();
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = fixture::state(cx, Some(client));
+            PullRequestsPage::new(state, cx)
+        });
+        page.update(cx, |page, cx| {
+            page.apply_initial_scope(
+                board_scope("github.com", &["owner/repo"]),
+                Some("remote".into()),
+                cx,
+            )
+        });
+        settle(
+            cx,
+            &runtime,
+            |page| page.hosts_task.is_none() && page.load_state == PullRequestsLoadState::Ready,
+            &page,
+            &rpc,
+        );
+        assert_eq!(*targets.lock().unwrap(), [Some("remote".into())]);
+    }
+
+    #[gpui::test]
+    fn signed_out_host_falls_back_without_replacing_the_saved_choice(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_eq!(
+            host_after_refresh(cx, &["github.com"]),
+            ("github.com".into(), Some("acme.ghe.com".into()))
+        );
+    }
+
+    #[gpui::test]
+    fn host_chip_hidden_with_one_host(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        fixture::init(cx);
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            crate::pull_request_hosts::PullRequestHosts::set(cx, None, vec!["github.com".into()]);
+            let state = cx.new(|_| AppState::new());
+            PullRequestsPage::new(state, cx)
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("pr-host").is_none());
+        page.update(cx, |_, cx| {
+            crate::pull_request_hosts::PullRequestHosts::set(
+                cx,
+                None,
+                vec!["github.com".into(), "acme.ghe.com".into()],
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let host = cx.debug_bounds("pr-host").unwrap();
+        let repository = cx.debug_bounds("pr-repository").unwrap();
+        assert!(
+            host.right() <= repository.left(),
+            "the host sits left of the repositories"
+        );
+    }
+
+    #[test]
+    fn auth_error_names_ghe_host() {
+        assert_eq!(
+            error_copy(&PullRequestsPageError::Authentication, "acme.ghe.com").1,
+            "Run gh auth login -h acme.ghe.com, then refresh this page."
+        );
+        assert_eq!(
+            error_copy(&PullRequestsPageError::Authentication, "github.com").1,
+            "Run gh auth login, then refresh this page."
+        );
+    }
+
+    #[gpui::test]
+    fn scope_label_names_the_first_repository_and_the_rest(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        fixture::init(cx);
+        let page = cx.new(|cx| PullRequestsPage::new(cx.new(|_| AppState::new()), cx));
+        page.update(cx, |page, _| {
+            assert_eq!(page.scope_label(), "Choose repository");
+            page.scope = Some(board_scope("github.com", &["a/one"]));
+            assert_eq!(page.scope_label(), "a/one");
+            page.scope = Some(board_scope("github.com", &["b/two", "A/One", "c/three"]));
+            assert_eq!(page.scope_label(), "A/One +2");
         });
     }
 }

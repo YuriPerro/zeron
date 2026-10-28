@@ -98,11 +98,20 @@ pub(super) fn repository(url: &str) -> String {
     url.split('/').skip(3).take(2).collect::<Vec<_>>().join("/")
 }
 
+/// The `--repo` value `gh` needs: `owner/name` on github.com and
+/// `host/owner/name` on any other host.
+fn gh_repository(url: &str) -> String {
+    match super::pull_request_repository(url) {
+        Some(link) if link.host != DEFAULT_HOST => format!("{}/{}", link.host, link.repository),
+        _ => repository(url),
+    }
+}
+
 pub(super) fn checkout_command(detail: &ChangeRequestDetail, url: &str) -> String {
     format!(
         "gh pr checkout {} --repo {}",
         detail.number,
-        repository(url)
+        gh_repository(url)
     )
 }
 
@@ -161,6 +170,8 @@ pub(super) fn prompt(
     platform: VerificationPlatform,
 ) -> String {
     let repo = repository(url);
+    let gh_repo = gh_repository(url);
+    let host = link_host(url);
     let number = detail.number;
     let head = ref_name(&detail.head_ref_name);
     let mut prompt = format!(
@@ -171,7 +182,7 @@ pub(super) fn prompt(
     );
     let assessment = Facts::from_detail(detail).assess();
     if zeron_proto::change_request_assessment::valid_head_oid(&detail.head_ref_oid) {
-        prompt.push_str(&format!("Observed source commit: {}\nAfter checkout, verify `git rev-parse HEAD` equals this commit. Check the current head with `gh pr view {number} --repo {repo} --json headRefOid`. If it changed, refresh the assessment before working.\n", detail.head_ref_oid));
+        prompt.push_str(&format!("Observed source commit: {}\nAfter checkout, verify `git rev-parse HEAD` equals this commit. Check the current head with `gh pr view {number} --repo {gh_repo} --json headRefOid`. If it changed, refresh the assessment before working.\n", detail.head_ref_oid));
     } else {
         prompt.push_str("Observed source commit: unavailable. Resolve and record the current head before working; this assessment cannot attest to an exact revision.\n");
     }
@@ -191,13 +202,20 @@ pub(super) fn prompt(
     prompt.push_str("\n");
     match kind {
         Handoff::Review => prompt.push_str(&format!(
-            "Review this pull request. Read the description with `gh pr view {number} --repo {repo}` and the diff with `gh pr diff {number} --repo {repo}`. Look for correctness bugs, regressions, and missing tests. Report findings by severity with file:line references. Don't push changes or post comments."
+            "Review this pull request. Read the description with `gh pr view {number} --repo {gh_repo}` and the diff with `gh pr diff {number} --repo {gh_repo}`. Look for correctness bugs, regressions, and missing tests. Report findings by severity with file:line references. Don't push changes or post comments."
         )),
-        Handoff::AddressFeedback => prompt.push_str(&format!(
-            "Address the open review feedback. Read conversation comments with `gh pr view {number} --repo {repo} --comments`. This command excludes inline review comments. Retrieve all inline comment bodies and replies with `gh api --paginate repos/{repo}/pulls/{number}/comments`. Fetch reviewThreads through the GitHub GraphQL API (repository → pullRequest → reviewThreads), including isResolved, isOutdated, path, line, originalLine, and comments with id, replyTo, body, author, url and createdAt. Paginate BOTH reviewThreads and each thread’s comments using pageInfo.hasNextPage/endCursor and after; do not assume the first 100 entries are complete. Prioritize unresolved threads, including outdated ones, and retain resolved threads and replies as context. Make the requested changes on `{head}`, run the relevant tests, and summarize what changed for each comment. Ask before pushing."
-        )),
+        Handoff::AddressFeedback => {
+            let (hostname, on_host) = if host == DEFAULT_HOST {
+                (String::new(), String::new())
+            } else {
+                (format!(" --hostname {host}"), format!(" on {host}"))
+            };
+            prompt.push_str(&format!(
+                "Address the open review feedback. Read conversation comments with `gh pr view {number} --repo {gh_repo} --comments`. This command excludes inline review comments. Retrieve all inline comment bodies and replies with `gh api{hostname} --paginate repos/{repo}/pulls/{number}/comments`. Fetch reviewThreads through the GitHub GraphQL API{on_host} (repository → pullRequest → reviewThreads), including isResolved, isOutdated, path, line, originalLine, and comments with id, replyTo, body, author, url and createdAt. Paginate BOTH reviewThreads and each thread’s comments using pageInfo.hasNextPage/endCursor and after; do not assume the first 100 entries are complete. Prioritize unresolved threads, including outdated ones, and retain resolved threads and replies as context. Make the requested changes on `{head}`, run the relevant tests, and summarize what changed for each comment. Ask before pushing."
+            ))
+        }
         Handoff::ResolveConflicts => prompt.push_str(&format!(
-            "Inspect merge conflicts against the current base with `gh pr view {number} --repo {repo} --json baseRefName,mergeable`. Resolve them on `{head}`, preserve both sides' intended behavior, and test the resulting combination. Ask before pushing."
+            "Inspect merge conflicts against the current base with `gh pr view {number} --repo {gh_repo} --json baseRefName,mergeable`. Resolve them on `{head}`, preserve both sides' intended behavior, and test the resulting combination. Ask before pushing."
         )),
         Handoff::FixChecks => {
             prompt.push_str("These checks are failing:\n");
@@ -207,17 +225,20 @@ pub(super) fn prompt(
             }
             for (name, status, link) in failures {
                 let name = plain(&name);
-                // Only links to github.com are passed on.
-                let link = url::Url::parse(&link)
-                    .ok()
-                    .filter(|link| link.scheme() == "https" && link.host_str() == Some("github.com"));
+                // Only links to github.com or the pull request's own host are passed on.
+                let link = url::Url::parse(&link).ok().filter(|link| {
+                    link.scheme() == "https"
+                        && link
+                            .host_str()
+                            .is_some_and(|link_host| link_host == DEFAULT_HOST || link_host == host)
+                });
                 match link {
                     Some(link) => prompt.push_str(&format!("- {name}: {link} ({status})\n")),
                     None => prompt.push_str(&format!("- {name} ({status})\n")),
                 }
             }
             prompt.push_str(&format!(
-                "\nInspect them with `gh pr checks {number} --repo {repo}` and the failed logs with `gh run view <run-id> --repo {repo} --log-failed`. Reproduce each failure locally, fix the root cause on `{head}`, and verify the fix. Ask before pushing."
+                "\nInspect them with `gh pr checks {number} --repo {gh_repo}` and the failed logs with `gh run view <run-id> --repo {gh_repo} --log-failed`. Reproduce each failure locally, fix the root cause on `{head}`, and verify the fix. Ask before pushing."
             ));
         }
     }
@@ -288,7 +309,7 @@ async fn matching_checkout(
     engine: &crate::state::EngineHandle,
     spaces: Vec<zeron_proto::Space>,
     device: &str,
-    repository: &str,
+    wanted: &RepositoryRef,
 ) -> Result<Option<zeron_proto::Space>, String> {
     let mut failed = false;
     for space in spaces.into_iter().filter(|space| space.device_id == device) {
@@ -296,14 +317,24 @@ async fn matching_checkout(
             .client()
             .call(
                 methods::GET_CHANGE_REQUEST_REPOSITORY,
-                serde_json::json!({"cwd": space.path, "targetDeviceId": device, "repository": repository}),
+                serde_json::json!({
+                    "cwd": space.path,
+                    "targetDeviceId": device,
+                    "host": wanted.host,
+                    "repository": wanted.repository,
+                }),
             )
             .await;
         match result.and_then(|value| {
-            serde_json::from_value::<Option<String>>(value)
+            serde_json::from_value::<Option<RepositoryRef>>(value)
                 .map_err(|_| zeron_rpc::RpcError::Failed("invalid repository response".into()))
         }) {
-            Ok(Some(repo)) if repo.eq_ignore_ascii_case(repository) => return Ok(Some(space)),
+            Ok(Some(found))
+                if found.host.eq_ignore_ascii_case(&wanted.host)
+                    && found.repository.eq_ignore_ascii_case(&wanted.repository) =>
+            {
+                return Ok(Some(space));
+            }
             Ok(_) => {}
             Err(_) => failed = true,
         }
@@ -335,11 +366,22 @@ impl PullRequestDetailPage {
         let spaces = state.spaces_sorted().into_iter().cloned().collect();
         // The engine's URL for the pull request it actually read, not the
         // link it was opened from.
-        let repo = repository(self.detail.as_ref().map_or(&self.url, |detail| &detail.url));
+        let wanted = self
+            .detail
+            .as_ref()
+            .and_then(|detail| super::pull_request_repository(&detail.url))
+            .or_else(|| super::pull_request_repository(&self.url));
+        let Some(wanted) = wanted else {
+            self.handoff_error =
+                Some("Couldn’t tell which repository this pull request is in.".into());
+            cx.notify();
+            return;
+        };
+        let repo = wanted.repository.clone();
         self.handoff_device = Some(device.clone());
         self.handoff_error = None;
         self.handoff_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let lookup = matching_checkout(&engine, spaces, &device, &repo);
+            let lookup = matching_checkout(&engine, spaces, &device, &wanted);
             let deadline = cx.background_executor().timer(std::time::Duration::from_secs(15));
             futures::pin_mut!(lookup, deadline);
             let result = match futures::future::select(lookup, deadline).await {
@@ -597,14 +639,19 @@ mod tests {
         let rpc = ScriptedRpc::new(|method, params| async move {
             assert_eq!(method, methods::GET_CHANGE_REQUEST_REPOSITORY);
             assert_eq!(params["targetDeviceId"], "remote");
+            assert_eq!(params["host"], "acme.ghe.com");
             assert!(matches!(
                 params["repository"].as_str(),
                 Some("a/b" | "missing/repo")
             ));
-            zeron_rpc::RpcReply::value(&Some(if params["cwd"] == "/right" {
-                "A/B"
-            } else {
-                "other/repo"
+            zeron_rpc::RpcReply::value(&Some(zeron_proto::RepositoryRef {
+                host: "ACME.ghe.com".into(),
+                repository: if params["cwd"] == "/right" {
+                    "A/B"
+                } else {
+                    "other/repo"
+                }
+                .into(),
             }))
         });
         let engine = crate::state::EngineHandle::from_test_client(rpc.client());
@@ -625,14 +672,18 @@ mod tests {
             space("unrelated", "remote"),
             space("right", "remote"),
         ];
-        let found = matching_checkout(&engine, spaces.clone(), "remote", "a/b")
+        let wanted = |repository: &str| zeron_proto::RepositoryRef {
+            host: "acme.ghe.com".into(),
+            repository: repository.into(),
+        };
+        let found = matching_checkout(&engine, spaces.clone(), "remote", &wanted("a/b"))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(found.device_id, "remote");
         assert_eq!(found.path, "/right");
         assert!(
-            matching_checkout(&engine, spaces, "remote", "missing/repo")
+            matching_checkout(&engine, spaces, "remote", &wanted("missing/repo"))
                 .await
                 .unwrap()
                 .is_none()
@@ -687,6 +738,56 @@ mod tests {
     }
 
     #[test]
+    fn ghe_feedback_handoff_reads_comments_from_the_pull_requests_host() {
+        let detail = ChangeRequestDetail {
+            number: 7,
+            ..Default::default()
+        };
+        let feedback = |url: &str| {
+            prompt(
+                Handoff::AddressFeedback,
+                &detail,
+                url,
+                VerificationPlatform::Relevant,
+            )
+        };
+        let enterprise = feedback("https://acme.ghe.com/infra/app/pull/7");
+        assert!(enterprise.contains(
+            "`gh api --hostname acme.ghe.com --paginate repos/infra/app/pulls/7/comments`"
+        ));
+        assert!(enterprise.contains("through the GitHub GraphQL API on acme.ghe.com ("));
+        let public = feedback("https://github.com/a/b/pull/7");
+        assert!(public.contains("`gh api --paginate repos/a/b/pulls/7/comments`"));
+        assert!(public.contains("through the GitHub GraphQL API ("));
+        assert!(!public.contains("--hostname"));
+    }
+
+    #[test]
+    fn check_links_on_the_pull_requests_own_host_are_kept() {
+        let mut detail = detail();
+        detail.status_check_rollup[0].details_url =
+            "https://acme.ghe.com/infra/app/actions/runs/1".into();
+        let checks = |detail: &ChangeRequestDetail, url: &str| {
+            prompt(Handoff::FixChecks, detail, url, VerificationPlatform::Linux)
+        };
+        let enterprise = "https://acme.ghe.com/infra/app/pull/591";
+        assert!(
+            checks(&detail, enterprise)
+                .contains("- linux: https://acme.ghe.com/infra/app/actions/runs/1 (FAILURE)")
+        );
+        assert!(
+            checks(&detail, "https://github.com/acme/zeron/pull/591").contains("- linux (FAILURE)"),
+            "another host's link is dropped"
+        );
+        detail.status_check_rollup[0].details_url =
+            "https://github.com/acme/zeron/actions/runs/1".into();
+        assert!(
+            checks(&detail, enterprise)
+                .contains("- linux: https://github.com/acme/zeron/actions/runs/1 (FAILURE)")
+        );
+    }
+
+    #[test]
     fn pull_request_handoff_prompts_carry_identity_and_commands() {
         let url = "https://github.com/acme/zeron/pull/591";
         let detail = detail();
@@ -695,6 +796,19 @@ mod tests {
             checkout_command(&detail, url),
             "gh pr checkout 591 --repo acme/zeron"
         );
+        let enterprise = "https://acme.ghe.com/infra/app/pull/591";
+        assert_eq!(
+            checkout_command(&detail, enterprise),
+            "gh pr checkout 591 --repo acme.ghe.com/infra/app"
+        );
+        let enterprise_review = prompt(
+            Handoff::Review,
+            &detail,
+            enterprise,
+            VerificationPlatform::Relevant,
+        );
+        assert!(enterprise_review.starts_with("Pull request #591 in infra/app: "));
+        assert!(enterprise_review.contains("gh pr diff 591 --repo acme.ghe.com/infra/app"));
         let checks = prompt(
             Handoff::FixChecks,
             &detail,

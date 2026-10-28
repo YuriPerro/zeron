@@ -146,7 +146,10 @@ fn main() -> anyhow::Result<()> {
             gpui_tokio::init(cx);
             gpui_base::init(cx);
             let mut settings = settings::UiSettings::default();
-            settings.last_pull_request_repository = Some(repository.clone());
+            settings.last_pull_request_host = Some("github.com".into());
+            settings
+                .last_pull_request_repositories
+                .insert("github.com".into(), vec![repository.clone()]);
             settings.pull_request_destination = settings::PullRequestDestination::Native;
             // Match the default desktop look: translucent, frosted surfaces.
             settings.surface = zeron_theme::SurfacePreference::Frosted;
