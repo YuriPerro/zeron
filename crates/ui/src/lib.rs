@@ -59,6 +59,7 @@ pub mod pickers;
 pub mod popover;
 pub mod project_actions;
 pub mod pull_request_detail;
+mod pull_request_hosts;
 mod pull_request_media;
 mod pull_request_skeleton;
 #[cfg(test)]

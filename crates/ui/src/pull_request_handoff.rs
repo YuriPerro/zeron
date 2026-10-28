@@ -288,7 +288,7 @@ async fn matching_checkout(
     engine: &crate::state::EngineHandle,
     spaces: Vec<zeron_proto::Space>,
     device: &str,
-    repository: &str,
+    wanted: &RepositoryRef,
 ) -> Result<Option<zeron_proto::Space>, String> {
     let mut failed = false;
     for space in spaces.into_iter().filter(|space| space.device_id == device) {
@@ -296,14 +296,24 @@ async fn matching_checkout(
             .client()
             .call(
                 methods::GET_CHANGE_REQUEST_REPOSITORY,
-                serde_json::json!({"cwd": space.path, "targetDeviceId": device, "repository": repository}),
+                serde_json::json!({
+                    "cwd": space.path,
+                    "targetDeviceId": device,
+                    "host": wanted.host,
+                    "repository": wanted.repository,
+                }),
             )
             .await;
         match result.and_then(|value| {
-            serde_json::from_value::<Option<String>>(value)
+            serde_json::from_value::<Option<RepositoryRef>>(value)
                 .map_err(|_| zeron_rpc::RpcError::Failed("invalid repository response".into()))
         }) {
-            Ok(Some(repo)) if repo.eq_ignore_ascii_case(repository) => return Ok(Some(space)),
+            Ok(Some(found))
+                if found.host.eq_ignore_ascii_case(&wanted.host)
+                    && found.repository.eq_ignore_ascii_case(&wanted.repository) =>
+            {
+                return Ok(Some(space));
+            }
             Ok(_) => {}
             Err(_) => failed = true,
         }
@@ -335,11 +345,22 @@ impl PullRequestDetailPage {
         let spaces = state.spaces_sorted().into_iter().cloned().collect();
         // The engine's URL for the pull request it actually read, not the
         // link it was opened from.
-        let repo = repository(self.detail.as_ref().map_or(&self.url, |detail| &detail.url));
+        let wanted = self
+            .detail
+            .as_ref()
+            .and_then(|detail| super::pull_request_repository(&detail.url))
+            .or_else(|| super::pull_request_repository(&self.url));
+        let Some(wanted) = wanted else {
+            self.handoff_error =
+                Some("Couldn’t tell which repository this pull request is in.".into());
+            cx.notify();
+            return;
+        };
+        let repo = wanted.repository.clone();
         self.handoff_device = Some(device.clone());
         self.handoff_error = None;
         self.handoff_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let lookup = matching_checkout(&engine, spaces, &device, &repo);
+            let lookup = matching_checkout(&engine, spaces, &device, &wanted);
             let deadline = cx.background_executor().timer(std::time::Duration::from_secs(15));
             futures::pin_mut!(lookup, deadline);
             let result = match futures::future::select(lookup, deadline).await {
@@ -597,14 +618,19 @@ mod tests {
         let rpc = ScriptedRpc::new(|method, params| async move {
             assert_eq!(method, methods::GET_CHANGE_REQUEST_REPOSITORY);
             assert_eq!(params["targetDeviceId"], "remote");
+            assert_eq!(params["host"], "acme.ghe.com");
             assert!(matches!(
                 params["repository"].as_str(),
                 Some("a/b" | "missing/repo")
             ));
-            zeron_rpc::RpcReply::value(&Some(if params["cwd"] == "/right" {
-                "A/B"
-            } else {
-                "other/repo"
+            zeron_rpc::RpcReply::value(&Some(zeron_proto::RepositoryRef {
+                host: "ACME.ghe.com".into(),
+                repository: if params["cwd"] == "/right" {
+                    "A/B"
+                } else {
+                    "other/repo"
+                }
+                .into(),
             }))
         });
         let engine = crate::state::EngineHandle::from_test_client(rpc.client());
@@ -625,14 +651,18 @@ mod tests {
             space("unrelated", "remote"),
             space("right", "remote"),
         ];
-        let found = matching_checkout(&engine, spaces.clone(), "remote", "a/b")
+        let wanted = |repository: &str| zeron_proto::RepositoryRef {
+            host: "acme.ghe.com".into(),
+            repository: repository.into(),
+        };
+        let found = matching_checkout(&engine, spaces.clone(), "remote", &wanted("a/b"))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(found.device_id, "remote");
         assert_eq!(found.path, "/right");
         assert!(
-            matching_checkout(&engine, spaces, "remote", "missing/repo")
+            matching_checkout(&engine, spaces, "remote", &wanted("missing/repo"))
                 .await
                 .unwrap()
                 .is_none()

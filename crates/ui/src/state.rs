@@ -3611,6 +3611,7 @@ impl AppState {
                 AppState::apply_auth_value,
             ),
             spawn_local_device_probe(cx, handle.clone()),
+            crate::pull_request_hosts::PullRequestHosts::fetch(handle.clone(), None, cx),
         ]);
         if supports_harness_updates {
             watch_tasks.push(spawn_watch(
@@ -5288,6 +5289,27 @@ mod tests {
             continuation_of: None,
             duration_ms: None,
         }
+    }
+
+    #[gpui::test]
+    fn hosts_fetched_on_engine_attach(cx: &mut gpui::TestAppContext) {
+        use crate::pull_request_hosts::PullRequestHosts;
+        use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rpc = ScriptedRpc::new(|method, _| async move {
+            if method == methods::LIST_CHANGE_REQUEST_HOSTS {
+                return RpcReply::value(&["acme.ghe.com", "github.com"]);
+            }
+            Err(zeron_rpc::RpcError::UnknownMethod(method))
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.attach_engine(EngineHandle::from_test_client(rpc.client()), cx)
+        });
+        rpc.settle(cx, &runtime, |cx| {
+            cx.update(|cx| PullRequestHosts::hosts(cx, None).contains(&"acme.ghe.com".to_owned()))
+        });
     }
 
     #[gpui::test]

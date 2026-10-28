@@ -70,6 +70,13 @@ impl RpcService for ScriptedRpc {
     }
 }
 
+/// The reply for the host-list request a connected engine always issues, so a
+/// scripted service that panics on unknown methods can ignore it.
+pub(super) fn hosts_reply(method: &str) -> Option<RpcReply> {
+    (method == zeron_rpc::methods::LIST_CHANGE_REQUEST_HOSTS)
+        .then(|| RpcReply::value(&["github.com"]).expect("host list serializes"))
+}
+
 pub(super) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -109,6 +109,7 @@ impl PullRequestDetailPage {
         let mut params = self.params(false);
         params["body"] = body.clone().into();
         let (cache, target, url) = (self.cache.clone(), self.target.clone(), self.url.clone());
+        let host = super::link_host(&url);
         // Detached: leaving the pull request neither stops the post nor loses
         // its outcome.
         cx.spawn(async move |_, cx| {
@@ -119,7 +120,7 @@ impl PullRequestDetailPage {
                 .map_err(|error| {
                     format!(
                         "Couldn’t confirm your comment was posted. {} Your draft is kept; check GitHub before sending again.",
-                        super::failure_reason(&error)
+                        super::failure_reason(&error, &host)
                     )
                 })
                 .and_then(|value| {

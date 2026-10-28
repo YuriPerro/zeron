@@ -3443,7 +3443,7 @@ fn valid_repository_filter(value: &str) -> bool {
         })
 }
 
-fn params_for_target(target: Option<&str>) -> serde_json::Value {
+pub(crate) fn params_for_target(target: Option<&str>) -> serde_json::Value {
     match target {
         Some(target) => serde_json::json!({ "targetDeviceId": target }),
         None => serde_json::json!({}),
