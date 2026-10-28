@@ -2,7 +2,9 @@
 //! decoding, error-code mapping).
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, TodoStatus, ToolCall};
+use zeron_proto::{
+    AgentEvent, CompactionPhase, DoneStatus, HarnessId, TodoItem, TodoStatus, ToolCall,
+};
 
 use super::wire::{ContentBlock, Frame, ResultFrame};
 
@@ -587,24 +589,39 @@ impl Normalizer {
                 }
                 // Compaction runs a whole model call with nothing streamed.
                 if f.subtype == "status" && f.status.as_deref() == Some("compacting") {
-                    return vec![AgentEvent::ReasoningDelta {
-                        text: String::new(),
-                    }];
+                    return vec![
+                        AgentEvent::ReasoningDelta {
+                            text: String::new(),
+                        },
+                        AgentEvent::Compaction {
+                            phase: CompactionPhase::Started,
+                            tokens_before: None,
+                            tokens_after: None,
+                        },
+                    ];
                 }
                 // The context shrank: report the new occupancy now rather
                 // than at the next assistant frame.
                 if f.subtype == "compact_boundary" {
-                    return f
-                        .compact_metadata
-                        .as_ref()
-                        .and_then(|m| m.get("post_tokens"))
-                        .and_then(Value::as_u64)
-                        .map(|tokens| AgentEvent::ContextUsage {
+                    let metadata_tokens = |key: &str| {
+                        f.compact_metadata
+                            .as_ref()
+                            .and_then(|m| m.get(key))
+                            .and_then(Value::as_u64)
+                    };
+                    let tokens_after = metadata_tokens("post_tokens");
+                    let mut out = vec![AgentEvent::Compaction {
+                        phase: CompactionPhase::Finished,
+                        tokens_before: metadata_tokens("pre_tokens"),
+                        tokens_after,
+                    }];
+                    if let Some(tokens) = tokens_after {
+                        out.push(AgentEvent::ContextUsage {
                             tokens: Some(tokens),
                             window: None,
-                        })
-                        .into_iter()
-                        .collect();
+                        });
+                    }
+                    return out;
                 }
                 if f.subtype != "init" || self.saw_init {
                     return Vec::new();
@@ -1830,23 +1847,54 @@ mod tests {
     }
 
     #[test]
-    fn compaction_is_liveness_then_new_context_usage() {
+    fn compaction_frames_become_compaction_events() {
         assert_eq!(
             normalize_one(r#"{"type":"system","subtype":"status","status":"compacting"}"#),
-            vec![AgentEvent::ReasoningDelta {
-                text: String::new()
-            }]
+            vec![
+                AgentEvent::ReasoningDelta {
+                    text: String::new()
+                },
+                AgentEvent::Compaction {
+                    phase: CompactionPhase::Started,
+                    tokens_before: None,
+                    tokens_after: None
+                },
+            ]
         );
         assert_eq!(
             normalize_one(
                 r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":180000,"post_tokens":9000}}"#
             ),
-            vec![AgentEvent::ContextUsage {
-                tokens: Some(9000),
-                window: None
+            vec![
+                AgentEvent::Compaction {
+                    phase: CompactionPhase::Finished,
+                    tokens_before: Some(180000),
+                    tokens_after: Some(9000)
+                },
+                AgentEvent::ContextUsage {
+                    tokens: Some(9000),
+                    window: None
+                },
+            ]
+        );
+        assert_eq!(
+            normalize_one(
+                r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":224463}}"#
+            ),
+            vec![AgentEvent::Compaction {
+                phase: CompactionPhase::Finished,
+                tokens_before: Some(224463),
+                tokens_after: None
             }]
         );
-        assert!(normalize_one(r#"{"type":"system","subtype":"compact_boundary"}"#).is_empty());
+        assert_eq!(
+            normalize_one(r#"{"type":"system","subtype":"compact_boundary"}"#),
+            vec![AgentEvent::Compaction {
+                phase: CompactionPhase::Finished,
+                tokens_before: None,
+                tokens_after: None
+            }]
+        );
         assert!(
             normalize_one(
                 r#"{"type":"system","subtype":"informational","content":"x","level":"info"}"#
