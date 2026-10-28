@@ -1790,6 +1790,7 @@ pub fn rows_for_entry(
                             compact_fold: None,
                         });
                     }
+                    MessagePart::Compaction { .. } => {}
                     // Tools and thoughts are grouped by the outer arms;
                     // nothing reaches here.
                     MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
