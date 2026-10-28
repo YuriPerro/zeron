@@ -119,6 +119,118 @@ pub fn mark_phase(delta: f32, x: f32, y: f32) -> f32 {
     (delta + mark_cell_stagger(x, y)).rem_euclid(1.0)
 }
 
+/// Echo loader period: concentric rings of a 5×5 grid pulse outward.
+pub const ECHO_CYCLE_MS: u64 = 1_500;
+/// Halo loader period: two comets orbit the ring of a 5×5 grid.
+pub const HALO_CYCLE_MS: u64 = 1_650;
+/// Discrete steps the halo comets advance per cycle.
+pub const HALO_STEPS: usize = 24;
+
+/// Echo keyframes `(phase, opacity)` for one cell's pulse.
+const ECHO_KEYFRAMES: [(f32, f32); 5] = [
+    (0.0, 0.10),
+    (0.28, 0.98),
+    (0.56, 0.32),
+    (0.78, 0.7824),
+    (1.0, 0.10),
+];
+/// Echo delay per ring, as a fraction of the cycle.
+const ECHO_RING_DELAY: f32 = 0.14;
+/// Extra echo delay on odd rings.
+const ECHO_ODD_RING_DELAY: f32 = 0.03;
+
+/// Halo ring cells in clockwise order, from the left of the top edge.
+pub const HALO_PATH: [(usize, usize); 12] = [
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (1, 4),
+    (2, 4),
+    (3, 4),
+    (4, 3),
+    (4, 2),
+    (4, 1),
+    (3, 0),
+    (2, 0),
+    (1, 0),
+];
+/// Opacity of the halo comet's head and each cell behind it.
+pub const HALO_TAIL: [f32; 5] = [1.0, 0.78, 0.56, 0.36, 0.22];
+
+const HALO_REST: f32 = 0.08;
+const HALO_CORE: f32 = 0.16;
+const HALO_OPPOSITE_DIM: f32 = 0.72;
+
+/// Manhattan distance of a `(row, col)` cell from the centre of the 5×5 grid.
+pub fn echo_ring(row: usize, col: usize) -> usize {
+    row.abs_diff(2) + col.abs_diff(2)
+}
+
+/// CSS `cubic-bezier(0.42, 0, 0.58, 1)` ease-in-out, solved by bisection.
+fn ease_in_out(progress: f32) -> f32 {
+    let bezier = |t: f32, a: f32, b: f32| {
+        let u = 1.0 - t;
+        3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
+    };
+    let (mut low, mut high) = (0.0f32, 1.0f32);
+    for _ in 0..24 {
+        let mid = (low + high) / 2.0;
+        if bezier(mid, 0.42, 0.58) < progress {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    bezier((low + high) / 2.0, 0.0, 1.0)
+}
+
+/// Echo loader cell opacity: each ring of the grid runs the same eased
+/// keyframe pulse, delayed by its distance from the centre.
+pub fn echo_opacity(phase: f32, row: usize, col: usize) -> f32 {
+    let ring = echo_ring(row, col);
+    let delay = ring as f32 * ECHO_RING_DELAY + (ring % 2) as f32 * ECHO_ODD_RING_DELAY;
+    let local = (phase - delay).rem_euclid(1.0);
+    let segment = ECHO_KEYFRAMES
+        .windows(2)
+        .find(|pair| local < pair[1].0)
+        .unwrap_or(&ECHO_KEYFRAMES[ECHO_KEYFRAMES.len() - 2..]);
+    let (start, from) = segment[0];
+    let (end, to) = segment[1];
+    lerp(from, to, ease_in_out((local - start) / (end - start)))
+}
+
+/// Halo loader cell opacity: two comets, half the ring apart, step around
+/// `HALO_PATH`. `None` for the four corners, which the loader leaves empty.
+pub fn halo_opacity(phase: f32, row: usize, col: usize) -> Option<f32> {
+    if matches!((row, col), (0 | 4, 0 | 4)) {
+        return None;
+    }
+    let Some(order) = HALO_PATH.iter().position(|&cell| cell == (row, col)) else {
+        return Some(if (row, col) == (2, 2) {
+            HALO_CORE
+        } else {
+            HALO_REST
+        });
+    };
+    let len = HALO_PATH.len();
+    let step = (phase.rem_euclid(1.0) * HALO_STEPS as f32) as usize;
+    let lead_a = step * len / HALO_STEPS % len;
+    let lead_b = (lead_a + len / 2) % len;
+    let tail = |lead: usize, dim: f32| {
+        HALO_TAIL
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| order == (lead + len - i) % len)
+            .map(|(_, &opacity)| opacity * dim)
+            .fold(0.0f32, f32::max)
+    };
+    Some(
+        tail(lead_a, 1.0)
+            .max(tail(lead_b, HALO_OPPOSITE_DIM))
+            .max(HALO_REST),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +324,42 @@ mod tests {
                 "({x},{y}) -> {stagger}"
             );
         }
+    }
+
+    #[test]
+    fn echo_center_peaks_at_28_percent() {
+        close(echo_opacity(0.28, 2, 2), 0.98, "centre peak");
+        close(echo_opacity(0.0, 2, 2), 0.10, "centre rest");
+    }
+
+    #[test]
+    fn echo_outer_ring_lags_by_its_delay() {
+        assert_eq!(echo_ring(0, 0), 4);
+        close(echo_opacity(0.56 + 0.28, 0, 0), 0.98, "corner peak");
+    }
+
+    #[test]
+    fn halo_hides_corners() {
+        assert_eq!(halo_opacity(0.0, 0, 0), None);
+    }
+
+    #[test]
+    fn halo_lead_and_opposite_comet() {
+        close(halo_opacity(0.0, 0, 1).unwrap(), 1.0, "lead");
+        close(halo_opacity(0.0, 4, 1).unwrap(), 0.22, "lead tail end");
+        close(
+            halo_opacity(0.0, 3, 4).unwrap(),
+            0.78 * 0.72,
+            "opposite tail",
+        );
+        close(halo_opacity(0.0, 4, 3).unwrap(), 0.72, "opposite lead");
+        close(halo_opacity(0.0, 4, 2).unwrap(), 0.08, "between the comets");
+    }
+
+    #[test]
+    fn halo_core_and_inner_rest() {
+        close(halo_opacity(0.0, 2, 2).unwrap(), 0.16, "core");
+        close(halo_opacity(0.0, 1, 1).unwrap(), 0.08, "inner rest");
     }
 
     #[test]
