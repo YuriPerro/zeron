@@ -3322,6 +3322,16 @@ impl AppState {
         running_subagents(self.session_for(chat_id), now)
     }
 
+    /// Background tasks (shells and the like) the engine reports under
+    /// `chat_id` right now; empty once its session row goes stale.
+    pub fn background_tasks_for(
+        &self,
+        chat_id: &str,
+        now: DateTime<Utc>,
+    ) -> &[zeron_proto::BackgroundTask] {
+        zeron_proto::view::background_tasks(self.session_for(chat_id), now)
+    }
+
     /// Native run indicator for composer/Stop controls. Sidebar attention is
     /// derived separately by `display_status_for`, including terminal reports.
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
