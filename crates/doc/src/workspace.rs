@@ -903,6 +903,8 @@ mod tests {
                 sandbox: SandboxLevel::WorkspaceWrite,
                 role: None,
                 orchestrator: None,
+                access: Default::default(),
+                plan: false,
             }),
             last_message_preview: None,
             last_message_at: None,
@@ -976,6 +978,8 @@ mod tests {
             sandbox: SandboxLevel::WorkspaceWrite,
             role: None,
             orchestrator: None,
+            access: Default::default(),
+            plan: false,
         };
         assert!(ws.set_chat_config("chat-1", &config).unwrap());
         let row = ws.chat("chat-1").unwrap().expect("row exists");

@@ -106,6 +106,8 @@ mod tests {
             sandbox: SandboxLevel::WorkspaceWrite,
             role: role.map(str::to_owned),
             orchestrator: orchestrator.map(str::to_owned),
+            access: Default::default(),
+            plan: false,
         });
         chat
     }
@@ -260,6 +262,8 @@ mod tests {
             cwd: "/tmp".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: false,
+            access: Default::default(),
+            plan: false,
             resume: resume.map(str::to_owned),
             attachments: Vec::new(),
             worktree: None,

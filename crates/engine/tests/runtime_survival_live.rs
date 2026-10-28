@@ -110,6 +110,8 @@ fn run(
         cwd: cwd.into(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: vec![],
         worktree: None,
         resume: None,
@@ -157,6 +159,8 @@ async fn agent_process_survives_sends_and_cancel() {
                 sandbox: SandboxLevel::DangerFullAccess,
                 role: None,
                 orchestrator: None,
+                access: Default::default(),
+                plan: false,
             },
         )
         .unwrap();

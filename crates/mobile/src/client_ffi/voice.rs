@@ -404,6 +404,8 @@ impl CoreClient {
                     sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                     role: None,
                     orchestrator: None,
+                    access: Default::default(),
+                    plan: false,
                 };
                 zeron_voice_session::run(
                     control,

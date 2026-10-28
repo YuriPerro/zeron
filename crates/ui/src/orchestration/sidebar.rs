@@ -139,6 +139,8 @@ pub(crate) mod test_support {
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                 role: None,
                 orchestrator: orchestrator.then(|| "orch".to_owned()),
+                access: Default::default(),
+                plan: false,
             }),
             last_message_preview: None,
             last_message_at: None,

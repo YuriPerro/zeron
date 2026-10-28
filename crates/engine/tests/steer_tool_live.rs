@@ -119,6 +119,8 @@ async fn steering_never_aborts_a_running_tool() {
                 sandbox: SandboxLevel::DangerFullAccess,
                 role: None,
                 orchestrator: None,
+                access: Default::default(),
+                plan: false,
             },
         )
         .unwrap();
@@ -156,6 +158,8 @@ async fn steering_never_aborts_a_running_tool() {
                     cwd: cwd.clone(),
                     sandbox: SandboxLevel::DangerFullAccess,
                     auto_approve: true,
+                    access: Default::default(),
+                    plan: false,
                     attachments: vec![],
                     worktree: None,
                     resume: None,

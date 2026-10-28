@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{HarnessId, ReasoningLevel, SandboxLevel};
+use crate::{AccessMode, HarnessId, ReasoningLevel, SandboxLevel};
 
 /// Admission limit for new pins. Concurrent offline additions may exceed it;
 /// existing pins remain visible, reorderable and removable without truncation.
@@ -177,6 +177,12 @@ pub struct ChatConfig {
     /// Id of the orchestrator this chat embodies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator: Option<String>,
+    /// The chat's access mode; absent on chats created before modes, which
+    /// ran with full access.
+    #[serde(default, skip_serializing_if = "AccessMode::is_full_access")]
+    pub access: AccessMode,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan: bool,
 }
 
 impl ChatConfig {
@@ -1523,6 +1529,11 @@ pub struct TerminalSession {
     pub cwd: String,
     /// Shell basename (`zsh`, `bash`, …) for the tab label.
     pub shell: String,
+    /// The host answers the terminal's queries itself (device attributes,
+    /// cursor position, …), so a viewer must not answer them too. Absent
+    /// from hosts that predate it, whose viewers answer as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_replies: bool,
 }
 
 /// One `SubscribeTerminal` stream item. `seq` is a per-terminal monotonic counter
@@ -1641,6 +1652,8 @@ mod tests {
             sandbox: SandboxLevel::WorkspaceWrite,
             role: role.map(str::to_owned),
             orchestrator: orchestrator.map(str::to_owned),
+            access: Default::default(),
+            plan: false,
         }
     }
 

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_doc::SessionCommandPayload;
 use zeron_proto::{
-    Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
+    AccessMode, Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
     Space, UserInputAnswer,
 };
 
@@ -135,6 +135,8 @@ fn catalog() -> Vec<ToolDef> {
                     "role": { "type": "string", "description": "Role the chat runs as (see list_roles in an orchestrator chat). Picks the model, reasoning and sandbox; explicit model, reasoning and sandbox win." },
                     "effort": { "type": "string", "enum": ["low", "medium", "high"], "description": "How hard the role's model should think, relative to its usual level. Needs role." },
                     "demand": { "type": "string", "description": "Orchestrator chats only: demand id. The first prompt is prefixed with a pointer to read_demand. Needs prompt." },
+                    "access": { "type": "string", "enum": ["supervised", "auto-accept-edits", "full-access"], "description": "What the agent may do without asking: supervised asks before commands and file changes, auto-accept-edits applies edits and asks before the rest, full-access asks nothing. Questions go to the person in the chat. Must be one of the harness's accessModes (list_harnesses). Defaults to, and can't exceed, the access of the chat you are speaking from." },
+                    "plan": { "type": "boolean", "default": false, "description": "Plan mode: explore and propose a plan before changing anything. Only for harnesses with supportsPlan." },
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
                     "branch": { "type": "string", "description": "Branch label to record on the chat." },
                     "cwd": { "type": "string", "description": "Working directory override (an existing worktree path). Defaults to the project folder." },
@@ -251,6 +253,20 @@ fn catalog() -> Vec<ToolDef> {
             "required": ["script", "title"]
         }),
     });
+    tools.push(ToolDef {
+        name: SHOW_IMAGE,
+        description: SHOW_IMAGE_DESCRIPTION.into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The image file on this machine, absolute or relative to your working directory."
+                }
+            },
+            "required": ["path"]
+        }),
+    });
     tools
 }
 
@@ -258,11 +274,23 @@ fn catalog() -> Vec<ToolDef> {
 /// Zeron launched (`ZERON_CHAT_ID` set).
 const SHOW_VISUAL: &str = "show_visual";
 
+/// Shows an image file in the CALLING chat; offered like `show_visual`.
+const SHOW_IMAGE: &str = "show_image";
+
+const SHOW_IMAGE_DESCRIPTION: &str = "\
+Show an image file (a screenshot, a rendered chart or diagram, a photo) inline in this chat, above \
+your final text reply; call it before writing that reply, once per image, in the order they should \
+appear. PNG, JPEG, WebP, or GIF, at most 10 MB and 4096 pixels on a side. Zeron copies the file \
+into the chat, so it stays visible after the file changes or is deleted. The reader \
+already sees the image, so the reply should not announce or describe it: add only what the image \
+doesn't show.";
+
 const SHOW_VISUAL_DESCRIPTION: &str = "\
 Show an interactive visual (chart, table, dashboard, diagram, simulation, 3D view) inline in this \
 chat, above your final text reply; call it before writing that reply. Use it when a visual says more \
 than prose. The reader already sees it, so the reply should not announce, locate, or restate it: add \
-only what the visual doesn't say.\n\
+only what the visual doesn't say. To show an image file as it is (a screenshot, a photo), use \
+show_image instead.\n\
 \n\
 A visual is a Luau script (Lua 5.1 plus `+=`, `continue`, and `if` expressions). Zeron runs it in a \
 sandbox (no I/O or network; math.random is seeded, so data is the same on every render) and renders \
@@ -453,7 +481,39 @@ async fn read_visual_assets(
     Ok(out)
 }
 
+/// Read `show_image`'s file (a path relative to the agent's working
+/// directory), bounded however the file changes (or lies about its size).
+async fn read_image(path: &str) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    use zeron_proto::IMAGE_MAX_BYTES;
+    let too_large = || anyhow::anyhow!("{path} is over {} MB", IMAGE_MAX_BYTES / (1024 * 1024));
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("can't read {path}"))?;
+    anyhow::ensure!(metadata.is_file(), "{path} is not a file");
+    if metadata.len() > IMAGE_MAX_BYTES as u64 {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("can't read {path}"))?
+        .take(IMAGE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("can't read {path}"))?;
+    if bytes.len() > IMAGE_MAX_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
 // ---- argument shapes ---------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ShowImageArgs {
+    path: String,
+}
 
 #[derive(Deserialize)]
 struct ShowVisualArgs {
@@ -515,6 +575,11 @@ struct PendingTurn {
     start: TurnStart,
 }
 
+/// Least to most trusting.
+fn access_rank(mode: AccessMode) -> usize {
+    AccessMode::ALL.iter().position(|m| *m == mode).unwrap_or(0)
+}
+
 #[derive(Deserialize, Default)]
 struct CreateChatArgs {
     kind: Option<ChatKind>,
@@ -528,6 +593,9 @@ struct CreateChatArgs {
     role: Option<String>,
     effort: Option<String>,
     demand: Option<String>,
+    access: Option<String>,
+    #[serde(default)]
+    plan: bool,
     title: Option<String>,
     branch: Option<String>,
     cwd: Option<String>,
@@ -677,6 +745,12 @@ impl Tools {
         }
     }
 
+    /// Whether the host launched this server's agent without its own
+    /// subagent tools, so `initialize` says to delegate through chats.
+    pub fn side_chats_only(&self) -> bool {
+        self.zeron.origin().side_chats_only
+    }
+
     pub async fn list(&self) -> Vec<ToolDef> {
         let scope = self.scope().await;
         let mut tools = self.base_tools();
@@ -706,7 +780,7 @@ impl Tools {
         let in_chat = self.zeron.origin().chat_id.is_some();
         catalog()
             .into_iter()
-            .filter(|tool| in_chat || tool.name != SHOW_VISUAL)
+            .filter(|tool| in_chat || ![SHOW_VISUAL, SHOW_IMAGE].contains(&tool.name))
             .collect()
     }
 
@@ -737,6 +811,7 @@ impl Tools {
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
+            SHOW_IMAGE => self.show_image(parse(args)?).await,
             other if orchestration::handles(other) => {
                 return self.call_orchestration(other, args).await;
             }
@@ -855,6 +930,8 @@ impl Tools {
                 "installed": h.installed,
                 "steersMidTurn": h.steers_mid_turn(),
                 "reasoningLevels": h.reasoning_levels,
+                "accessModes": h.access_modes,
+                "supportsPlan": h.supports_plan,
             })).collect::<Vec<_>>()
         }))
     }
@@ -982,6 +1059,9 @@ impl Tools {
 
         // Delegation is one level deep: a chat that has a parent never
         // creates chats, and a new chat's parent is a top-level chat.
+        // The calling chat's access mode caps the new one's: a supervised
+        // agent must not hand its work to one that asks nothing.
+        let mut ceiling = AccessMode::FullAccess;
         if let Some(origin) = self.zeron.origin().chat_id.as_deref()
             && !zeron_proto::voice::is_orchestrator_chat(origin)
         {
@@ -990,6 +1070,7 @@ impl Tools {
                 origin.parent_chat_id.is_none(),
                 "A delegated chat can't create chats of its own. Do the work in this chat, or ask the chat that started you."
             );
+            ceiling = origin.config.map(|c| c.access).unwrap_or_default();
         }
         if let Some(parent) = parent_chat_id.as_deref() {
             let parent = self.zeron.resolve_chat(parent).await?;
@@ -1064,6 +1145,30 @@ impl Tools {
                 .as_ref()
                 .map_or(SandboxLevel::WorkspaceWrite, |r| r.sandbox),
         };
+        let access: AccessMode = match args.access.as_deref() {
+            Some(raw) => parse_enum("access", raw).map_err(anyhow::Error::msg)?,
+            None => ceiling,
+        };
+        anyhow::ensure!(
+            access_rank(access) <= access_rank(ceiling),
+            "This chat runs {}, so the chats it creates can't have more access than that.",
+            ceiling.label()
+        );
+        // A Cloud machine's catalog is checked when it runs, not here; an
+        // engine predating modes lists none and runs with full access.
+        if let Some(info) = harnesses.iter().find(|h| h.id == harness).filter(|_| !args.cloud) {
+            let modes = &info.access_modes;
+            anyhow::ensure!(
+                access.is_full_access() || modes.contains(&access),
+                "{harness:?} on device {device_id} cannot run {} (accessModes: {})",
+                access.label(),
+                modes.iter().map(|m| m.label()).collect::<Vec<_>>().join(", ")
+            );
+            anyhow::ensure!(
+                !args.plan || info.supports_plan,
+                "{harness:?} on device {device_id} has no plan mode"
+            );
+        }
         let config = ChatConfig {
             harness,
             model: model.clone(),
@@ -1072,6 +1177,8 @@ impl Tools {
             sandbox,
             role: child.role.clone(),
             orchestrator: None,
+            access,
+            plan: args.plan,
         };
 
         let chat_id = uuid::Uuid::new_v4().to_string();
@@ -1359,6 +1466,36 @@ impl Tools {
         }))
     }
 
+    async fn show_image(&self, args: ShowImageArgs) -> anyhow::Result<Value> {
+        use base64::Engine as _;
+        let chat_id = self
+            .zeron
+            .origin()
+            .chat_id
+            .clone()
+            .context("show_image only works from an agent Zeron launched in a chat")?;
+        let bytes = read_image(&args.path).await?;
+        let name = std::path::Path::new(&args.path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "image".into());
+        let shown = self
+            .zeron
+            .call(
+                zeron_rpc::methods::PUBLISH_IMAGE,
+                json!({
+                    "chatId": chat_id,
+                    "name": name,
+                    "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                }),
+            )
+            .await?;
+        Ok(json!({
+            "image": shown,
+            "message": "Shown to the reader above your reply. Don't mention or describe the image; reply with only what it doesn't already show.",
+        }))
+    }
+
     async fn interrupt_chat(&self, args: ChatArgs) -> anyhow::Result<Value> {
         let chat = self.zeron.resolve_chat(&args.chat).await?;
         let command_id = self
@@ -1436,10 +1573,7 @@ impl Tools {
             }
             _ => short(origin_id).to_owned(),
         };
-        format!(
-            "[Message from Zeron chat {label}. Reply to it with the Zeron `send_message` tool, chat {}.]\n\n{text}",
-            origin_id
-        )
+        zeron_proto::agent_messages::agent_message(&label, origin_id, text)
     }
 
     /// Pick and perform the delivery the composer would.
@@ -1498,6 +1632,8 @@ impl Tools {
                         .map(|c| c.sandbox)
                         .unwrap_or(SandboxLevel::WorkspaceWrite),
                     auto_approve: false,
+                    access: config.as_ref().map(|c| c.access).unwrap_or_default(),
+                    plan: config.as_ref().is_some_and(|c| c.plan),
                     resume: None,
                     attachments: Vec::new(),
                     worktree: None,
@@ -1797,7 +1933,8 @@ pub(crate) mod tests {
                 ])),
                 methods::LIST_HARNESSES => RpcReply::Value(json!([
                     { "id": "claude-code", "name": "Claude Code", "supportsSteering": true,
-                      "steeringMode": "step-boundary", "reasoningLevels": [], "installed": true, "enabled": true },
+                      "steeringMode": "step-boundary", "reasoningLevels": [], "installed": true, "enabled": true,
+                      "accessModes": ["supervised", "auto-accept-edits", "full-access"], "supportsPlan": true },
                     { "id": "codex", "name": "Codex", "supportsSteering": true,
                       "steeringMode": "turn-boundary", "reasoningLevels": [], "installed": false, "enabled": true }
                 ])),
@@ -1853,6 +1990,13 @@ pub(crate) mod tests {
                         .unwrap()
                         .push((method.to_owned(), params.clone()));
                     RpcReply::Value(json!({ "id": "v:1", "title": params["title"] }))
+                }
+                methods::PUBLISH_IMAGE => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(json!({ "id": "img:1", "name": params["name"] }))
                 }
                 methods::MUTATE | methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
                     // A Cloud chat gets a machine of its own from the engine.
@@ -1931,6 +2075,7 @@ pub(crate) mod tests {
             Origin {
                 chat_id: Some("chat-alpha-1".into()),
                 device_id: Some("dev-local".into()),
+                ..Default::default()
             },
         );
         assert!(inside.has("show_visual").await);
@@ -1951,6 +2096,73 @@ pub(crate) mod tests {
         assert_eq!(method, methods::PUBLISH_VISUAL);
         assert_eq!(params["chatId"], "chat-alpha-1");
         assert_eq!(params["script"], "return ui.text 'chart'");
+    }
+
+    #[tokio::test]
+    async fn show_image_sends_the_file_only_from_inside_a_chat() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("before.png");
+        std::fs::write(&file, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let world = Arc::new(World::default());
+        let outside = tools(world.clone(), Origin::default());
+        assert!(!outside.has("show_image").await);
+        assert!(
+            outside
+                .call("show_image", json!({ "path": path }))
+                .await
+                .is_err()
+        );
+
+        let inside = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: Some("dev-local".into()),
+                ..Default::default()
+            },
+        );
+        assert!(inside.has("show_image").await);
+        let shown = inside
+            .call("show_image", json!({ "path": path }))
+            .await
+            .unwrap();
+        assert_eq!(shown["image"]["name"], "before.png");
+        {
+            let writes = world.writes.lock().unwrap();
+            let (method, params) = writes.last().unwrap();
+            assert_eq!(method, methods::PUBLISH_IMAGE);
+            assert_eq!(params["chatId"], "chat-alpha-1");
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(params["data"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(data, b"\x89PNG\r\n\x1a\nfixture");
+        }
+
+        let missing = inside
+            .call("show_image", json!({ "path": "/nonexistent/shot.png" }))
+            .await
+            .unwrap_err();
+        assert!(
+            missing.contains("can't read /nonexistent/shot.png"),
+            "{missing}"
+        );
+        let huge = dir.path().join("huge.png");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(zeron_proto::IMAGE_MAX_BYTES as u64 + 1)
+            .unwrap();
+        let error = inside
+            .call("show_image", json!({ "path": huge.to_string_lossy() }))
+            .await
+            .unwrap_err();
+        assert!(error.contains("over 10 MB"), "{error}");
+        assert_eq!(
+            world.writes.lock().unwrap().len(),
+            1,
+            "nothing else was sent"
+        );
     }
 
     #[tokio::test]
@@ -1988,6 +2200,7 @@ pub(crate) mod tests {
             Origin {
                 chat_id: Some("chat-beta-2".into()),
                 device_id: Some("dev-local".into()),
+                ..Default::default()
             },
         );
         let err = tools
@@ -2042,6 +2255,7 @@ pub(crate) mod tests {
             Origin {
                 chat_id: Some(second.into()),
                 device_id: None,
+                ..Default::default()
             },
         );
         let error = orchestrator
@@ -2079,6 +2293,7 @@ pub(crate) mod tests {
             Origin {
                 chat_id: Some("chat-alpha-1".into()),
                 device_id: None,
+                ..Default::default()
             },
         );
         worker
@@ -2174,6 +2389,7 @@ pub(crate) mod tests {
             Origin {
                 chat_id: Some("chat-beta-2".into()),
                 device_id: None,
+                ..Default::default()
             },
         );
         let created = tools
@@ -2314,7 +2530,61 @@ pub(crate) mod tests {
         Origin {
             chat_id: Some(chat.into()),
             device_id: None,
+            ..Default::default()
         }
+    }
+
+    fn tools_from(world: &Arc<World>, chat: &str) -> Tools {
+        tools(world.clone(), origin(chat))
+    }
+
+    #[tokio::test]
+    async fn a_chat_creates_chats_with_no_more_access_than_its_own() {
+        let supervised = json!({
+            "id": "chat-careful", "deviceId": "dev-local", "title": "Careful",
+            "archived": false, "spaceId": "space-1",
+            "config": { "harness": "claude-code", "sandbox": "workspace-write", "access": "supervised" },
+            "createdAt": "2026-09-01T00:00:00Z"
+        });
+        let world = Arc::new(World {
+            extra_chats: vec![supervised],
+            ..Default::default()
+        });
+        let tools = tools_from(&world, "chat-careful");
+        tools.call("create_chat", json!({})).await.unwrap();
+        tools
+            .call("create_chat", json!({"access": "supervised", "plan": true}))
+            .await
+            .unwrap();
+        let err = tools
+            .call("create_chat", json!({"access": "full-access"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("can't have more access"), "{err}");
+        let writes = world.writes.lock().unwrap();
+        let created: Vec<&Value> = writes
+            .iter()
+            .filter(|(_, w)| w["op"] == "createChat")
+            .map(|(_, w)| w)
+            .collect();
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[0]["config"]["access"], "supervised", "inherited");
+        assert_eq!(created[1]["config"]["plan"], true);
+        drop(writes);
+        // A top-level chat with no mode of its own runs with full access,
+        // which its chats inherit (the field is omitted on the wire).
+        tools_from(&world, "chat-alpha-1")
+            .call("create_chat", json!({}))
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        let last = writes
+            .iter()
+            .rev()
+            .find(|(_, w)| w["op"] == "createChat")
+            .unwrap();
+        assert!(last.1["config"].get("access").is_none());
     }
 
     #[tokio::test]
@@ -2544,6 +2814,7 @@ pub(crate) mod tests {
             Origin {
                 chat_id: Some("chat-alpha-1".into()),
                 device_id: None,
+                ..Default::default()
             },
         );
         for (args, kind, parent) in [
@@ -2738,6 +3009,7 @@ pub(crate) mod tests {
             Origin {
                 chat_id: Some("chat-alpha-1".into()),
                 device_id: None,
+                ..Default::default()
             },
         );
         let result = tools
@@ -3056,6 +3328,24 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn initialize_and_list_over_jsonrpc() {
         let world = Arc::new(World::default());
+        // A server whose agent launched without its own subagent tools
+        // tells it to delegate through chats; any other doesn't.
+        let rule = "with `create_chats` (or `create_chat`).";
+        for side_chats_only in [true, false] {
+            let origin = Origin {
+                side_chats_only,
+                ..Default::default()
+            };
+            let init = crate::jsonrpc::handle_request(
+                &tools(world.clone(), origin),
+                json!(1),
+                "initialize",
+                json!({}),
+            )
+            .await;
+            let instructions = init["result"]["instructions"].as_str().unwrap();
+            assert_eq!(instructions.ends_with(rule), side_chats_only);
+        }
         let tools = tools(world, Origin::default());
         let init = crate::jsonrpc::handle_request(
             &tools,

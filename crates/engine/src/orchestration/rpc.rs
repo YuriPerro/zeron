@@ -328,5 +328,7 @@ pub(crate) fn chat_config(config: &OrchestratorConfig) -> ChatConfig {
         sandbox: SandboxLevel::ReadOnly,
         role: None,
         orchestrator: Some(config.id.clone()),
+        access: Default::default(),
+        plan: false,
     }
 }

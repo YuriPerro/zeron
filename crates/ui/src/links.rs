@@ -136,6 +136,8 @@ mod tests {
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                 role: None,
                 orchestrator: None,
+                access: Default::default(),
+                plan: false,
             }),
             last_message_preview: None,
             last_message_at: None,

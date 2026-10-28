@@ -1,3 +1,4 @@
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, ClickEvent, InteractiveElement as _, IntoElement as _, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
@@ -40,6 +41,7 @@ pub(crate) fn row_for_message(
             RowKind::FromChat {
                 chat_id: chat_id.into(),
                 label: label.into(),
+                markdown: crate::transcript::user_markdown(&body),
                 body: body.into(),
                 contract_demand: contract_demand.map(Into::into),
             }
@@ -140,11 +142,16 @@ pub(crate) fn child_event_line(
         .into_any_element()
 }
 
+/// A message from another chat, as a bubble on the sender's side headed by
+/// who sent it; `open`, when the sender is listed, opens it from the name.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn from_chat_bubble(
+    row_id: &SharedString,
     sender: &Sender,
     chat_id: &SharedString,
     contract_demand: Option<&SharedString>,
     body: AnyElement,
+    open: Option<impl Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
     max_width: f32,
     theme: &Theme,
 ) -> AnyElement {
@@ -183,11 +190,18 @@ pub(crate) fn from_chat_bubble(
         .children(avatar)
         .child(
             div()
+                .id(SharedString::from(format!("{row_id}-sender")))
                 .min_w_0()
                 .truncate()
                 .text_size(crate::typography::ui_rems(13.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_muted)
+                .when_some(open, |el, on_click| {
+                    el.role(gpui::Role::Link)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme.text))
+                        .on_click(on_click)
+                })
                 .child(sender.name.clone()),
         )
         .children(tag);
@@ -312,11 +326,14 @@ mod tests {
                 chat_id,
                 label,
                 body,
+                markdown,
                 contract_demand,
             } => {
                 assert_eq!(chat_id.as_ref(), ID);
                 assert_eq!(label.as_ref(), "Plataforma");
                 assert_eq!(body.as_ref(), "Goal: ship");
+                // Prose reads the same as typed: the plain body.
+                assert!(markdown.is_none());
                 assert!(contract_demand.is_none());
             }
             _ => panic!("expected a from-chat row"),

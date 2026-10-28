@@ -55,6 +55,8 @@ impl Shell {
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                 role: None,
                 orchestrator: None,
+                access: Default::default(),
+                plan: false,
             });
         let saved = settings::current(cx);
         let device = saved.codex_voice_device.unwrap_or(device);
@@ -248,6 +250,9 @@ impl Shell {
                         cx.stop_propagation();
                         this.voice.update(cx, |voice, cx| voice.dismiss_reason(cx));
                     }))
+                    .role(gpui::Role::Button)
+                    .aria_label("Dismiss")
+                    .tooltip(stage_tooltip("Dismiss"))
                     .child(
                         icon(icons::CLOSE)
                             .size(px(14.0))

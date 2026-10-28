@@ -845,6 +845,8 @@ impl TryFrom<ChatConfig> for zc::ChatConfig {
             },
             role: None,
             orchestrator: None,
+            access: Default::default(),
+            plan: false,
         })
     }
 }
