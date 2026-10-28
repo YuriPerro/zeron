@@ -30,10 +30,11 @@ use zeron_doc::{
 };
 use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage, TurnControl};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, CompactionPhase, DoneStatus, HarnessId, RunRequest, Session, SessionStatus,
+    UserInputAnswer, UserInputQuestion,
 };
 
+use crate::compaction;
 use crate::doc_host::{ChatDocHandle, DocHost};
 
 #[path = "session_activity.rs"]
@@ -3452,7 +3453,9 @@ async fn drive_run(
     // segment — the mid-word transcript splits.
     let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_images = std::collections::HashSet::new();
-    for entry in doc_ref.read_entries().unwrap_or_default() {
+    let entries = doc_ref.read_entries().unwrap_or_default();
+    let mut compaction_pending = compaction::awaits_after(&entries);
+    for entry in entries {
         for part in entry.parts {
             if let MessagePart::Image { id, .. } = part {
                 seen_images.insert(format!("{chat_id}\0{id}"));
@@ -4362,6 +4365,21 @@ async fn drive_run(
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
             }
+            if compaction_pending
+                && !compaction::has_running(&folded)
+                && let Some(tokens) = tokens.filter(|tokens| *tokens > 0)
+            {
+                if compaction::fill_after(&mut folded, tokens) {
+                    if !dirty {
+                        dirty = true;
+                        flush_at = tokio::time::Instant::now()
+                            + std::time::Duration::from_millis(STREAM_COMMIT_MS);
+                    }
+                } else if let Err(err) = doc_ref.fill_compaction_after(tokens) {
+                    tracing::warn!(%chat_id, error = %err, "compaction after write failed");
+                }
+                compaction_pending = false;
+            }
             continue;
         }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
@@ -4686,6 +4704,12 @@ async fn drive_run(
             _ => {}
         }
 
+        let event = match event {
+            AgentEvent::Compaction { .. } if !compaction::has_running(&folded) => {
+                compaction::with_before(event, doc_ref.context_usage())
+            }
+            event => event,
+        };
         inner.publish(&chat_id, &event);
 
         // Defensive rule from zeron: a mid-run SessionStarted re-emission (Claude SDK
@@ -4699,6 +4723,15 @@ async fn drive_run(
             // journal. To reintroduce: `zeron_doc::sidecar_payload(&event)`
             // → `apply_sidecar_refs` → `doc_host.upload_tool_sidecar`, all
             // still in place and tested.
+        }
+        if matches!(
+            &event,
+            AgentEvent::Compaction {
+                phase: CompactionPhase::Finished,
+                ..
+            }
+        ) {
+            compaction_pending = compaction::has_pending(&folded);
         }
 
         if let AgentEvent::Done { status, .. } = &event {

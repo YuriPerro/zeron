@@ -70,8 +70,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, CompactionPhase, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice,
+    ReasoningLevel, RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient, transport_lost};
@@ -1806,10 +1806,22 @@ async fn run_session(session: Session) {
                                 }
                             }
                         }
+                        if item_type(item) == "contextCompaction" {
+                            let phase = match phase {
+                                Phase::Started => CompactionPhase::Started,
+                                Phase::Completed => CompactionPhase::Finished,
+                            };
+                            if !send(&event_tx, AgentEvent::Compaction {
+                                phase,
+                                tokens_before: None,
+                                tokens_after: None,
+                            }).await {
+                                break 'main;
+                            }
+                        }
                         if phase == Phase::Completed {
                             let output = match item_type(item) {
                                 "exitedReviewMode" => item.get("review").and_then(Value::as_str),
-                                "contextCompaction" => Some("Context compacted."),
                                 _ => None,
                             };
                             if let Some(text) = output
