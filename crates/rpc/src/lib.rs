@@ -218,12 +218,15 @@ pub mod methods {
     pub const WATCH_WORKSPACE_GIT_STATUS: &str = "WatchWorkspaceGitStatus";
     /// Current pull request for one checkout, resolved on the checkout's host device.
     pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
-    /// One page of a repository's open pull requests (`filter`, `after`
-    /// cursor), with the total count.
+    /// One page of open pull requests for 1 to 5 repositories of one host
+    /// (`host`, `repositories`, `filter`, `after` cursor), with the total
+    /// count.
     pub const LIST_CHANGE_REQUEST_PAGE: &str = "ListChangeRequestPage";
     /// Hosts `gh` is signed in to on this device.
     pub const LIST_CHANGE_REQUEST_HOSTS: &str = "ListChangeRequestHosts";
-    /// Resolve a selected checkout through local Git metadata only.
+    /// Resolve a selected checkout to a `RepositoryRef` on any signed-in host
+    /// through local Git metadata only. With `repository` (and `host`, default
+    /// `github.com`) it matches that repository against the checkout's remotes.
     pub const GET_CHANGE_REQUEST_REPOSITORY: &str = "GetChangeRequestRepository";
     pub const GET_CHANGE_REQUEST: &str = "GetChangeRequest";
     pub const POST_CHANGE_REQUEST_COMMENT: &str = "PostChangeRequestComment";

@@ -1790,6 +1790,10 @@ fn should_invalidate_link(error: &RpcError) -> bool {
     matches!(error, RpcError::Closed | RpcError::Transport(_))
 }
 
+fn default_change_request_host() -> String {
+    "github.com".into()
+}
+
 fn change_request_rpc_error(error: ChangeRequestError) -> RpcError {
     let code = match error {
         ChangeRequestError::CliUnavailable => capability_errors::PULL_REQUESTS_CLI_UNAVAILABLE,
@@ -3227,6 +3231,8 @@ impl RpcService for EngineRpc {
                     cwd: String,
                     #[serde(default)]
                     repository: Option<String>,
+                    #[serde(default = "default_change_request_host")]
+                    host: String,
                 }
                 let p: P = parse_params(params)?;
                 // Only a chat or project checkout on this device: a caller
@@ -3236,18 +3242,29 @@ impl RpcService for EngineRpc {
                 let resolver = crate::source_control::ChangeRequestResolver::new();
                 let repository = match p.repository {
                     Some(repository) => {
+                        let wanted = zeron_proto::RepositoryRef {
+                            host: p.host,
+                            repository,
+                        };
                         resolver
-                            .matching_repository_for_checkout(cwd, &repository, &self.github)
+                            .matching_repository_for_checkout(cwd, &wanted, &self.github)
                             .await
                     }
-                    None => resolver.repository_for_checkout(cwd).await,
+                    None => {
+                        resolver
+                            .repository_for_checkout(cwd, &self.github.known_hosts().await)
+                            .await
+                    }
                 };
                 RpcReply::value(&repository)
             }
+            methods::LIST_CHANGE_REQUEST_HOSTS => RpcReply::value(&self.github.known_hosts().await),
             methods::LIST_CHANGE_REQUEST_PAGE => {
                 #[derive(Deserialize)]
                 struct P {
-                    repository: String,
+                    #[serde(default = "default_change_request_host")]
+                    host: String,
+                    repositories: Vec<String>,
                     #[serde(default)]
                     filter: zeron_proto::ChangeRequestFilter,
                     #[serde(default)]
@@ -3259,8 +3276,14 @@ impl RpcService for EngineRpc {
                     cached: bool,
                 }
                 let p: P = parse_params(params)?;
-                if !crate::source_control::valid_pr_repository(&p.repository) {
-                    return Err(RpcError::BadParams("repository must be owner/repo".into()));
+                let scope = zeron_proto::BoardScope {
+                    host: p.host,
+                    repositories: p.repositories,
+                };
+                if !crate::source_control::valid_board_scope(&scope) {
+                    return Err(RpcError::BadParams(
+                        "repositories must be 1 to 5 owner/repo".into(),
+                    ));
                 }
                 if p.after
                     .as_deref()
@@ -3270,16 +3293,7 @@ impl RpcService for EngineRpc {
                 }
                 let page = self
                     .github
-                    .list_page(
-                        &zeron_proto::BoardScope {
-                            host: "github.com".into(),
-                            repositories: vec![p.repository],
-                        },
-                        p.filter,
-                        p.after.as_deref(),
-                        p.refresh,
-                        p.cached,
-                    )
+                    .list_page(&scope, p.filter, p.after.as_deref(), p.refresh, p.cached)
                     .await
                     .map_err(change_request_rpc_error)?;
                 RpcReply::value(&page)

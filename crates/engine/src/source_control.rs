@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use zeron_proto::{
     ChangeRequestListItem, ChangeRequestMergeability, ChangeRequestReviewDecision,
-    ChangeRequestState, ChangeRequestSummary,
+    ChangeRequestState, ChangeRequestSummary, RepositoryRef,
 };
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -233,7 +233,11 @@ impl ChangeRequestResolver {
     /// lookup, repository enumeration, or remote transport. The slug is the
     /// remote's as written, which may predate a repository rename; the board
     /// adopts GitHub's canonical name once its first page loads.
-    pub async fn repository_for_checkout(&self, cwd: &Path) -> Option<String> {
+    pub async fn repository_for_checkout(
+        &self,
+        cwd: &Path,
+        hosts: &[String],
+    ) -> Option<RepositoryRef> {
         let remote_url = match self.inspect_checkout(cwd).await {
             Ok(source) => source.branch.remote_url?,
             // An unborn or detached checkout still has a useful origin.
@@ -243,26 +247,33 @@ impl ChangeRequestResolver {
                     .await?
             }
         };
-        self.github_slug(&remote_url).await
+        self.remote_identity(&remote_url, hosts).await
     }
 
-    /// Match a PR's repository against every fetch remote. A fork's origin
-    /// stays the board's default identity, while upstream is a valid handoff.
-    /// Remote URLs are read with local Git only; a remote is never contacted.
-    /// When no remote names the repository as written, `github` resolves each
-    /// remote's slug to GitHub's canonical name, so a checkout cloned before a
-    /// rename (`acme/old` → `acme/new`) still matches.
+    /// Match a PR's repository against every fetch remote on the same host. A
+    /// fork's origin stays the board's default identity, while upstream is a
+    /// valid handoff. Remote URLs are read with local Git only; a remote is
+    /// never contacted. When no remote names the repository as written,
+    /// `github` resolves each remote's slug to GitHub's canonical name, so a
+    /// checkout cloned before a rename (`acme/old` → `acme/new`) still matches.
     pub async fn matching_repository_for_checkout(
         &self,
         cwd: &Path,
-        repository: &str,
+        wanted: &RepositoryRef,
         github: &GitHubCli,
-    ) -> Option<String> {
-        if !valid_pr_repository(repository) {
+    ) -> Option<RepositoryRef> {
+        if !valid_pr_repository(&wanted.repository) {
+            return None;
+        }
+        let hosts = github.known_hosts().await;
+        if !hosts
+            .iter()
+            .any(|host| host.eq_ignore_ascii_case(&wanted.host))
+        {
             return None;
         }
         let remotes = self.inspector.git_optional(cwd, &["remote"]).await?;
-        let mut slugs = Vec::new();
+        let mut identities: Vec<RepositoryRef> = Vec::new();
         for name in remotes.lines().filter(|name| !name.is_empty()) {
             let Some(urls) = self
                 .inspector
@@ -272,37 +283,57 @@ impl ChangeRequestResolver {
                 continue;
             };
             for url in urls.lines() {
-                if let Some(slug) = self.github_slug(url).await {
-                    if slug.eq_ignore_ascii_case(repository) {
-                        return Some(slug);
-                    }
-                    if !slugs
-                        .iter()
-                        .any(|seen: &String| seen.eq_ignore_ascii_case(&slug))
-                    {
-                        slugs.push(slug);
-                    }
+                let Some(identity) = self.remote_identity(url, &hosts).await else {
+                    continue;
+                };
+                if !identity.host.eq_ignore_ascii_case(&wanted.host) {
+                    continue;
+                }
+                if identity.repository.eq_ignore_ascii_case(&wanted.repository) {
+                    return Some(identity);
+                }
+                if !identities
+                    .iter()
+                    .any(|seen| seen.repository.eq_ignore_ascii_case(&identity.repository))
+                {
+                    identities.push(identity);
                 }
             }
         }
-        for slug in slugs {
-            if let Some(canonical) = github.canonical_repository(&slug).await
-                && canonical.eq_ignore_ascii_case(repository)
+        for identity in identities {
+            if let Some(canonical) = github
+                .canonical_repository(&identity.host, &identity.repository)
+                .await
+                && canonical.eq_ignore_ascii_case(&wanted.repository)
             {
-                return Some(canonical);
+                return Some(RepositoryRef {
+                    host: identity.host,
+                    repository: canonical,
+                });
             }
         }
         None
     }
 
-    /// `owner/name` for a remote on github.com. An SSH remote may name a
-    /// host alias from `~/.ssh/config` (`git@github-work:acme/zeron.git`);
-    /// `ssh -G` resolves it locally without connecting.
-    async fn github_slug(&self, remote_url: &str) -> Option<String> {
+    /// The host and `owner/name` of a remote whose host is one of `hosts`. An
+    /// SSH remote may name a host alias from `~/.ssh/config`
+    /// (`git@github-work:acme/zeron.git`); `ssh -G` resolves it locally
+    /// without connecting.
+    pub async fn remote_identity(
+        &self,
+        remote_url: &str,
+        hosts: &[String],
+    ) -> Option<RepositoryRef> {
         let remote = parse_git_remote(remote_url)?;
-        let slug = format!("{}/{}", remote.owner, remote.repository);
-        if remote.host.eq_ignore_ascii_case("github.com") {
-            return Some(slug);
+        let repository = format!("{}/{}", remote.owner, remote.repository);
+        let allowed = |candidate: &str| {
+            hosts
+                .iter()
+                .find(|host| host.eq_ignore_ascii_case(candidate))
+                .cloned()
+        };
+        if let Some(host) = allowed(&remote.host) {
+            return Some(RepositoryRef { host, repository });
         }
         if !is_ssh_remote(remote_url) || !valid_ssh_alias(&remote.host) {
             return None;
@@ -324,9 +355,10 @@ impl ChangeRequestResolver {
         if !output.success || output.stdout_truncated {
             return None;
         }
-        ssh_config_hostname(&String::from_utf8_lossy(&output.stdout))
-            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
-            .then_some(slug)
+        let host = allowed(ssh_config_hostname(&String::from_utf8_lossy(
+            &output.stdout,
+        ))?)?;
+        Some(RepositoryRef { host, repository })
     }
 
     pub async fn resolve_github(
@@ -756,15 +788,20 @@ impl GitHubCli {
         Ok(metadata)
     }
 
-    /// GitHub's current `owner/name` for `repository`, following renames.
-    /// `None` when GitHub can't resolve it (missing, private to another
-    /// account, offline). Shares the board's cache and rate-limit pause.
-    pub async fn canonical_repository(&self, repository: &str) -> Option<String> {
+    /// GitHub's current `owner/name` for `repository` on `host`, following
+    /// renames. `None` when GitHub can't resolve it (missing, private to
+    /// another account, offline) or the host is not signed in. Shares the
+    /// board's cache and rate-limit pause.
+    pub async fn canonical_repository(&self, host: &str, repository: &str) -> Option<String> {
         if !valid_pr_repository(repository) {
             return None;
         }
+        let host = host.to_ascii_lowercase();
+        if !self.known_hosts().await.contains(&host) {
+            return None;
+        }
         let repository = repository.to_ascii_lowercase();
-        let key = format!("repository:{repository}");
+        let key = format!("repository:{host}:{repository}");
         let github = self.clone();
         let lookup = self.cached_pr_request(key, false, async move {
             let (owner, name) = repository
@@ -783,7 +820,7 @@ impl GitHubCli {
                         "-f".into(),
                         format!("name={name}"),
                     ],
-                    ..github_request("github.com")
+                    ..github_request(&host)
                 })
                 .await
                 .map_err(classify_run_error)?;
@@ -2568,14 +2605,18 @@ mod tests {
             .unwrap()
             .with_github(github);
         let client = zeron_rpc::memory_client(Arc::new(rpc));
-        let repository: Option<String> = client
+        let repository: Option<RepositoryRef> = client
             .call_as(
                 methods::GET_CHANGE_REQUEST_REPOSITORY,
                 json!({"cwd": checkout, "targetDeviceId": core.device_id}),
             )
             .await
             .unwrap();
-        assert_eq!(repository.as_deref(), Some("acme/zeron"));
+        assert_eq!(
+            serde_json::to_value(&repository).unwrap(),
+            json!({"host": "github.com", "repository": "acme/zeron"})
+        );
+        let repository = repository.unwrap().repository;
         // A directory that is no chat or project checkout is refused.
         let outside = dir.path().join("elsewhere");
         std::fs::create_dir(&outside).unwrap();
@@ -2612,11 +2653,17 @@ mod tests {
             ("missing/repository", None),
             ("../invalid", None),
         ] {
-            let matched: Option<String> = client.call_as(
+            let matched: Option<RepositoryRef> = client.call_as(
                 methods::GET_CHANGE_REQUEST_REPOSITORY,
                 json!({"cwd": checkout, "repository": wanted, "targetDeviceId": core.device_id}),
             ).await.unwrap();
-            assert_eq!(matched.as_deref(), expected);
+            assert_eq!(
+                matched,
+                expected.map(|repository| RepositoryRef {
+                    host: "github.com".into(),
+                    repository: repository.into()
+                })
+            );
         }
         run_git(
             &checkout,
@@ -2634,30 +2681,30 @@ mod tests {
         );
         run_git(&checkout, &["branch", "-M", "feature"]);
         run_git(&checkout, &["config", "branch.feature.remote", "upstream"]);
-        let tracked: Option<String> = client
+        let tracked: Option<RepositoryRef> = client
             .call_as(
                 methods::GET_CHANGE_REQUEST_REPOSITORY,
                 json!({"cwd": checkout}),
             )
             .await
             .unwrap();
-        assert_eq!(tracked.as_deref(), Some("acme/upstream"));
+        assert_eq!(tracked.unwrap().repository, "acme/upstream");
         run_git(&checkout, &["checkout", "--detach", "--quiet"]);
-        let detached: Option<String> = client
+        let detached: Option<RepositoryRef> = client
             .call_as(
                 methods::GET_CHANGE_REQUEST_REPOSITORY,
                 json!({"cwd": checkout}),
             )
             .await
             .unwrap();
-        assert_eq!(detached.as_deref(), Some("acme/zeron"));
+        assert_eq!(detached.unwrap().repository, "acme/zeron");
         let first: ChangeRequestPage = client.call_as(methods::LIST_CHANGE_REQUEST_PAGE,
-            json!({"repository": repository, "filter": "reviewing", "targetDeviceId": core.device_id})).await.unwrap();
+            json!({"repositories": [repository], "filter": "reviewing", "targetDeviceId": core.device_id})).await.unwrap();
         assert_eq!(first.items[0].number, 123);
         assert_eq!(first.items[0].repository, "acme/zeron");
         assert_eq!(first.total_count, Some(2));
         let second: ChangeRequestPage = client.call_as(methods::LIST_CHANGE_REQUEST_PAGE,
-            json!({"repository": repository, "filter": "reviewing", "after": first.next_cursor})).await.unwrap();
+            json!({"repositories": [repository], "filter": "reviewing", "after": first.next_cursor})).await.unwrap();
         assert_eq!(second.items[0].number, 124);
         assert!(second.next_cursor.is_none());
         let params = json!({"url": url, "targetDeviceId": core.device_id});
@@ -2741,15 +2788,23 @@ mod tests {
             (methods::LIST_CHANGE_REQUEST_PAGE, json!({})),
             (
                 methods::LIST_CHANGE_REQUEST_PAGE,
-                json!({"repository": "acme/zeron", "filter": "unknown"}),
+                json!({"repositories": []}),
             ),
             (
                 methods::LIST_CHANGE_REQUEST_PAGE,
-                json!({"repository": "acme/zeron repo:other/repo"}),
+                json!({"repositories": ["a/1", "a/2", "a/3", "a/4", "a/5", "a/6"]}),
             ),
             (
                 methods::LIST_CHANGE_REQUEST_PAGE,
-                json!({"repository": "acme/zeron", "after": "a b"}),
+                json!({"repositories": ["acme/zeron"], "filter": "unknown"}),
+            ),
+            (
+                methods::LIST_CHANGE_REQUEST_PAGE,
+                json!({"repositories": ["acme/zeron repo:other/repo"]}),
+            ),
+            (
+                methods::LIST_CHANGE_REQUEST_PAGE,
+                json!({"repositories": ["acme/zeron"], "after": "a b"}),
             ),
             (
                 methods::POST_CHANGE_REQUEST_COMMENT,
@@ -2763,6 +2818,15 @@ mod tests {
             let error = client.call(method, params).await.unwrap_err();
             assert!(error.to_string().starts_with("bad params"), "{error}");
         }
+        let error = client
+            .call(
+                methods::LIST_CHANGE_REQUEST_PAGE,
+                json!({"host": "evil.example", "repositories": ["acme/zeron"]}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, RpcError::Capability(code)
+            if code == capability_errors::PULL_REQUESTS_COMMAND_FAILED));
         let requests = runner.requests();
         assert_eq!(
             requests.len(),
@@ -2899,12 +2963,15 @@ mod tests {
             inspector: GitCheckoutInspector::new(runner.clone()),
             github: GitHubCli::with_runner(runner.clone()).with_hosts(&["github.com"]),
         };
+        let hosts = vec!["github.com".to_owned()];
         assert_eq!(
             resolver
-                .github_slug("git@github-work:acme/zeron.git")
-                .await
-                .as_deref(),
-            Some("acme/zeron")
+                .remote_identity("git@github-work:acme/zeron.git", &hosts)
+                .await,
+            Some(RepositoryRef {
+                host: "github.com".into(),
+                repository: "acme/zeron".into()
+            })
         );
         let request = &runner.requests()[0];
         assert_eq!(request.program, "ssh");
@@ -2912,16 +2979,80 @@ mod tests {
         // Literal github.com and HTTPS hosts never consult ssh.
         assert_eq!(
             resolver
-                .github_slug("https://github.com/acme/zeron")
+                .remote_identity("https://github.com/acme/zeron", &hosts)
                 .await
+                .map(|identity| identity.repository)
                 .as_deref(),
             Some("acme/zeron")
         );
         assert_eq!(
-            resolver.github_slug("https://gitlab.com/acme/zeron").await,
+            resolver
+                .remote_identity("https://gitlab.com/acme/zeron", &hosts)
+                .await,
             None
         );
         assert_eq!(runner.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_identity_accepts_allowed_hosts() {
+        let runner =
+            FakeProcessRunner::with_responses([command_success("hostname acme.ghe.com\n")]);
+        let resolver = ChangeRequestResolver {
+            inspector: GitCheckoutInspector::new(runner.clone()),
+            github: GitHubCli::with_runner(runner.clone()),
+        };
+        let hosts = vec!["github.com".to_owned(), "acme.ghe.com".to_owned()];
+        let expected = Some(RepositoryRef {
+            host: "acme.ghe.com".into(),
+            repository: "Infra/dbt".into(),
+        });
+        assert_eq!(
+            resolver
+                .remote_identity("https://acme.ghe.com/Infra/dbt.git", &hosts)
+                .await,
+            expected
+        );
+        assert_eq!(
+            resolver
+                .remote_identity("git@work:Infra/dbt.git", &hosts)
+                .await,
+            expected
+        );
+        assert_eq!(
+            resolver
+                .remote_identity("https://gitlab.com/a/b.git", &hosts)
+                .await,
+            None
+        );
+        assert_eq!(runner.requests().len(), 1);
+        assert_eq!(runner.requests()[0].args, ["-G", "work"]);
+    }
+
+    #[tokio::test]
+    async fn list_hosts_rpc() {
+        use zeron_rpc::methods;
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble(
+            &dir.path().join("engine"),
+            Arc::new(crate::HarnessRegistry::new()),
+            zeron_proto::HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let github = GitHubCli::with_runner(FakeProcessRunner::with_responses([]))
+            .with_hosts(&["acme.ghe.com", "github.com"]);
+        let rpc = Arc::try_unwrap(core.rpc_service())
+            .ok()
+            .unwrap()
+            .with_github(github);
+        let client = zeron_rpc::memory_client(Arc::new(rpc));
+        let hosts: Vec<String> = client
+            .call_as(methods::LIST_CHANGE_REQUEST_HOSTS, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(hosts, ["acme.ghe.com", "github.com"]);
     }
 
     #[test]
@@ -4504,7 +4635,11 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             Some("git@github.com:acme/zeron.git")
         );
         assert_eq!(
-            resolver.repository_for_checkout(&checkout).await.as_deref(),
+            resolver
+                .repository_for_checkout(&checkout, &["github.com".to_owned()])
+                .await
+                .map(|identity| identity.repository)
+                .as_deref(),
             Some("acme/zeron")
         );
     }
