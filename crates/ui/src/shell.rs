@@ -14999,13 +14999,13 @@ mod tests {
                 "default width must preserve main's responsive layout at {panel_width}px"
             );
         }
-        // At the same 300px pane width, main fits three thumbnails per row.
-        // Applying transcript gutters reduced this to two and turned 60 images
-        // from a 1284px strip into a 1924px strip, pushing controls off-screen.
+        // At the same 300px pane width, main fits two thumbnails per row.
+        // Applying transcript gutters must not cut that to one, which would
+        // double a 60-image strip and push the controls off-screen.
         for setting in [560.0, 736.0, 1200.0] {
             let width = composer_target_width(300.0, setting, true);
             let inner = width - 2.0 * Theme::SPACE_LG - 2.0;
-            for (count, expected_height) in [(3, 68.0), (60, 1284.0), (120, 2564.0)] {
+            for (count, expected_height) in [(3, 212.0), (60, 3124.0), (120, 6244.0)] {
                 assert_eq!(
                     crate::composer::attachment_strip_height(count, inner),
                     expected_height

@@ -78,7 +78,7 @@ fn staged_names(
 }
 
 #[gpui::test]
-fn pasting_images_numbers_them_and_mentions_each_at_the_caret(cx: &mut gpui::TestAppContext) {
+fn pasting_images_numbers_them_as_tiles_without_chips(cx: &mut gpui::TestAppContext) {
     let (_dir, handle) = composer_focus_window(cx);
     handle
         .update(cx, |composer, _, cx| {
@@ -89,30 +89,23 @@ fn pasting_images_numbers_them_and_mentions_each_at_the_caret(cx: &mut gpui::Tes
         .unwrap();
     paste_images(&handle, cx, 2);
     assert_eq!(staged_names(&handle, cx), ["Image 1.png", "Image 2.png"]);
-    assert_eq!(
-        text(&handle, cx),
-        format!(
-            "compare {} {} ",
-            attachment_mention_link(1, None),
-            attachment_mention_link(2, None)
-        )
-    );
+    assert_eq!(tiled_names(&handle, cx), ["Image 1.png", "Image 2.png"]);
+    assert_eq!(text(&handle, cx), "compare ");
     handle
         .read_with(cx, |composer, cx| {
-            let display = &composer.input.read(cx).projection.display;
-            assert!(
-                display.contains(&format!("{CHIP_ICON_SLOT}Image\u{a0}1")),
-                "{display:?}"
-            );
-            assert_eq!(composer.input.read(cx).projection.mentions.len(), 2);
+            assert!(composer.input.read(cx).projection.mentions.is_empty());
         })
         .unwrap();
 }
 
 #[gpui::test]
-fn one_undo_removes_a_paste_and_redo_restores_it(cx: &mut gpui::TestAppContext) {
-    let (_dir, handle) = composer_focus_window(cx);
-    paste_images(&handle, cx, 2);
+fn one_undo_removes_a_file_drop_and_redo_restores_it(cx: &mut gpui::TestAppContext) {
+    let (dir, handle) = composer_focus_window(cx);
+    let paths = vec![write_file(&dir, "notes.md"), write_file(&dir, "logs.md")];
+    handle
+        .update(cx, |composer, _, cx| composer.add_paths(paths, cx))
+        .unwrap();
+    cx.run_until_parked();
     handle
         .update(cx, |composer, window, cx| {
             composer
@@ -132,31 +125,7 @@ fn one_undo_removes_a_paste_and_redo_restores_it(cx: &mut gpui::TestAppContext) 
         .unwrap();
     cx.run_until_parked();
     assert_eq!(attachment_mention_indices(&text(&handle, cx)), vec![1, 2]);
-    assert_eq!(staged_names(&handle, cx), ["Image 1.png", "Image 2.png"]);
-}
-
-#[gpui::test]
-fn deleting_the_last_chip_unstages_and_undo_restores_the_image(cx: &mut gpui::TestAppContext) {
-    let (_dir, handle) = composer_focus_window(cx);
-    paste_images(&handle, cx, 2);
-    handle
-        .update(cx, |composer, _, cx| {
-            composer
-                .input
-                .update(cx, |input, cx| input.remove_attachment_chips(1, cx));
-        })
-        .unwrap();
-    cx.run_until_parked();
-    assert_eq!(staged_names(&handle, cx), ["Image 2.png"]);
-    handle
-        .update(cx, |composer, window, cx| {
-            composer
-                .input
-                .update(cx, |input, cx| input.undo(&Undo, window, cx));
-        })
-        .unwrap();
-    cx.run_until_parked();
-    assert_eq!(staged_names(&handle, cx), ["Image 1.png", "Image 2.png"]);
+    assert_eq!(staged_names(&handle, cx), ["notes.md", "logs.md"]);
 }
 
 #[gpui::test]
@@ -165,9 +134,8 @@ fn numbers_are_never_reused_after_a_removal(cx: &mut gpui::TestAppContext) {
     paste_images(&handle, cx, 2);
     handle
         .update(cx, |composer, _, cx| {
-            composer
-                .input
-                .update(cx, |input, cx| input.remove_attachment_chips(2, cx));
+            let id = composer.staged()[1].id.clone();
+            composer.remove_attachment(&id, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -176,13 +144,13 @@ fn numbers_are_never_reused_after_a_removal(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn removing_a_thumbnail_removes_every_chip_for_it(cx: &mut gpui::TestAppContext) {
-    let (_dir, handle) = composer_focus_window(cx);
-    paste_images(&handle, cx, 1);
+fn removing_a_tile_removes_every_chip_for_it(cx: &mut gpui::TestAppContext) {
+    let (dir, handle) = composer_focus_window(cx);
+    add_file(&handle, cx, write_file(&dir, "notes.md"));
     append(
         &handle,
         cx,
-        &format!(" and {}", attachment_mention_link(1, None)),
+        &format!(" and {}", attachment_mention_link(1, Some("notes.md"))),
     );
     assert_eq!(attachment_mention_indices(&text(&handle, cx)), vec![1]);
     assert_eq!(staged_names(&handle, cx).len(), 1);
@@ -194,18 +162,17 @@ fn removing_a_thumbnail_removes_every_chip_for_it(cx: &mut gpui::TestAppContext)
         .unwrap();
     cx.run_until_parked();
     assert!(attachment_mention_indices(&text(&handle, cx)).is_empty());
-    assert!(!text(&handle, cx).contains("zeron-image"));
     assert!(staged_names(&handle, cx).is_empty());
 }
 
 #[gpui::test]
-fn a_chip_may_repeat_and_the_image_stays_until_the_last_is_removed(cx: &mut gpui::TestAppContext) {
-    let (_dir, handle) = composer_focus_window(cx);
-    paste_images(&handle, cx, 1);
+fn a_chip_may_repeat_and_the_file_stays_until_the_last_is_removed(cx: &mut gpui::TestAppContext) {
+    let (dir, handle) = composer_focus_window(cx);
+    add_file(&handle, cx, write_file(&dir, "notes.md"));
     append(
         &handle,
         cx,
-        &format!(" again {}", attachment_mention_link(1, None)),
+        &format!(" again {}", attachment_mention_link(1, Some("notes.md"))),
     );
     for expected_left in [1usize, 0] {
         edit(&handle, cx, |input| {
@@ -254,31 +221,19 @@ fn tiled_names(
 }
 
 #[gpui::test]
-fn only_attachments_without_a_chip_get_a_tile(cx: &mut gpui::TestAppContext) {
-    let (_dir, handle) = composer_focus_window(cx);
+fn images_get_tiles_and_chipped_files_do_not(cx: &mut gpui::TestAppContext) {
+    let (dir, handle) = composer_focus_window(cx);
     paste_images(&handle, cx, 2);
-    // The chips stand in for the staged images: no tile repeats them.
-    assert_eq!(staged_names(&handle, cx).len(), 2);
-    assert!(tiled_names(&handle, cx).is_empty());
-    handle
-        .update(cx, |composer, _, _| {
-            let key = composer.current_key.clone();
-            composer
-                .attachments
-                .entry(key)
-                .or_default()
-                .push(crate::attachments::stage_clipboard_image(png()));
-        })
-        .unwrap();
-    cx.run_until_parked();
-    // One with no chip keeps its tile, the only handle it has.
-    assert_eq!(tiled_names(&handle, cx), ["image.png"]);
+    // The file's chip stands in for it: no tile repeats it.
+    add_file(&handle, cx, write_file(&dir, "notes.md"));
+    assert_eq!(staged_names(&handle, cx).len(), 3);
+    assert_eq!(tiled_names(&handle, cx), ["Image 1.png", "Image 2.png"]);
 }
 
 #[gpui::test]
-fn undoing_a_thumbnail_removal_restores_image_and_chip(cx: &mut gpui::TestAppContext) {
-    let (_dir, handle) = composer_focus_window(cx);
-    paste_images(&handle, cx, 1);
+fn undoing_a_tile_removal_restores_file_and_chip(cx: &mut gpui::TestAppContext) {
+    let (dir, handle) = composer_focus_window(cx);
+    add_file(&handle, cx, write_file(&dir, "notes.md"));
     handle
         .update(cx, |composer, _, cx| {
             let id = composer.staged()[0].id.clone();
@@ -295,7 +250,7 @@ fn undoing_a_thumbnail_removal_restores_image_and_chip(cx: &mut gpui::TestAppCon
         })
         .unwrap();
     cx.run_until_parked();
-    assert_eq!(staged_names(&handle, cx), ["Image 1.png"]);
+    assert_eq!(staged_names(&handle, cx), ["notes.md"]);
     assert_eq!(attachment_mention_indices(&text(&handle, cx)), vec![1]);
 }
 
@@ -346,10 +301,7 @@ fn images_and_files_share_one_numbering(cx: &mut gpui::TestAppContext) {
         staged_names(&handle, cx),
         ["Image 1.png", "notes.md", "Image 3.png"]
     );
-    assert_eq!(
-        attachment_mention_indices(&text(&handle, cx)),
-        vec![1, 2, 3]
-    );
+    assert_eq!(attachment_mention_indices(&text(&handle, cx)), vec![2]);
 }
 
 #[gpui::test]
@@ -398,7 +350,7 @@ fn at_completion_offers_staged_files_by_name(cx: &mut gpui::TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         attachment_mention_indices(&text(&handle, cx)),
-        vec![1, 2],
+        vec![2],
         "the file chip is mentioned a second time"
     );
     assert!(
@@ -457,41 +409,15 @@ fn images_without_chips_still_count_as_content_and_send_state(cx: &mut gpui::Tes
 }
 
 #[gpui::test]
-fn at_completion_pins_staged_images_above_files_and_filters_them(cx: &mut gpui::TestAppContext) {
+fn at_completion_leaves_tile_only_images_out(cx: &mut gpui::TestAppContext) {
     let (_dir, handle) = composer_focus_window(cx);
     paste_images(&handle, cx, 2);
-    append(&handle, cx, " @");
+    append(&handle, cx, "@image");
     handle
         .read_with(cx, |composer, _| {
-            let matches = composer.mention_attachment_matches();
-            assert_eq!(
-                matches.iter().map(|row| row.index).collect::<Vec<_>>(),
-                vec![1, 2]
-            );
-            assert_eq!(composer.mention.active, Some(0));
+            assert!(composer.mention_attachment_matches().is_empty());
         })
         .unwrap();
-    append(&handle, cx, "image2");
-    handle
-        .update(cx, |composer, _, cx| {
-            let matches = composer.mention_attachment_matches();
-            assert_eq!(
-                matches.iter().map(|row| row.index).collect::<Vec<_>>(),
-                vec![2]
-            );
-            composer.accept_mention(cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    assert_eq!(
-        text(&handle, cx),
-        format!(
-            "{} {}  {} ",
-            attachment_mention_link(1, None),
-            attachment_mention_link(2, None),
-            attachment_mention_link(2, None)
-        )
-    );
     assert_eq!(staged_names(&handle, cx), ["Image 1.png", "Image 2.png"]);
 }
 
@@ -708,14 +634,10 @@ fn leaving_a_queued_edit_restores_the_draft_and_its_numbering(cx: &mut gpui::Tes
         .unwrap();
     cx.run_until_parked();
 
-    // The draft comes back with its own image and live chip...
+    // The draft comes back with its own image...
     assert_eq!(text(&handle, cx), draft);
     assert_eq!(staged_names(&handle, cx), ["Image 1.png"]);
-    handle
-        .read_with(cx, |composer, cx| {
-            assert_eq!(composer.input.read(cx).projection.mentions.len(), 1);
-        })
-        .unwrap();
+    assert_eq!(tiled_names(&handle, cx), ["Image 1.png"]);
     // ...and its own numbering: the edit's numbers never leak into it.
     paste_images(&handle, cx, 1);
     assert_eq!(staged_names(&handle, cx), ["Image 1.png", "Image 2.png"]);
@@ -762,7 +684,19 @@ fn click_first_chip(
 #[gpui::test]
 fn clicking_an_image_chip_opens_the_picture_full_size(cx: &mut gpui::TestAppContext) {
     let (_dir, handle) = composer_focus_window(cx);
-    paste_images(&handle, cx, 1);
+    // Pasted images take no chip; one written into the prompt still has one.
+    handle
+        .update(cx, |composer, _, cx| {
+            let key = composer.current_key.clone();
+            let mut image = crate::attachments::stage_clipboard_image(png());
+            image.mention = Some(1);
+            composer.attachments.entry(key).or_default().push(image);
+            composer.input.update(cx, |input, cx| {
+                input.set_text(attachment_mention_link(1, None), cx)
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
     // Hovering shows no card: the click is how the picture is seen.
     cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
         .unwrap();
@@ -786,7 +720,7 @@ fn clicking_an_image_chip_opens_the_picture_full_size(cx: &mut gpui::TestAppCont
     handle
         .read_with(cx, |composer, _| {
             let preview = composer.preview.as_ref().expect("the chip opens its image");
-            assert_eq!(preview.name.as_ref(), "Image 1.png");
+            assert_eq!(preview.name.as_ref(), "image.png");
         })
         .unwrap();
 }

@@ -293,8 +293,8 @@ fn input_drag_scroll_delta(
 }
 
 /// Staged-attachment strip metrics (zeron attachment-ui.tsx AttachmentStrip:
-/// `flex flex-wrap gap-2 px-4 pt-3`, `size-14` thumbs).
-pub const STRIP_THUMB: f32 = 56.0;
+/// `flex flex-wrap gap-2 px-4 pt-3`), with Codex-sized square thumbs.
+pub const STRIP_THUMB: f32 = 96.0;
 pub const STRIP_GAP: f32 = 8.0;
 pub const STRIP_PAD_TOP: f32 = 12.0;
 pub const STRIP_PAD_X: f32 = 16.0;
@@ -6792,10 +6792,11 @@ impl Composer {
         draft.next
     }
 
-    /// Add newly staged files to a draft. Each is numbered and mentioned at the
-    /// caret as one edit: images read "Image 1", "Image 2", ...; other files
-    /// keep their name. A file the editor cannot take a chip for, or that was
-    /// staged for a draft the user has since left, stays a plain attachment.
+    /// Add newly staged files to a draft. Each is numbered; images read
+    /// "Image 1", "Image 2", ... and show only as tiles, while other files keep
+    /// their name and are mentioned at the caret as one edit. A file the editor
+    /// cannot take a chip for, or that was staged for a draft the user has
+    /// since left, stays a plain attachment.
     fn adopt_staged_attachments(
         &mut self,
         key: String,
@@ -6808,33 +6809,32 @@ impl Composer {
         }
         let text = self.input.read(cx).text().to_string();
         let mut links = Vec::with_capacity(staged.len());
-        let mut indices = Vec::with_capacity(staged.len());
-        for att in &mut staged {
+        let mut chipped = Vec::with_capacity(staged.len());
+        for (position, att) in staged.iter_mut().enumerate() {
             let index = self.next_attachment_index(&key, &text);
-            let file_name = match att.image() {
-                Some(image) => {
-                    att.name = attachments::ensure_extension(
-                        &zeron_proto::attachment_mentions::image_label(index),
-                        image.format,
-                    );
-                    None
-                }
-                None => Some(att.name.as_str()),
-            };
+            if let Some(image) = att.image() {
+                att.name = attachments::ensure_extension(
+                    &zeron_proto::attachment_mentions::image_label(index),
+                    image.format,
+                );
+                continue;
+            }
             links.push(zeron_proto::attachment_mentions::attachment_mention_link(
-                index, file_name,
+                index,
+                Some(att.name.as_str()),
             ));
-            indices.push(index);
+            chipped.push((position, index));
         }
         // Chips are inserted before the attachments join the draft, so a
         // draft that cannot take them (read-only, composing) keeps the files
         // and their original names.
-        let mentioned = self
-            .input
-            .update(cx, |input, cx| input.insert_reference(&links.join(" "), cx));
+        let mentioned = !links.is_empty()
+            && self
+                .input
+                .update(cx, |input, cx| input.insert_reference(&links.join(" "), cx));
         if mentioned {
-            for (att, index) in staged.iter_mut().zip(indices) {
-                att.mention = Some(index);
+            for (position, index) in chipped {
+                staged[position].mention = Some(index);
             }
         }
         self.attachments.entry(key).or_default().extend(staged);
@@ -12040,13 +12040,13 @@ mod tests {
                 composer.on_state_changed(cx);
                 composer.attachments.insert(
                     composer.current_key.clone(),
-                    (0..10)
+                    (0..6)
                         .map(|i| {
                             attachments::stage_png_bytes(format!("image-{i}.png"), png.clone())
                         })
                         .collect(),
                 );
-                composer.set_available_width(698.0, cx);
+                composer.set_available_width(682.0, cx);
                 composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
                 composer
                     .input
@@ -12067,7 +12067,7 @@ mod tests {
         cx.update(|cx| {
             handle
                 .update(cx, |composer, _, cx| {
-                    composer.set_available_width(697.0, cx)
+                    composer.set_available_width(681.0, cx)
                 })
                 .unwrap();
             cx.update_window(handle.into(), |_, window, cx| {
@@ -12077,9 +12077,9 @@ mod tests {
             .unwrap();
             handle
                 .read_with(cx, |composer, cx| {
-                    assert_eq!(composer.staged().len(), 10);
-                    assert_eq!(attachment_strip_height(10, 698.0 - 34.0), 68.0);
-                    assert_eq!(attachment_strip_height(10, 697.0 - 34.0), 132.0);
+                    assert_eq!(composer.staged().len(), 6);
+                    assert_eq!(attachment_strip_height(6, 682.0 - 34.0), 108.0);
+                    assert_eq!(attachment_strip_height(6, 681.0 - 34.0), 212.0);
                     let surface = composer.surface_bounds.get().unwrap();
                     assert!(
                         (f32::from(surface.size.height) - before).abs() <= 1.0,
@@ -12090,7 +12090,7 @@ mod tests {
                     assert!(composer.height_morph.is_none());
                     assert!(
                         (composer.last_rendered_height + composer.dock_clearance_correction
-                            - (COMPACT_TOTAL_HEIGHT + 132.0))
+                            - (COMPACT_TOTAL_HEIGHT + 212.0))
                             .abs()
                             < 0.1,
                         "transcript clearance must reserve the destination height"
@@ -12340,15 +12340,8 @@ mod tests {
             cx.update_window(handle.into(), |_, window, cx| {
                 window.draw(cx).clear();
                 assert!(input.read(cx).focus_handle.is_focused(window));
-                // An attached image is mentioned at the caret.
-                assert_eq!(
-                    input.read(cx).text(),
-                    if accepted {
-                        "Keep this draft [Image 1](zeron-image:1) "
-                    } else {
-                        "Keep this draft"
-                    }
-                );
+                // An attached image joins as a tile and leaves the text alone.
+                assert_eq!(input.read(cx).text(), "Keep this draft");
             })
             .unwrap();
             assert_eq!(

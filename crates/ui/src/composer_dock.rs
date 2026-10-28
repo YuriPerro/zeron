@@ -709,7 +709,7 @@ mod tests {
         DockLayout {
             hero_height: crate::composer::COMPOSER_MIN_HEIGHT,
             thread_height: crate::composer::COMPACT_TOTAL_HEIGHT,
-            extra_height: crate::composer::attachment_strip_height(10, outer_width - 34.0),
+            extra_height: crate::composer::attachment_strip_height(6, outer_width - 34.0),
             compact: true,
         }
     }
@@ -720,13 +720,13 @@ mod tests {
             let mut reflow = DockReflow::default();
             let mut now = Instant::now();
             let (before, after) = if docked {
-                (698.0, 697.0)
+                (682.0, 681.0)
             } else {
-                (697.0, 698.0)
+                (681.0, 682.0)
             };
             let source = attachment_layout(before);
             let target = attachment_layout(after);
-            assert_eq!((source.extra_height - target.extra_height).abs(), 64.0);
+            assert_eq!((source.extra_height - target.extra_height).abs(), 104.0);
             let mut frame = DockFrame::settled(docked);
             frame.active = true;
             frame.amount = 0.4;
@@ -742,7 +742,9 @@ mod tests {
             now += std::time::Duration::from_millis(16);
             let (offset, _) = reflow.sample(target, frame, false, now);
             let painted = target.height(frame.amount) + offset;
-            assert!((painted - source.height(frame.amount)).abs() < 5.0);
+            // The first eased frame moves a small share of the row jump.
+            let jump = (source.extra_height - target.extra_height).abs();
+            assert!((painted - source.height(frame.amount)).abs() < 0.08 * jump);
             // Reverse both route and wrapping before the correction has settled.
             frame.docked = !docked;
             let (offset, _) = reflow.sample(source, frame, false, now);

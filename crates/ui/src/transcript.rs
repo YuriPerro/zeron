@@ -177,11 +177,11 @@ pub const USER_LINE_HEIGHT: f32 = 22.0;
 pub const USER_COLLAPSE_CHARS: usize = 400;
 /// Vertical separation before the plain expand/collapse link.
 const USER_TOGGLE_GAP: f32 = 8.0;
-/// User-bubble attachment thumbnails (user-attachments.tsx): 112×80 thumbs in
-/// a wrapping strip. Fixed thumbnail sizes keep load-state flips from
-/// shifting the virtualizer.
-pub const ATT_THUMB_W: f32 = 112.0;
-pub const ATT_THUMB_H: f32 = 80.0;
+/// User-bubble attachment thumbnails: square thumbs in a wrapping strip,
+/// sized like the composer's. Fixed thumbnail sizes keep load-state flips
+/// from shifting the virtualizer.
+pub const ATT_THUMB_W: f32 = 96.0;
+pub const ATT_THUMB_H: f32 = 96.0;
 
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
@@ -1388,9 +1388,10 @@ pub fn rows_for_entry(
         {
             return vec![row];
         }
-        // Chips stand in for their attachments: those leave the strip, and a
-        // chip carries its upload's path for its progress and, for an image,
-        // a click opening it.
+        // Chips stand in for their file attachments, which leave the strip;
+        // images keep their thumbnail there beside the chip. A chip carries
+        // its upload's path for its progress and, for an image, a click
+        // opening it.
         let chips = zeron_proto::attachment_mentions::attachment_mentions(&body);
         let mut attachments = parsed.attachments;
         let (text, mut mentions) = match crate::composer::sent_mention_display(&body) {
@@ -1411,6 +1412,7 @@ pub fn rows_for_entry(
         }
         attachments.retain(|att| {
             att.appshot.is_some()
+                || crate::attachments::is_image_path(&att.path)
                 || !chips
                     .iter()
                     .any(|chip| crate::attachments::chip_names_attachment(chip, &att.path))
@@ -5918,7 +5920,8 @@ impl Transcript {
     /// What a sent bubble's attachment chips show beyond their label: the
     /// progress of an upload still crossing to the host in place of the icon
     /// (the strip's thumbnails used to carry it), a warning for an image that
-    /// can't be read back, and a click target opening a loaded image.
+    /// can't be read back, and a click target opening a loaded image or a
+    /// workspace file.
     fn chip_overlays(
         &mut self,
         row_id: &SharedString,
@@ -5927,12 +5930,32 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> Vec<ChipOverlay> {
         use crate::attachments::AttachmentSnapshot;
-        if mentions.iter().all(|span| span.upload.is_none()) {
+        let is_workspace_file = |span: &crate::composer::SentMentionSpan| {
+            span.kind == crate::composer::ChipKind::File && span.upload.is_none()
+        };
+        if mentions
+            .iter()
+            .all(|span| span.upload.is_none() && !is_workspace_file(span))
+        {
             return Vec::new();
         }
+        let file_opener = self.tool_file_opener(cx);
         let device_ids = self.attachment_device_ids(cx);
         let mut overlays = Vec::new();
         for (ix, span) in mentions.iter().enumerate() {
+            if is_workspace_file(span) {
+                if file_opener
+                    .as_ref()
+                    .is_some_and(|opener| opener.opens(&span.path))
+                {
+                    overlays.push(ChipOverlay {
+                        range: span.range.clone(),
+                        open: Some(ChipOpen::File(span.path.clone())),
+                        status: None,
+                    });
+                }
+                continue;
+            }
             let Some(upload) = &span.upload else {
                 continue;
             };
@@ -5958,7 +5981,7 @@ impl Transcript {
                 // Loading here keeps the image ready for a click, as the
                 // strip's thumbnail did.
                 match self.attachment_state(&device_ids, upload, None, cx) {
-                    AttachmentSnapshot::Loaded(_) => open = Some(upload.clone()),
+                    AttachmentSnapshot::Loaded(_) => open = Some(ChipOpen::Image(upload.clone())),
                     AttachmentSnapshot::Error { .. } if !sending => {
                         status = Some(
                             crate::icons::icon(crate::icons::DANGER_TRIANGLE)
@@ -6419,8 +6442,13 @@ impl Transcript {
                 measured_h.clone(),
                 cx.entity_id(),
                 chip_overlays,
-                Rc::new(cx.listener(|this, path: &SharedString, window, cx| {
-                    this.open_chip_image(path, window, cx);
+                Rc::new(cx.listener(|this, open: &ChipOpen, window, cx| match open {
+                    ChipOpen::Image(path) => this.open_chip_image(path, window, cx),
+                    ChipOpen::File(path) => {
+                        if let Some(opener) = this.tool_file_opener(cx) {
+                            opener.open(path, window, cx);
+                        }
+                    }
                 })),
             ));
         // Height motion uses the same ease-out curve as sidebars, tool folds,
@@ -8886,7 +8914,7 @@ fn user_bubble_text(
     measured_h: Rc<Cell<f32>>,
     entity_id: gpui::EntityId,
     overlays: Vec<ChipOverlay>,
-    open_image: Rc<dyn Fn(&SharedString, &mut Window, &mut gpui::App)>,
+    open_chip: Rc<dyn Fn(&ChipOpen, &mut Window, &mut gpui::App)>,
 ) -> AnyElement {
     let runs = user_bubble_runs(&text, &mentions, theme);
     let styled = StyledText::new(text.clone()).with_runs(runs);
@@ -8965,7 +8993,7 @@ fn user_bubble_text(
         child: text,
         layout: chip_layout,
         overlays,
-        open: open_image,
+        open: open_chip,
         well: crate::file_icons::well_bg(theme),
     }
     .into_any_element()
@@ -8974,12 +9002,28 @@ fn user_bubble_text(
 /// The upload status painted in a sent chip's icon well.
 const CHIP_STATUS_SIZE: f32 = 14.0;
 
-/// One sent chip's extras, laid over its pill: a status in place of its icon
-/// and, for a loaded image, a click target opening it full size.
+/// One sent chip's extras, laid over its label: a status in place of its icon
+/// and a click target opening a loaded image full size or a workspace file in
+/// the side pane.
 struct ChipOverlay {
     range: Range<usize>,
-    open: Option<SharedString>,
+    open: Option<ChipOpen>,
     status: Option<AnyElement>,
+}
+
+/// What clicking a sent chip opens.
+#[derive(Clone)]
+enum ChipOpen {
+    Image(SharedString),
+    File(SharedString),
+}
+
+impl ChipOpen {
+    fn path(&self) -> &SharedString {
+        match self {
+            Self::Image(path) | Self::File(path) => path,
+        }
+    }
 }
 
 /// Wraps a sent bubble's text with its chips' overlays. They follow the
@@ -8990,7 +9034,7 @@ struct ChipOverlays {
     child: AnyElement,
     layout: gpui::TextLayout,
     overlays: Vec<ChipOverlay>,
-    open: Rc<dyn Fn(&SharedString, &mut Window, &mut gpui::App)>,
+    open: Rc<dyn Fn(&ChipOpen, &mut Window, &mut gpui::App)>,
     well: gpui::Hsla,
 }
 
@@ -9056,12 +9100,13 @@ impl gpui::Element for ChipOverlays {
                 );
                 targets.push(well);
             }
-            let Some(path) = overlay.open.clone() else {
+            let Some(target_open) = overlay.open.clone() else {
                 continue;
             };
             for (part, rect) in rects.into_iter().enumerate() {
                 let open = self.open.clone();
-                let path = path.clone();
+                let target_open = target_open.clone();
+                let path = target_open.path();
                 let mut target = div()
                     .id(SharedString::from(format!("{}-{index}-{part}", self.id)))
                     .w(rect.size.width)
@@ -9071,7 +9116,7 @@ impl gpui::Element for ChipOverlays {
                     .aria_label(format!(
                         "Preview {}",
                         crate::attachments::attachment_display_name(
-                            path.rsplit(['/', '\\']).next().unwrap_or(&path),
+                            path.rsplit(['/', '\\']).next().unwrap_or(path),
                         )
                     ))
                     .on_click(move |event, window, cx| {
@@ -9079,7 +9124,7 @@ impl gpui::Element for ChipOverlays {
                         if event.click_count() == 1
                             && crate::markdown::selection::selected_text().is_none()
                         {
-                            open(&path, window, cx);
+                            open(&target_open, window, cx);
                         }
                     })
                     .into_any_element();
@@ -15548,7 +15593,13 @@ mod tests {
         else {
             panic!("expected a user row");
         };
-        assert!(attachments.is_empty());
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|a| a.path.as_str())
+                .collect::<Vec<_>>(),
+            ["pending://att-1/Image 1.png"]
+        );
         let mentions = mentions.clone();
         transcript.update(cx, |transcript, cx| {
             let overlays = transcript.chip_overlays(&"u5".into(), &mentions, &Theme::dark(), cx);
@@ -15576,10 +15627,10 @@ mod tests {
     }
 
     /// A sent message with image, file-attachment and workspace-file chips
-    /// reads as chips in the bubble; only attachments without a chip stay in
-    /// the strip above.
+    /// reads as chips in the bubble; images and attachments without a chip
+    /// stay in the strip above.
     #[test]
-    fn user_bubbles_project_attachment_chips_in_place_of_the_strip() {
+    fn user_bubbles_keep_image_thumbnails_beside_their_chips() {
         use crate::composer::ChipKind;
         use zeron_proto::attachment_mentions::attachment_mention_link;
         let body = format!(
@@ -15624,14 +15675,17 @@ mod tests {
             })
             .collect();
         assert_eq!(labels, ["Image 1", "notes.md", "composer.rs"]);
-        // Chips stand in for their attachments: only the unchipped image is
-        // left in the strip, and each attachment chip carries its upload.
+        // A file chip stands in for its attachment, images keep their
+        // thumbnail, and each attachment chip carries its upload.
         assert_eq!(
             attachments
                 .iter()
                 .map(|a| a.path.as_str())
                 .collect::<Vec<_>>(),
-            ["/uploads/0a1b2c3d-Image_3.png"]
+            [
+                "/uploads/ab12cd34-Image_1.png",
+                "/uploads/0a1b2c3d-Image_3.png"
+            ]
         );
         assert_eq!(
             mentions
