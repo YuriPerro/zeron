@@ -195,7 +195,7 @@ impl Composer {
                     .map(|task| {
                         let stopping =
                             self.state.read(cx).background_task_stopping(&chat_id, &task.id);
-                        self.background_tray_row(&chat_id, task, stopping, now, &theme, cx)
+                        self.background_tray_row(&chat_id, task, stopping, now, &theme)
                     })
                     .collect(),
             };
@@ -397,7 +397,6 @@ impl Composer {
         stopping: bool,
         now: chrono::DateTime<chrono::Utc>,
         theme: &Theme,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
         let meta = if stopping {
             row_meta("Stopping…".into(), theme.danger, theme)
