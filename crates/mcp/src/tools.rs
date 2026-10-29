@@ -6,7 +6,6 @@
 //! deliver a message to a chat in this state" choice the composer makes
 //! for humans.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,7 +19,6 @@ use zeron_proto::{
     Space, UserInputAnswer,
 };
 
-use crate::orchestration::{self, Scope};
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
 use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
 
@@ -35,12 +33,12 @@ const MAX_WAIT: Duration = Duration::from_secs(3600);
 #[serde(rename_all = "camelCase")]
 pub struct ToolDef {
     pub name: &'static str,
-    pub description: Cow<'static, str>,
+    pub description: &'static str,
     pub input_schema: Value,
 }
 
 pub struct Tools {
-    pub(crate) zeron: Arc<Zeron>,
+    zeron: Arc<Zeron>,
     // Remember successful sends on this MCP connection so wait_for_turn after
     // wait:false also waits for a newly created chat with no session row yet.
     pending_turns: tokio::sync::Mutex<HashMap<String, Arc<PendingTurn>>>,
@@ -69,27 +67,27 @@ fn catalog() -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
             name: "whoami",
-            description: "Which chat and device this server speaks for, plus the engine's workspace mode. Call this first when you need to know your own chat id.".into(),
+            description: "Which chat and device this server speaks for, plus the engine's workspace mode. Call this first when you need to know your own chat id.",
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
             name: "list_devices",
-            description: "Devices in this workspace (the local engine's device is flagged). Chats and projects are hosted on a device.".into(),
+            description: "Devices in this workspace (the local engine's device is flagged). Chats and projects are hosted on a device.",
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
             name: "list_projects",
-            description: "Projects: folders on specific devices. Filter by device (id or name); omit for all projects. Use ids when names or paths repeat.".into(),
+            description: "Projects: folders on specific devices. Filter by device (id or name); omit for all projects. Use ids when names or paths repeat.",
             input_schema: json!({ "type": "object", "properties": { "device": device_schema() } }),
         },
         ToolDef {
             name: "list_harnesses",
-            description: "Agent harnesses (claude-code, codex, cursor, …) on the chosen device (local when omitted). `connected` = installed, enabled and not known to be signed out: those are the providers you can delegate to, whichever provider you are. `signedIn` is null when the login state is unknown.".into(),
+            description: "Agent harnesses (claude-code, codex, cursor, …) on the chosen device (local when omitted). `connected` = installed, enabled and not known to be signed out: those are the providers you can delegate to, whichever provider you are. `signedIn` is null when the login state is unknown.",
             input_schema: json!({ "type": "object", "properties": { "device": device_schema() } }),
         },
         ToolDef {
             name: "list_models",
-            description: "Models a harness offers on the chosen device (local engine when omitted). Model ids are harness-specific strings; pass one to create_chat.".into(),
+            description: "Models a harness offers on the chosen device (local engine when omitted). Model ids are harness-specific strings; pass one to create_chat.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -101,7 +99,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_chats",
-            description: "Chats with project, device, harness/model, sidebar status, and last activity. Status is working, awaitingInput (needs input), completed (unseen result), errored, or idle. statusStale marks expired live reports; terminalActivity explains OSC 7501 reports. sessionStatus is native execution state. Newest activity first.".into(),
+            description: "Chats with project, device, harness/model, sidebar status, and last activity. Status is working, awaitingInput (needs input), completed (unseen result), errored, or idle. statusStale marks expired live reports; terminalActivity explains OSC 7501 reports. sessionStatus is native execution state. Newest activity first.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -115,12 +113,12 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "get_chat",
-            description: "One chat's metadata, live status, and any question its agent is currently blocked on.".into(),
+            description: "One chat's metadata, live status, and any question its agent is currently blocked on.",
             input_schema: chat_key_schema(json!({})),
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a standalone session with kind chat, or a child with kind side. Omitted kind defaults to side with an origin/parent, standalone otherwise. Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.".into(),
+            description: "Create a standalone session with kind chat, or a child with kind side. Omitted kind defaults to side with an origin/parent, standalone otherwise. Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -131,10 +129,7 @@ fn catalog() -> Vec<ToolDef> {
                     "harness": { "type": "string", "description": "Harness id (see list_harnesses with the chosen device). Prefers a connected provider, claude-code first." },
                     "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit for the harness default." },
                     "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max)." },
-                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write", "description": "Defaults to the role's access when a role is given." },
-                    "role": { "type": "string", "description": "Role the chat runs as (see list_roles in an orchestrator chat). Picks the model, reasoning and sandbox; explicit model, reasoning and sandbox win." },
-                    "effort": { "type": "string", "enum": ["low", "medium", "high"], "description": "How hard the role's model should think, relative to its usual level. Needs role." },
-                    "demand": { "type": "string", "description": "Orchestrator chats only: demand id. The first prompt is prefixed with a pointer to read_demand. Needs prompt." },
+                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write" },
                     "access": { "type": "string", "enum": ["supervised", "auto-accept-edits", "full-access"], "description": "What the agent may do without asking: supervised asks before commands and file changes, auto-accept-edits applies edits and asks before the rest, full-access asks nothing. Questions go to the person in the chat. Must be one of the harness's accessModes (list_harnesses). Defaults to, and can't exceed, the access of the chat you are speaking from." },
                     "plan": { "type": "boolean", "default": false, "description": "Plan mode: explore and propose a plan before changing anything. Only for harnesses with supportsPlan." },
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
@@ -149,7 +144,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_chat",
-            description: "Read a chat's transcript as plain messages (newest window by default). Tool calls are summarized one per line.".into(),
+            description: "Read a chat's transcript as plain messages (newest window by default). Tool calls are summarized one per line.",
             input_schema: chat_key_schema(json!({
                 "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 40, "description": "How many messages, counted from the newest." },
                 "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest messages (paging backwards)." },
@@ -159,7 +154,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "send_message",
-            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn through its live mailbox (at the next supported input boundary without interrupting the agent). Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.".into(),
+            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn through its live mailbox (at the next supported input boundary without interrupting the agent). Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
             input_schema: chat_key_schema(json!({
                 "text": { "type": "string" },
                 "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
@@ -169,19 +164,19 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "wait_for_turn",
-            description: "Wait for completed, awaitingInput, interrupted, errored, or timedOut. Native pendingInput can be answered with respond_to_input; terminalActivity input must be handled in its terminal. Stale/offline activity is not completion. Returns assistant replies when available.".into(),
+            description: "Wait for completed, awaitingInput, interrupted, errored, or timedOut. Native pendingInput can be answered with respond_to_input; terminalActivity input must be handled in its terminal. Stale/offline activity is not completion. Returns assistant replies when available.",
             input_schema: chat_key_schema(json!({
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
             })),
         },
         ToolDef {
             name: "interrupt_chat",
-            description: "Stop the chat's running turn.".into(),
+            description: "Stop the chat's running turn.",
             input_schema: chat_key_schema(json!({})),
         },
         ToolDef {
             name: "respond_to_input",
-            description: "Answer a question the chat's agent is blocked on (see get_chat / wait_for_turn pendingInput). Labels are the option strings, or free text for open questions.".into(),
+            description: "Answer a question the chat's agent is blocked on (see get_chat / wait_for_turn pendingInput). Labels are the option strings, or free text for open questions.",
             input_schema: chat_key_schema(json!({
                 "request_id": { "type": "string", "description": "The pending request id. Defaults to the chat's current pending question." },
                 "answers": {
@@ -199,7 +194,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "archive_chat",
-            description: "Archive a chat (hide it from the active sidebar list); pass archived=false to restore. Use it to tidy up chats you created.".into(),
+            description: "Archive a chat (hide it from the active sidebar list); pass archived=false to restore. Use it to tidy up chats you created.",
             input_schema: chat_key_schema(json!({
                 "archived": { "type": "boolean", "default": true }
             })),
@@ -224,8 +219,7 @@ fn catalog() -> Vec<ToolDef> {
             .input_schema
             .clone();
         tools.push(ToolDef {
-            name,
-            description: description.into(),
+            name, description,
             input_schema: json!({
                 "type": "object",
                 "properties": {"requests": {"type": "array", "minItems": 1, "maxItems": MAX_BATCH, "items": item_schema}},
@@ -235,7 +229,7 @@ fn catalog() -> Vec<ToolDef> {
     }
     tools.push(ToolDef {
         name: SHOW_VISUAL,
-        description: SHOW_VISUAL_DESCRIPTION.into(),
+        description: SHOW_VISUAL_DESCRIPTION,
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -255,7 +249,7 @@ fn catalog() -> Vec<ToolDef> {
     });
     tools.push(ToolDef {
         name: SHOW_IMAGE,
-        description: SHOW_IMAGE_DESCRIPTION.into(),
+        description: SHOW_IMAGE_DESCRIPTION,
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -590,9 +584,6 @@ struct CreateChatArgs {
     model: Option<String>,
     reasoning: Option<String>,
     sandbox: Option<String>,
-    role: Option<String>,
-    effort: Option<String>,
-    demand: Option<String>,
     access: Option<String>,
     #[serde(default)]
     plan: bool,
@@ -751,32 +742,7 @@ impl Tools {
         self.zeron.origin().side_chats_only
     }
 
-    pub async fn list(&self) -> Vec<ToolDef> {
-        let scope = self.scope().await;
-        let mut tools = self.base_tools();
-        tools.extend(orchestration::definitions_for(&scope));
-        if matches!(scope, Scope::Orchestrator { .. }) {
-            let roles = orchestration::roles_summary(&self.zeron).await;
-            if !roles.is_empty()
-                && let Some(create) = tools.iter_mut().find(|tool| tool.name == "create_chat")
-            {
-                create.description = format!("{} {roles}", create.description).into();
-            }
-        }
-        tools
-    }
-
-    pub async fn has(&self, name: &str) -> bool {
-        if self.base_tools().iter().any(|t| t.name == name) {
-            return true;
-        }
-        orchestration::handles(name)
-            && orchestration::scope(&self.zeron)
-                .await
-                .map_or(true, |scope| orchestration::offers(&scope, name))
-    }
-
-    fn base_tools(&self) -> Vec<ToolDef> {
+    pub fn list(&self) -> Vec<ToolDef> {
         let in_chat = self.zeron.origin().chat_id.is_some();
         catalog()
             .into_iter()
@@ -784,10 +750,8 @@ impl Tools {
             .collect()
     }
 
-    async fn scope(&self) -> Scope {
-        orchestration::scope(&self.zeron)
-            .await
-            .unwrap_or(Scope::Plain)
+    pub fn has(&self, name: &str) -> bool {
+        self.list().iter().any(|t| t.name == name)
     }
 
     /// `Ok` is the tool's structured result; `Err` is a message the model
@@ -812,9 +776,6 @@ impl Tools {
             "archive_chat" => self.archive_chat(parse(args)?).await,
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
             SHOW_IMAGE => self.show_image(parse(args)?).await,
-            other if orchestration::handles(other) => {
-                return self.call_orchestration(other, args).await;
-            }
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))
@@ -1045,17 +1006,6 @@ impl Tools {
         } else {
             ChatKind::Chat
         };
-        let mut child = orchestration::prepare_child(
-            &self.zeron,
-            orchestration::ChildRequest {
-                role: args.role.as_deref(),
-                effort: args.effort.as_deref(),
-                demand: args.demand.as_deref(),
-                has_prompt: args.prompt.as_deref().is_some_and(|p| !p.trim().is_empty()),
-                parent_chat_id: parent_chat_id.as_deref(),
-            },
-        )
-        .await?;
 
         // Delegation is one level deep: a chat that has a parent never
         // creates chats, and a new chat's parent is a top-level chat.
@@ -1074,7 +1024,6 @@ impl Tools {
         }
         if let Some(parent) = parent_chat_id.as_deref() {
             let parent = self.zeron.resolve_chat(parent).await?;
-            orchestration::ensure_started_by_owner(&self.zeron, &parent)?;
             anyhow::ensure!(
                 parent.parent_chat_id.is_none(),
                 "{} is itself a delegated chat: only top-level chats have side chats.",
@@ -1085,17 +1034,11 @@ impl Tools {
             .zeron
             .resolve_target(args.project.as_deref(), args.device.as_deref())
             .await?;
-        child.attach_project(&self.zeron, space.as_ref()).await?;
         let harnesses = self.zeron.harnesses_on(Some(&device_id)).await?;
-        let requested: Option<HarnessId> = match args.harness.as_deref() {
-            Some(raw) => Some(parse_enum("harness", raw).map_err(anyhow::Error::msg)?),
-            None => child
-                .child_harness()
-                .filter(|id| !args.cloud || CLOUD_HARNESSES.contains(id)),
-        };
-        let harness = match requested {
+        let harness = match args.harness.as_deref() {
             // Cloud runs its own agents, with your Cloud accounts.
-            Some(id) if args.cloud => {
+            Some(raw) if args.cloud => {
+                let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(
                     CLOUD_HARNESSES.contains(&id),
                     "Cloud runs Codex and Claude Code only"
@@ -1103,25 +1046,16 @@ impl Tools {
                 id
             }
             None if args.cloud => CLOUD_HARNESSES[0],
-            Some(id) => {
+            Some(raw) => {
+                let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(
                     harnesses.iter().any(|h| h.id == id && h.available()),
-                    "harness {} is not available on device {device_id} (see list_harnesses with device)",
-                    harness_label(id)
+                    "harness {raw} is not available on device {device_id} (see list_harnesses with device)"
                 );
                 id
             }
             None => default_harness(&harnesses).with_context(|| format!("device {device_id}"))?,
         };
-        let all_explicit =
-            args.model.is_some() && args.reasoning.is_some() && args.sandbox.is_some();
-        let resolved = child
-            .resolve_role(&self.zeron, harness, &device_id, all_explicit)
-            .await?;
-        let model = args
-            .model
-            .clone()
-            .or_else(|| resolved.as_ref().map(|r| r.model.clone()));
         // A Cloud machine's catalog is checked when it runs, not here.
         if let Some(model) = args.model.as_deref().filter(|_| !args.cloud) {
             let models = self.zeron.models_on(harness, Some(&device_id)).await?;
@@ -1137,13 +1071,11 @@ impl Tools {
         }
         let reasoning: Option<ReasoningLevel> = match args.reasoning.as_deref() {
             Some(raw) => Some(parse_enum("reasoning level", raw).map_err(anyhow::Error::msg)?),
-            None => resolved.as_ref().and_then(|r| r.reasoning),
+            None => None,
         };
         let sandbox: SandboxLevel = match args.sandbox.as_deref() {
             Some(raw) => parse_enum("sandbox", raw).map_err(anyhow::Error::msg)?,
-            None => resolved
-                .as_ref()
-                .map_or(SandboxLevel::WorkspaceWrite, |r| r.sandbox),
+            None => SandboxLevel::WorkspaceWrite,
         };
         let access: AccessMode = match args.access.as_deref() {
             Some(raw) => parse_enum("access", raw).map_err(anyhow::Error::msg)?,
@@ -1171,11 +1103,11 @@ impl Tools {
         }
         let config = ChatConfig {
             harness,
-            model: model.clone(),
+            model: args.model.clone(),
             reasoning,
             model_options: Default::default(),
             sandbox,
-            role: child.role.clone(),
+            role: None,
             orchestrator: None,
             access,
             plan: args.plan,
@@ -1208,7 +1140,6 @@ impl Tools {
             .map(str::trim)
             .filter(|c| !c.is_empty())
             .map(str::to_owned);
-        child.ensure_cwd(space.as_ref(), cwd.as_deref())?;
         // A projectless chat runs in its own scratch folder on a host that
         // creates them; naming it here keeps createChat and the first run
         // in agreement.
@@ -1267,9 +1198,8 @@ impl Tools {
             "deviceId": device_id,
             "project": space.as_ref().map(|s| json!({ "id": s.id, "name": s.display_name(), "path": s.path })),
             "harness": harness,
-            "model": model,
+            "model": args.model,
             "reasoning": reasoning,
-            "role": child.role,
             "title": args.title,
             "parentChatId": parent_chat_id,
         });
@@ -1279,7 +1209,6 @@ impl Tools {
             ));
         }
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
-            let prompt = child.brief(prompt);
             // The row may not have folded into WatchChats yet; build the
             // chat locally from what we just wrote rather than re-reading.
             let chat = Chat {
@@ -1772,16 +1701,9 @@ impl Tools {
     }
 }
 
-fn harness_label(id: HarnessId) -> String {
-    serde_json::to_value(id)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| format!("{id:?}"))
-}
-
 /// claude-code when it is ready here, else the first ready harness — a
 /// provider that is installed but signed out only when nothing else is.
-pub fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
+fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
     let real = |h: &&HarnessInfo| h.id != HarnessId::Mock;
     harnesses
         .iter()
@@ -1804,7 +1726,7 @@ pub fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::zeron::Origin;
     use async_trait::async_trait;
@@ -1815,8 +1737,8 @@ pub(crate) mod tests {
     /// Two devices with distinct catalogs and repeated project paths, plus
     /// two chats with a two-message transcript. Writes are recorded for assertions.
     #[derive(Default)]
-    pub(crate) struct World {
-        pub(crate) writes: Mutex<Vec<(String, Value)>>,
+    struct World {
+        writes: Mutex<Vec<(String, Value)>>,
         dispatch_barrier: Option<tokio::sync::Barrier>,
         beta_parent: Option<String>,
         /// Adds two more chats below Beta: Beta → Gamma → Delta.
@@ -1827,21 +1749,7 @@ pub(crate) mod tests {
         beta_remote: bool,
         extra_chats: Vec<Value>,
         catalog_error: Option<&'static str>,
-        pub(crate) reads: Mutex<Vec<(String, Value)>>,
-        orch_child_harness: Option<&'static str>,
-    }
-
-    impl World {
-        pub(crate) fn orchestrated(
-            child_harness: Option<&'static str>,
-            chats: Vec<Value>,
-        ) -> Arc<Self> {
-            Arc::new(Self {
-                extra_chats: chats,
-                orch_child_harness: child_harness,
-                ..Default::default()
-            })
-        }
+        reads: Mutex<Vec<(String, Value)>>,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1853,11 +1761,7 @@ pub(crate) mod tests {
         async fn handle(&self, method: &str, params: Value) -> Result<RpcReply, RpcError> {
             if matches!(
                 method,
-                methods::LIST_HARNESSES
-                    | methods::LIST_MODELS
-                    | methods::LIST_AGENT_ACCOUNTS
-                    | methods::RESOLVE_ROLE_MODEL
-                    | methods::GET_ORCHESTRATOR
+                methods::LIST_HARNESSES | methods::LIST_MODELS | methods::LIST_AGENT_ACCOUNTS
             ) {
                 self.reads
                     .lock()
@@ -1951,39 +1855,6 @@ pub(crate) mod tests {
                       "status": "complete",
                       "parts": [{ "kind": "text", "id": "t", "text": "hello back" }] }
                 ]})),
-                methods::LIST_ROLES => RpcReply::Value(json!({
-                    "roles": [
-                        { "name": "executor", "description": "Implements a plan item",
-                          "model": "@medio", "access": "write" },
-                        { "name": "explorador", "description": "Reads code, changes nothing",
-                          "model": "@rapido", "access": "read-only" }
-                    ],
-                    "errors": []
-                })),
-                methods::RESOLVE_ROLE_MODEL => RpcReply::Value(json!({
-                    "model": "sonnet",
-                    "reasoning": "high",
-                    "sandbox": if params["role"] == "explorador" { "read-only" } else { "workspace-write" }
-                })),
-                methods::GET_ORCHESTRATOR => RpcReply::Value(json!({
-                    "id": params["orchestratorId"], "name": "Plataforma", "avatar": null,
-                    "harness": "claude-code", "model": null, "reasoning": null,
-                    "childHarness": self.orch_child_harness.unwrap_or("claude-code"),
-                    "projects": ["space-1"]
-                })),
-                methods::ORCH_CREATE_DEMAND
-                | methods::ORCH_WRITE_SPEC
-                | methods::ORCH_WRITE_PLAN
-                | methods::ORCH_READ_DEMAND
-                | methods::ORCH_SUBMIT_REPORT
-                | methods::ORCH_CLOSE_DEMAND
-                | methods::ORCH_REMEMBER => {
-                    self.writes
-                        .lock()
-                        .unwrap()
-                        .push((method.to_owned(), params));
-                    RpcReply::Value(json!({ "demand": "2026-10-24-login" }))
-                }
                 methods::PUBLISH_VISUAL => {
                     self.writes
                         .lock()
@@ -2026,7 +1897,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn tools(world: Arc<World>, origin: Origin) -> Tools {
+    fn tools(world: Arc<World>, origin: Origin) -> Tools {
         let client = memory_client(world);
         Tools::new(Arc::new(Zeron::with_client(client, origin)))
     }
@@ -2059,7 +1930,7 @@ pub(crate) mod tests {
     async fn show_visual_is_offered_only_inside_a_chat() {
         let world = Arc::new(World::default());
         let outside = tools(world.clone(), Origin::default());
-        assert!(!outside.has("show_visual").await);
+        assert!(!outside.has("show_visual"));
         assert!(
             outside
                 .call(
@@ -2078,7 +1949,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         );
-        assert!(inside.has("show_visual").await);
+        assert!(inside.has("show_visual"));
         // The guidance names every color the runtime accepts.
         for name in zeron_visual::TOKEN_NAMES {
             assert!(SHOW_VISUAL_DESCRIPTION.contains(name), "{name}");
@@ -2107,7 +1978,7 @@ pub(crate) mod tests {
         let path = file.to_string_lossy().into_owned();
         let world = Arc::new(World::default());
         let outside = tools(world.clone(), Origin::default());
-        assert!(!outside.has("show_image").await);
+        assert!(!outside.has("show_image"));
         assert!(
             outside
                 .call("show_image", json!({ "path": path }))
@@ -2123,7 +1994,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         );
-        assert!(inside.has("show_image").await);
+        assert!(inside.has("show_image"));
         let shown = inside
             .call("show_image", json!({ "path": path }))
             .await
@@ -2526,7 +2397,7 @@ pub(crate) mod tests {
         assert!(world.writes.lock().unwrap().is_empty());
     }
 
-    pub(crate) fn origin(chat: &str) -> Origin {
+    fn origin(chat: &str) -> Origin {
         Origin {
             chat_id: Some(chat.into()),
             device_id: None,

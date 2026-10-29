@@ -17,13 +17,12 @@
 //! originating chat, and a chat can never message itself.
 
 mod jsonrpc;
-mod orchestration;
 mod tools;
 mod transcript;
 mod zeron;
 
 pub use jsonrpc::serve_stdio;
-pub use tools::{ToolDef, Tools, default_harness};
+pub use tools::{ToolDef, Tools};
 pub use transcript::{RenderOptions, RenderedMessage, render_entries};
 pub use zeron::{Origin, Zeron};
 
