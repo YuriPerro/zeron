@@ -61,7 +61,7 @@ pub(crate) fn contained_menu(
                 trigger_height,
                 align,
             })
-            .priority(3),
+            .priority(1),
         )
         .into_any_element()
 }

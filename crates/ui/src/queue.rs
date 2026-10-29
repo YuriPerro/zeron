@@ -539,10 +539,7 @@ impl Composer {
             Some(QueueDeliveryGate::ReviewRequired { .. }) if !being_edited => {
                 (SharedString::from("Needs review"), Vec::new())
             }
-            _ => match crate::orchestration::messages::queue_label(&item.text) {
-                Some(label) => (one_line(&label), Vec::new()),
-                None => queue_row_text(&item.text, &item.attachments),
-            },
+            _ => queue_row_text(&item.text, &item.attachments),
         };
 
         let edit_id = item.id.clone();

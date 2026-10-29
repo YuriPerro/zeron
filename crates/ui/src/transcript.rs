@@ -1155,21 +1155,6 @@ pub enum RowKind {
         label: SharedString,
         running: bool,
     },
-    /// An engine wake notice about an orchestrator's child, as a compact line.
-    ChildEvent {
-        chat_id: SharedString,
-        title: SharedString,
-        kind: crate::orchestration::messages::ChildEventKind,
-    },
-    /// A message another chat sent into this one, with its sender.
-    FromChat {
-        chat_id: SharedString,
-        label: SharedString,
-        body: SharedString,
-        /// `body` parsed as Markdown, when it uses any.
-        markdown: Option<UserMarkdown>,
-        contract_demand: Option<SharedString>,
-    },
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1425,11 +1410,6 @@ pub fn rows_for_entry(
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
-        if let Some(row) =
-            crate::orchestration::transcript_rows::row_for_message(entry, &body, raw.len(), pending)
-        {
-            return vec![row];
-        }
         let (sender, body) = match agent_message_sender(&body) {
             Some((sender, body)) => (Some(sender), body.to_owned()),
             None => (None, body),
@@ -1463,11 +1443,15 @@ pub fn rows_for_entry(
                     .iter()
                     .any(|chip| crate::attachments::chip_names_attachment(chip, &att.path))
         });
-        let markdown = if mentions.is_empty() {
-            user_markdown(&text)
-        } else {
-            None
-        };
+        let markdown = mentions
+            .is_empty()
+            .then(|| crate::markdown::parse_message(&text))
+            .filter(|tree| !plain_markdown(tree))
+            .map(|tree| UserMarkdown {
+                folded: folded_markdown(&tree, USER_COLLAPSED_LINES + USER_FOLD_OVERDRAW_LINES)
+                    .map(Arc::new),
+                full: Arc::new(tree),
+            });
         let copy_text = (!text.trim().is_empty()).then(|| SharedString::from(text.clone()));
         return vec![Row {
             id: entry.id.clone().into(),
@@ -3665,9 +3649,6 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
-    /// A child event line's "Open": show the chat in the right-pane tab the
-    /// Side chats card uses, leaving this transcript in the main area.
-    OpenChildChat { chat_id: String },
     /// An agent message's sender caption: open the chat that sent it.
     OpenChat { chat_id: String },
 }
@@ -8443,67 +8424,6 @@ impl Transcript {
             RowKind::CompactionMarker { label, running } => {
                 crate::compaction_line::marker(label.clone(), *running, cx.entity_id(), &theme, cx)
             }
-            RowKind::ChildEvent {
-                chat_id,
-                title,
-                kind,
-            } => {
-                let open = crate::orchestration::transcript_rows::chat_exists(
-                    &self.state.read(cx).chats,
-                    chat_id,
-                )
-                .then(|| {
-                    let chat_id = chat_id.to_string();
-                    cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
-                        cx.emit(TranscriptEvent::OpenChildChat {
-                            chat_id: chat_id.clone(),
-                        });
-                    })
-                });
-                crate::orchestration::transcript_rows::child_event_line(
-                    &row.id, title, *kind, open, &theme,
-                )
-            }
-            RowKind::FromChat {
-                chat_id,
-                label,
-                body,
-                markdown,
-                contract_demand,
-            } => {
-                let chats = &self.state.read(cx).chats;
-                let sender =
-                    crate::orchestration::transcript_rows::sender_for(chats, chat_id, label);
-                let open =
-                    crate::orchestration::transcript_rows::chat_exists(chats, chat_id).then(|| {
-                        let chat_id = chat_id.to_string();
-                        cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
-                            cx.emit(TranscriptEvent::OpenChat {
-                                chat_id: chat_id.clone(),
-                            });
-                        })
-                    });
-                let body = self.render_user_body(
-                    &row.id,
-                    ix,
-                    body.clone(),
-                    Arc::default(),
-                    markdown.clone(),
-                    &theme,
-                    window,
-                    cx,
-                );
-                crate::orchestration::transcript_rows::from_chat_bubble(
-                    &row.id,
-                    &sender,
-                    chat_id,
-                    contract_demand.as_ref(),
-                    body,
-                    open,
-                    self.content_width * 0.8,
-                    &theme,
-                )
-            }
         };
         // Diagram fences and images this row just requested start loading.
         self.ensure_diagram_worker(cx);
@@ -9777,17 +9697,6 @@ fn folded_markdown(tree: &BlockTree, lines: usize) -> Option<BlockTree> {
             .zip(&tree.blocks)
             .all(|(part, top)| part.block == top.block);
     (!whole).then_some(BlockTree { blocks })
-}
-
-/// `text` parsed as Markdown, with the part that fills the fold, when it
-/// uses any: plain prose keeps the bubble's typed text.
-pub(crate) fn user_markdown(text: &str) -> Option<UserMarkdown> {
-    let tree = crate::markdown::parse_message(text);
-    (!plain_markdown(&tree)).then(|| UserMarkdown {
-        folded: folded_markdown(&tree, USER_COLLAPSED_LINES + USER_FOLD_OVERDRAW_LINES)
-            .map(Arc::new),
-        full: Arc::new(tree),
-    })
 }
 
 /// The render key of a user row's Markdown: its selection, element ids and
@@ -13541,19 +13450,23 @@ mod tests {
             "[Message from Zeron chat zgui prod: Windows (WING-PC) (cd27c5c2). Reply to it with the Zeron `send_message` tool, chat {id}.]\n\nWindows lane: done."
         );
         let rows = rows_for_entry(&user_entry("u1", &text), false, false, &mut parse);
-        let RowKind::FromChat {
-            chat_id,
-            label,
-            body,
+        let RowKind::User {
+            text: shown,
+            sender,
             ..
         } = &rows[0].kind
         else {
-            panic!("expected a from-chat row");
+            panic!("expected a user row");
         };
-        assert_eq!(body.as_ref(), "Windows lane: done.");
-        assert_eq!(chat_id.as_ref(), id);
-        // Only the trailing short id goes; a title's own parens stay.
-        assert_eq!(label.as_ref(), "zgui prod: Windows (WING-PC)");
+        assert_eq!(shown.as_ref(), "Windows lane: done.");
+        assert_eq!(
+            sender.as_ref(),
+            Some(&AgentSender {
+                chat_id: id.into(),
+                // Only the trailing short id goes; a title's own parens stay.
+                title: "zgui prod: Windows (WING-PC)".into(),
+            })
+        );
         // An untitled sender is labelled by its short id alone.
         let untitled = format!(
             "[Message from Zeron chat cd27c5c2. Reply to it with the Zeron `send_message` tool, chat {id}.]\n\nhi"
@@ -13588,13 +13501,9 @@ mod tests {
         // stays plain.
         let link = zeron_proto::attachment_mentions::attachment_mention_link(1, Some("notes.md"));
         assert!(markdown(&format!("**read** {link}")).is_none());
-        // An agent's message renders its body, under the sender's header.
+        // An agent's message renders its body, under the sender caption.
         let routed = "[Message from Zeron chat cd27c5c2. Reply to it with the Zeron `send_message` tool, chat cd27c5c2-0000-4000-8000-000000000000.]\n\nRun `cargo test`.";
-        let rows = rows_for_entry(&user_entry("u1", routed), false, false, &mut parse);
-        let RowKind::FromChat { markdown, .. } = &rows[0].kind else {
-            panic!("expected a from-chat row");
-        };
-        assert!(markdown.is_some());
+        assert!(markdown(routed).is_some());
     }
 
     #[test]

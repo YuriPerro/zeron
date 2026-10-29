@@ -79,8 +79,6 @@ mod harness_updates;
 mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
-mod new_orchestrator;
-mod orchestrators;
 mod panel_layout;
 use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_tween};
 #[cfg(test)]
@@ -2146,8 +2144,6 @@ pub struct Shell {
     pub(super) archived_shown: usize,
     /// Ephemeral collapsed project/device sections, keyed by organization + id.
     pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
-    /// Orchestrator chat ids whose "N done" children list is expanded.
-    pub(super) orchestrator_done_open: std::collections::HashSet<String>,
     /// In-flight disclosure tweens, shared by device groups, Pinned and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -2272,7 +2268,6 @@ pub struct Shell {
     rename_space_dialog: Option<RenameSpaceDialog>,
     sidebar_section_migration: Option<(String, crate::state::EngineHandle)>,
     section_dialog: Option<sidebar_sections::SectionDialog>,
-    new_orchestrator: crate::orchestration::new_dialog::NewOrchestratorDialog,
     section_menu: Option<(String, Point<Pixels>)>,
     section_header_hover: Option<String>,
     section_menu_focus: FocusHandle,
@@ -2324,8 +2319,6 @@ pub struct Shell {
     sidebar_section_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<Pixels>>>>,
     /// Each regular group's painted bounds, for the project-group reorder.
     sidebar_project_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<Pixels>>>>,
-    /// Painted height of the Orchestrators section stacked above Pinned.
-    orchestrators_height: std::rc::Rc<std::cell::Cell<f32>>,
     /// Pending pin intents are scoped to the active profile and engine attachment.
     sidebar_pin_write: Option<sidebar_pins::PendingSidebarPins>,
     sidebar_pin_write_generation: u64,
@@ -2552,7 +2545,6 @@ impl Shell {
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
-            this.sync_new_orchestrator(cx);
             cx.notify();
         });
         // A reopened window reuses AppState, so the engine may already be
@@ -2767,7 +2759,6 @@ impl Shell {
             sessions_open: true,
             archived_shown: 0,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
-            orchestrator_done_open: std::collections::HashSet::new(),
             sidebar_reveal_motions: std::collections::HashSet::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
@@ -2844,7 +2835,6 @@ impl Shell {
             rename_space_dialog: None,
             sidebar_section_migration: None,
             section_dialog: None,
-            new_orchestrator: Default::default(),
             section_menu: None,
             section_header_hover: None,
             section_menu_focus: cx.focus_handle(),
@@ -2877,7 +2867,6 @@ impl Shell {
             sidebar_section_drag: None,
             sidebar_section_bounds: Default::default(),
             sidebar_project_bounds: Default::default(),
-            orchestrators_height: Default::default(),
             sidebar_pin_write: None,
             sidebar_pin_write_generation: 0,
             sidebar_pin_write_notice: None,
@@ -4634,7 +4623,6 @@ impl Shell {
                 );
             }
             TranscriptEvent::SignIn { chat_id } => self.sign_in_for_chat(chat_id, cx),
-            TranscriptEvent::OpenChildChat { chat_id } => self.open_child_chat_tab(chat_id, cx),
             TranscriptEvent::OpenChat { chat_id } => self.open_chat(chat_id.clone(), cx),
         }
     }
@@ -6279,7 +6267,7 @@ impl Shell {
         // The sidebar lists only top-level chats; side chats ride the
         // session card's lanes. Either way the row must be on screen first:
         // a field on a hidden row would take keystrokes unseen.
-        let surface = if parent.is_some() && !self.in_orchestrator_section(&chat_id, cx) {
+        let surface = if parent.is_some() {
             ChatRenameSurface::SessionCard
         } else {
             ChatRenameSurface::Sidebar
@@ -6672,7 +6660,6 @@ impl Shell {
         self.command_palette.is_some()
             || self.voice.read(cx).stage_open
             || self.section_dialog.is_some()
-            || self.new_orchestrator.open.is_some()
             || self.section_menu.is_some()
             || self.add_space.is_some()
             || self.composer.read(cx).pickers().read(cx).is_open()
@@ -8896,15 +8883,13 @@ impl Shell {
         } else {
             format!("chat-{id}")
         };
-        let (pr_device, orchestrator_name) = {
-            let state = self.state.read(cx);
-            let chat = state.chats.iter().find(|chat| chat.id == id);
-            (
-                chat.map(|chat| chat.device_id.clone()),
-                chat.filter(|chat| crate::orchestration::sidebar::is_orchestrator(chat))
-                    .map(|chat| crate::orchestration::sidebar::display_name(chat).to_owned()),
-            )
-        };
+        let pr_device = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == id)
+            .map(|chat| chat.device_id.clone());
         let compact = search_query.is_none() && self.settings.sidebar_compact;
         let pr_surface = if search_query.is_some() {
             crate::change_requests::ChangeRequestBadgeSurface::Sidebar
@@ -8934,18 +8919,6 @@ impl Shell {
         };
         let project_icon = (project_icon && search_query.is_none())
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
-        let orchestrator_avatar = orchestrator_name.as_deref().map(|name| {
-            div()
-                .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                .flex_none()
-                .child(crate::orchestration::sidebar::orchestrator_avatar(
-                    name, &id, selected, theme,
-                ))
-                .into_any_element()
-        });
-        let is_orchestrator = orchestrator_avatar.is_some();
-        let harness = harness.filter(|_| !is_orchestrator);
-        let project_icon = orchestrator_avatar.or(project_icon);
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
         let archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
         let project_icon = project_icon.map(|icon| {
@@ -8982,9 +8955,7 @@ impl Shell {
         } else {
             match status {
                 zeron_proto::ChatIndicator::Working => Some("Working"),
-                zeron_proto::ChatIndicator::AwaitingInput => Some(
-                    crate::orchestration::sidebar::awaiting_input_label(is_orchestrator),
-                ),
+                zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
                 zeron_proto::ChatIndicator::Errored => Some("Failed"),
                 zeron_proto::ChatIndicator::Completed => Some("Done"),
                 zeron_proto::ChatIndicator::Idle => None,
@@ -10100,11 +10071,6 @@ impl Shell {
 
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
-        let orchestrators_section = self.render_orchestrators_section(
-            show_pinned_section || (ungrouped && custom_count == 0),
-            theme,
-            cx,
-        );
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -10296,7 +10262,6 @@ impl Shell {
                     // No "Sessions" header (user request) — the list
                     // is the whole column; a little air stands in.
                     .pt(px(SIDEBAR_LIST_PAD_TOP))
-                    .child(orchestrators_section)
                     .child(active_list)
                     .children(archived_section)
                     .children(moving_row)
@@ -11293,9 +11258,6 @@ impl Shell {
                     .iter()
                     .any(|chat| chat.id == chat_id && chat.parent_chat_id.is_some());
             let is_pinned = self.active_sidebar_pins(cx).contains(&chat_id);
-            let is_orchestrator = self.state.read(cx).chats.iter().any(|chat| {
-                chat.id == chat_id && crate::orchestration::sidebar::is_orchestrator(chat)
-            });
             let rename_id = chat_id.clone();
             let pin_id = chat_id.clone();
             let archive_id = chat_id.clone();
@@ -11351,12 +11313,8 @@ impl Shell {
                             )
                             .child(SharedString::from("Archive"));
                     let copy = self.render_chat_copy_trigger(&chat_id, copy_open, &theme, cx);
-                    let menu = if is_orchestrator {
-                        menu
-                    } else {
-                        menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_PIN, pin, cx))
-                    };
-                    menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_ARCHIVE, archive, cx))
+                    menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_PIN, pin, cx))
+                        .child(self.chat_menu_hover_row(CHAT_MENU_ROW_ARCHIVE, archive, cx))
                         .child(self.chat_menu_hover_row(CHAT_MENU_ROW_COPY, copy, cx))
                 };
                 let delete = popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
@@ -11428,7 +11386,6 @@ impl Shell {
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         overlays.extend(self.render_section_overlays(viewport, window, cx));
-        overlays.extend(self.render_new_orchestrator_overlay(viewport, window, cx));
         if let Some(overlay) = self.render_command_palette(viewport, window, cx) {
             overlays.push(overlay);
         }

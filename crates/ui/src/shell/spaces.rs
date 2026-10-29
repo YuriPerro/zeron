@@ -79,16 +79,9 @@ pub(super) fn retain_known_pins(
     pinned_ids.len() != before
 }
 
-/// Convert viewport coordinates to the first pinned row, below its disclosure
-/// and whatever section (`above`) the list stacks over it.
-fn pinned_session_pointer_y(
-    pointer_y: f32,
-    viewport_top: f32,
-    scroll_top: f32,
-    above: f32,
-) -> f32 {
+/// Convert viewport coordinates to the first pinned row, below its disclosure.
+fn pinned_session_pointer_y(pointer_y: f32, viewport_top: f32, scroll_top: f32) -> f32 {
     pointer_y - viewport_top + scroll_top
-        - above
         - super::SIDEBAR_LIST_PAD_TOP
         - SIDEBAR_DISCLOSURE_HEADER_HEIGHT
         - SIDEBAR_DISCLOSURE_BODY_INSET
@@ -2299,47 +2292,19 @@ mod pinned_session_tests {
         let viewport_top = 100.0;
         let row_top = 136.0;
         assert_eq!(
-            super::pinned_session_pointer_y(row_top, viewport_top, 0.0, 0.0),
+            super::pinned_session_pointer_y(row_top, viewport_top, 0.0),
             0.0
         );
         assert_eq!(
-            pinned_session_drop_index(
-                super::pinned_session_pointer_y(125.0, viewport_top, 0.0, 0.0),
-                3
-            ),
+            pinned_session_drop_index(super::pinned_session_pointer_y(125.0, viewport_top, 0.0), 3),
             None,
         );
         assert_eq!(
             pinned_session_drop_index(
-                super::pinned_session_pointer_y(row_top, viewport_top, 63.0, 0.0),
+                super::pinned_session_pointer_y(row_top, viewport_top, 63.0),
                 3
             ),
             Some(1),
-        );
-    }
-
-    #[test]
-    fn pinned_drag_skips_the_section_stacked_above_it() {
-        let viewport_top = 100.0;
-        let above = 40.0;
-        let row_top = 136.0 + above;
-        assert_eq!(
-            super::pinned_session_pointer_y(row_top, viewport_top, 0.0, above),
-            0.0
-        );
-        assert_eq!(
-            pinned_session_drop_index(
-                super::pinned_session_pointer_y(row_top + 63.0, viewport_top, 0.0, above),
-                3
-            ),
-            Some(1),
-        );
-        assert_eq!(
-            pinned_session_drop_index(
-                super::pinned_session_pointer_y(row_top - 1.0, viewport_top, 0.0, above),
-                3
-            ),
-            None,
         );
     }
 
@@ -2446,11 +2411,11 @@ pub(super) fn pinned_drag_snapshot_is_valid(
 }
 
 pub(super) struct ActiveChatRow {
-    pub(super) status: ChatIndicator,
+    status: ChatIndicator,
     pub(super) chat: zeron_proto::Chat,
-    pub(super) folder: String,
-    pub(super) branch: Option<String>,
-    pub(super) change_request: Option<zeron_proto::ChangeRequestSummary>,
+    folder: String,
+    branch: Option<String>,
+    change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
 }
 
@@ -2595,7 +2560,7 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 20] = [
 // list items stay tightly related at 2px, while section boundaries use 12px
 // (well over 2x the intra-list gap). Disclosure content gets a small 4px
 // handoff from its header without leaving dead space while collapsed.
-pub(super) const SIDEBAR_SECTION_GAP: f32 = 12.0;
+const SIDEBAR_SECTION_GAP: f32 = 12.0;
 pub(super) const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 pub(super) const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
@@ -4177,12 +4142,7 @@ impl Shell {
             return;
         }
         let scroll_top = -f32::from(self.sidebar_scroll.offset().y);
-        let rel_y = pinned_session_pointer_y(
-            pointer_y,
-            viewport_top,
-            scroll_top,
-            self.orchestrators_height.get(),
-        );
+        let rel_y = pinned_session_pointer_y(pointer_y, viewport_top, scroll_top);
         let inside_pinned_section =
             row_drop_index(rel_y, &self.sidebar_pinned_heights, false).is_some();
         let Some(over) = row_drop_index(rel_y, &self.sidebar_pinned_heights, true) else {
@@ -4272,12 +4232,7 @@ impl Shell {
             return false;
         };
 
-        let rel_y = pinned_session_pointer_y(
-            pointer_y,
-            viewport_top,
-            next_scroll,
-            self.orchestrators_height.get(),
-        );
+        let rel_y = pinned_session_pointer_y(pointer_y, viewport_top, next_scroll);
         let Some(over) = row_drop_index(rel_y, &self.sidebar_pinned_heights, false) else {
             if let Some(drag) = self.pinned_session_drag.as_mut() {
                 drag.autoscroll_active = false;
@@ -5622,9 +5577,6 @@ impl Shell {
 
     /// Hover targets include the paged Archived shelf, unlike jump shortcuts.
     pub(super) fn sidebar_hover_card_row_visible(&self, chat_id: &str, cx: &Context<Self>) -> bool {
-        if self.orchestrator_row_visible(chat_id, cx) {
-            return true;
-        }
         if self
             .sidebar_visible_order(cx)
             .iter()
@@ -5687,13 +5639,6 @@ impl Shell {
     /// clear), or a synced section could not be expanded. Either way the
     /// sidebar notice says why.
     pub(super) fn reveal_sidebar_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
-        if self.reveal_orchestrator_row(chat_id, cx) {
-            if self.settings.sidebar_collapsed {
-                self.toggle_sidebar(cx);
-            }
-            cx.notify();
-            return true;
-        }
         let (active, archived) = {
             let state = self.state.read(cx);
             let active = state
@@ -5772,7 +5717,7 @@ impl Shell {
     /// Mark a disclosure opened for a reveal: its motion starts on the next
     /// render, where the body height is known. Like a header click, it
     /// replaces the resort glide for this movement.
-    pub(super) fn queue_sidebar_reveal(&mut self, key: &str) {
+    fn queue_sidebar_reveal(&mut self, key: &str) {
         self.sidebar_reveal_motions.insert(key.to_owned());
         self.sidebar_prev_order.clear();
         self.sidebar_resort.clear();
@@ -5788,7 +5733,7 @@ impl Shell {
     }
 
     /// Shared metadata and visibility settings for active and archived sessions.
-    pub(super) fn sidebar_chat_data(
+    fn sidebar_chat_data(
         &self,
         status: ChatIndicator,
         chat: zeron_proto::Chat,
