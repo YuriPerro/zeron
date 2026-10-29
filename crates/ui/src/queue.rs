@@ -1072,7 +1072,7 @@ impl Composer {
 
     /// A permanently-visible trailing glyph button. The queue reference keeps
     /// edit and remove present instead of revealing them only on hover.
-    fn queue_action(
+    pub(crate) fn queue_action(
         &self,
         key: &SharedString,
         slot: &str,

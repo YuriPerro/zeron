@@ -1,21 +1,56 @@
 //! Bash mode in the composer: a `!` typed into an empty draft turns Enter into
-//! "run this on the chat's host", and each run is staged per chat until the
-//! next message carries it. Rendering the staged runs lands with the tray.
+//! "run this on the chat's host", and each run is staged per chat in a tray
+//! above the composer until the next message carries it.
 
-use gpui::{App, Context};
+use std::collections::HashSet;
+
+use gpui::{
+    AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
+};
 use zeron_rpc::methods;
 
 use crate::composer::Composer;
+use crate::icons;
 use crate::shell_blocks::{ShellRun, ShellRunState};
+use crate::theme::Theme;
 
 pub(crate) const BASH_PLACEHOLDER: &str = "Run a command";
 
+const ROW_HEIGHT: f32 = 32.0;
+const ROW_PAD_X: f32 = 8.0;
+/// Rows sit in the queue tray's surface, so they share its concentric radius.
+const ROW_RADIUS: f32 = crate::queue::ROW_RADIUS;
+const TEXT_SIZE: f32 = 12.5;
+const OUTPUT_SIZE: f32 = 11.5;
+const OUTPUT_LINE: f32 = 16.0;
+const SPINNER_SIZE: f32 = 12.0;
+/// An open row previews the tail of its output; the message carries all of it.
+const OUTPUT_PREVIEW_LINES: usize = 20;
+
 /// One chat's bash mode and staged runs, keyed in `Composer::shell_trays` by
-/// [`Composer::shell_tray_key`].
+/// [`Composer::shell_tray_key`]. `open` holds the ids of rows showing output.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ShellTrayState {
     pub bash_mode: bool,
     pub runs: Vec<ShellRun>,
+    pub open: HashSet<String>,
+}
+
+impl ShellTrayState {
+    fn idle(&self) -> bool {
+        !self.bash_mode && self.runs.is_empty()
+    }
+}
+
+fn ready(run: &ShellRun) -> bool {
+    run.state != ShellRunState::Running
+}
+
+/// The last `OUTPUT_PREVIEW_LINES` lines of `output`.
+fn output_tail(output: &str) -> Vec<&str> {
+    let lines: Vec<&str> = output.trim_end_matches('\n').lines().collect();
+    lines[lines.len().saturating_sub(OUTPUT_PREVIEW_LINES)..].to_vec()
 }
 
 #[derive(serde::Deserialize)]
@@ -163,7 +198,7 @@ impl Composer {
                 timed_out: reply.timed_out,
             },
             Err(err) => {
-                crate::toast::error(cx, format!("Couldn't run the command: {err}"));
+                crate::toast::error(cx, format!("Couldn’t run the command: {err}"));
                 ShellRunState::Failed(err)
             }
         };
@@ -179,7 +214,8 @@ impl Composer {
             return;
         };
         let run = tray.runs.remove(index);
-        if !tray.bash_mode && tray.runs.is_empty() {
+        tray.open.remove(run_id);
+        if tray.idle() {
             self.shell_trays.remove(chat_id);
         }
         cx.notify();
@@ -204,13 +240,210 @@ impl Composer {
         })
         .detach();
     }
+
+    /// How many staged runs the next message would carry.
+    pub(crate) fn shell_outputs_ready(&self, cx: &App) -> usize {
+        self.shell_trays
+            .get(&self.shell_tray_key(cx))
+            .map_or(0, |tray| tray.runs.iter().filter(|run| ready(run)).count())
+    }
+
+    /// Unstage the finished runs under `key` for a send. Running ones stay.
+    pub(crate) fn take_shell_outputs(&mut self, key: &str) -> Vec<ShellRun> {
+        let Some(tray) = self.shell_trays.get_mut(key) else {
+            return Vec::new();
+        };
+        let (taken, kept) = std::mem::take(&mut tray.runs).into_iter().partition(ready);
+        tray.runs = kept;
+        let ShellTrayState { runs, open, .. } = tray;
+        open.retain(|id| runs.iter().any(|run| &run.id == id));
+        if tray.idle() {
+            self.shell_trays.remove(key);
+        }
+        taken
+    }
+
+    /// Hand a failed send's runs back to the tray they left, ahead of any
+    /// staged since.
+    pub(crate) fn restore_shell_outputs(&mut self, key: &str, mut runs: Vec<ShellRun>) {
+        if runs.is_empty() {
+            return;
+        }
+        let tray = self.shell_trays.entry(key.to_owned()).or_default();
+        runs.append(&mut tray.runs);
+        tray.runs = runs;
+    }
+
+    /// The selected chat's staged runs, or `None` when it has none. It shares
+    /// the queue's glass surface and sits between the queue and the composer.
+    pub(crate) fn render_shell_tray(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let key = self.shell_tray_key(cx);
+        let tray = self.shell_trays.get(&key)?;
+        if tray.runs.is_empty() {
+            return None;
+        }
+        let (runs, open) = (tray.runs.clone(), tray.open.clone());
+        let theme = Theme::of(cx).clone();
+        let rows: Vec<AnyElement> = runs
+            .iter()
+            .map(|run| self.shell_row(&key, run, open.contains(&run.id), &theme, cx))
+            .collect();
+        let list = crate::edge_fade::edge_faded(
+            Theme::TRANSCRIPT_FADE_BAND,
+            true,
+            true,
+            div()
+                .id("shell-tray-rows")
+                .max_h(window.viewport_size().height * 0.3)
+                .overflow_y_scroll()
+                .track_scroll(&self.shell_tray_scroll)
+                .flex()
+                .flex_col()
+                .children(rows),
+        )
+        .fade_overflow_y(&self.shell_tray_scroll);
+        let surface = crate::queue::queue_panel_surface(&theme, cx.has_active_drag())
+            .debug_selector(|| "shell-tray".into())
+            .child(list);
+        Some(
+            crate::frost::frosted(crate::queue::PANEL_RADIUS, crate::frost::MENU_BLUR, surface)
+                .into_any_element(),
+        )
+    }
+
+    /// `$ command`, then a spinner or how it ended, then ✕. Clicking the row
+    /// toggles the tail of its output.
+    fn shell_row(
+        &self,
+        key: &str,
+        run: &ShellRun,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = SharedString::from(format!("shell-run-{}", run.id));
+        let status: Option<AnyElement> = match &run.state {
+            ShellRunState::Running => Some(
+                crate::loaders::ring_spinner(
+                    format!("{id}-spinner"),
+                    SPINNER_SIZE,
+                    theme.text_muted,
+                )
+                .into_any_element(),
+            ),
+            ShellRunState::Done {
+                timed_out: true, ..
+            } => Some(status_label("timed out", theme.danger, theme)),
+            ShellRunState::Done {
+                exit_code: Some(code),
+                ..
+            } => Some(status_label(
+                format!("exit {code}"),
+                if *code == 0 {
+                    theme.text_faint
+                } else {
+                    theme.danger
+                },
+                theme,
+            )),
+            ShellRunState::Done { .. } | ShellRunState::Failed(_) => None,
+        };
+        let (chat_id, run_id) = (run.chat_id.clone(), run.id.clone());
+        let remove = self.queue_action(
+            &id,
+            "remove",
+            "Remove",
+            icons::QUEUE_CLOSE,
+            true,
+            theme,
+            cx.listener(move |this, _, _, cx| this.cancel_shell_run(&chat_id, &run_id, cx)),
+        );
+        let (toggle_key, toggle_id) = (key.to_owned(), run.id.clone());
+        let accent = theme.accent;
+        let header = div()
+            .id(id.clone())
+            .role(gpui::Role::Button)
+            .aria_label(if open { "Hide output" } else { "Show output" })
+            .h(px(ROW_HEIGHT))
+            .flex_none()
+            .px(px(ROW_PAD_X))
+            .pr(px(ROW_PAD_X - 4.0))
+            .rounded(px(ROW_RADIUS))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(crate::theme::ink(0.04)))
+            .tab_index(0)
+            .focus_visible(move |s| s.bg(accent.opacity(0.14)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(tray) = this.shell_trays.get_mut(&toggle_key)
+                    && !tray.open.remove(&toggle_id)
+                {
+                    tray.open.insert(toggle_id.clone());
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(TEXT_SIZE))
+                    .text_color(theme.text.opacity(0.9))
+                    .child(format!("$ {}", run.command)),
+            )
+            .children(status)
+            .child(remove);
+        let output = match &run.state {
+            ShellRunState::Running => None,
+            ShellRunState::Done { output, .. } => Some((output.as_str(), theme.text_muted)),
+            ShellRunState::Failed(error) => Some((error.as_str(), theme.danger)),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(header)
+            .when_some(output.filter(|_| open), |el, (output, color)| {
+                el.child(
+                    div()
+                        .px(px(ROW_PAD_X))
+                        .pb(px(6.0))
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(OUTPUT_SIZE))
+                        .line_height(px(OUTPUT_LINE))
+                        .text_color(color)
+                        .children(
+                            output_tail(output)
+                                .into_iter()
+                                .map(|line| div().truncate().child(line.to_owned())),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+fn status_label(text: impl Into<SharedString>, color: gpui::Hsla, theme: &Theme) -> AnyElement {
+    div()
+        .flex_none()
+        .font_family(theme.font_mono.clone())
+        .text_size(px(11.0))
+        .text_color(color)
+        .child(text.into())
+        .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
-    use gpui::{AppContext as _, TestAppContext, WindowHandle};
+    use gpui::{TestAppContext, WindowHandle};
     use std::sync::{Arc, Mutex};
     use zeron_rpc::{RpcError, RpcReply};
 
@@ -221,12 +454,17 @@ mod tests {
         Replies,
         Fails,
         Hangs,
+        /// Replies once the rig opens the gate.
+        Gated,
+        /// Runs reply, sends fail.
+        SendFails,
     }
 
     struct Rig {
         _dir: tempfile::TempDir,
         rpc: Arc<ScriptedRpc>,
         calls: Calls,
+        gate: Arc<tokio::sync::Notify>,
         handle: WindowHandle<Composer>,
     }
 
@@ -246,17 +484,28 @@ mod tests {
             crate::composer::init(cx, Default::default());
         });
         let calls: Calls = Default::default();
+        let gate = Arc::new(tokio::sync::Notify::new());
         let rpc = ScriptedRpc::new({
             let calls = calls.clone();
+            let gate = gate.clone();
             move |method, params| {
                 calls.lock().unwrap().push((method.clone(), params));
+                let gate = gate.clone();
                 async move {
+                    let reply = serde_json::json!({
+                        "exitCode": 0, "output": "a\n",
+                        "truncated": false, "timedOut": false,
+                    });
                     match (method.as_str(), host) {
-                        (methods::RUN_SHELL_COMMAND, Host::Replies) => {
-                            RpcReply::value(&serde_json::json!({
-                                "exitCode": 0, "output": "a\n",
-                                "truncated": false, "timedOut": false,
-                            }))
+                        (methods::RUN_SHELL_COMMAND, Host::Replies | Host::SendFails) => {
+                            RpcReply::value(&reply)
+                        }
+                        (methods::QUEUE_COMMAND, Host::SendFails) => {
+                            Err(RpcError::Failed("disk full".into()))
+                        }
+                        (methods::RUN_SHELL_COMMAND, Host::Gated) => {
+                            gate.notified().await;
+                            RpcReply::value(&reply)
                         }
                         (methods::RUN_SHELL_COMMAND, Host::Fails) => {
                             Err(RpcError::Failed("host offline".into()))
@@ -264,7 +513,7 @@ mod tests {
                         (methods::RUN_SHELL_COMMAND, Host::Hangs) => {
                             futures::future::pending().await
                         }
-                        (methods::CANCEL_SHELL_COMMAND, _) => {
+                        (methods::CANCEL_SHELL_COMMAND | methods::QUEUE_COMMAND, _) => {
                             RpcReply::value(&serde_json::json!({}))
                         }
                         _ => Err(RpcError::UnknownMethod(method)),
@@ -274,13 +523,16 @@ mod tests {
         });
         let state = cx.update(|cx| fixture::state(cx, Some(rpc.client())));
         state.update(cx, |state, _| {
-            state.chats = vec![
-                serde_json::from_value(serde_json::json!({
-                    "id": "chat-a", "deviceId": "box",
-                    "archived": false, "createdAt": chrono::Utc::now(),
-                }))
-                .unwrap(),
-            ];
+            state.chats = ["chat-a", "chat-b"]
+                .into_iter()
+                .map(|id| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": id, "deviceId": "box",
+                        "archived": false, "createdAt": chrono::Utc::now(),
+                    }))
+                    .unwrap()
+                })
+                .collect();
             state.selected_chat = Some("chat-a".into());
         });
         let handle = cx.add_window(|_, cx| Composer::new(state, cx));
@@ -290,6 +542,7 @@ mod tests {
             _dir: dir,
             rpc,
             calls,
+            gate,
             handle,
         }
     }
@@ -318,15 +571,60 @@ mod tests {
         }
 
         fn tray(&self, cx: &mut TestAppContext) -> ShellTrayState {
+            self.tray_of("chat-a", cx)
+        }
+
+        fn tray_of(&self, key: &str, cx: &mut TestAppContext) -> ShellTrayState {
             self.handle
                 .read_with(cx, |composer, _| {
-                    composer
-                        .shell_trays
-                        .get("chat-a")
-                        .cloned()
-                        .unwrap_or_default()
+                    composer.shell_trays.get(key).cloned().unwrap_or_default()
                 })
                 .unwrap()
+        }
+
+        fn stage(&self, runs: Vec<ShellRun>, cx: &mut TestAppContext) {
+            self.handle
+                .update(cx, |composer, _, cx| {
+                    composer
+                        .shell_trays
+                        .entry("chat-a".into())
+                        .or_default()
+                        .runs = runs;
+                    cx.notify();
+                })
+                .unwrap();
+        }
+
+        fn select(&self, chat_id: &str, cx: &mut TestAppContext) {
+            let chat_id = chat_id.to_owned();
+            self.handle
+                .update(cx, |composer, _, cx| {
+                    composer.state.update(cx, |state, cx| {
+                        state.selected_chat = Some(chat_id);
+                        cx.notify();
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+
+        /// The prompt of the one message sent so far.
+        fn sent_prompt(
+            &self,
+            cx: &mut TestAppContext,
+            runtime: &tokio::runtime::Runtime,
+        ) -> String {
+            self.settle(cx, runtime, |rig, _| {
+                !rig.calls(methods::QUEUE_COMMAND).is_empty()
+            });
+            let sent = self.calls(methods::QUEUE_COMMAND);
+            let [params] = sent.as_slice() else {
+                panic!("expected one send, got {sent:?}");
+            };
+            params["command"]["request"]["prompt"]
+                .as_str()
+                .unwrap()
+                .to_owned()
         }
 
         fn calls(&self, method: &str) -> Vec<serde_json::Value> {
@@ -486,7 +784,7 @@ mod tests {
         assert!(
             toasts
                 .iter()
-                .any(|toast| toast.as_ref() == format!("Couldn't run the command: {err}")),
+                .any(|toast| toast.as_ref() == format!("Couldn’t run the command: {err}")),
             "{toasts:?}"
         );
     }
@@ -529,5 +827,117 @@ mod tests {
         rig.type_text("!", cx);
         assert!(!rig.tray(cx).bash_mode);
         assert_eq!(rig.text(cx), "!");
+    }
+
+    fn run(id: &str, state: ShellRunState) -> ShellRun {
+        ShellRun {
+            id: id.into(),
+            chat_id: "chat-a".into(),
+            command: format!("cmd-{id}"),
+            state,
+        }
+    }
+
+    fn done(id: &str) -> ShellRun {
+        run(
+            id,
+            ShellRunState::Done {
+                exit_code: Some(0),
+                output: "a\n".into(),
+                truncated: false,
+                timed_out: false,
+            },
+        )
+    }
+
+    #[gpui::test]
+    fn send_prefixes_done_runs_and_clears_them(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        let running = run("running", ShellRunState::Running);
+        rig.stage(vec![done("done"), running.clone()], cx);
+        rig.type_text("why?", cx);
+        rig.press("enter", cx);
+        assert_eq!(
+            rig.sent_prompt(cx, &runtime),
+            crate::shell_blocks::format_prompt(&[done("done")], "why?")
+        );
+        assert_eq!(rig.tray(cx).runs, vec![running]);
+    }
+
+    #[gpui::test]
+    fn send_with_only_runs_is_allowed(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.stage(vec![done("done")], cx);
+        rig.press("enter", cx);
+        assert_eq!(
+            rig.sent_prompt(cx, &runtime),
+            crate::shell_blocks::format_prompt(&[done("done")], "")
+        );
+        assert!(rig.tray(cx).runs.is_empty());
+    }
+
+    #[gpui::test]
+    fn result_lands_in_the_starting_chat(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Gated);
+        rig.run_ls(cx);
+        rig.settle(cx, &runtime, |rig, _| {
+            !rig.calls(methods::RUN_SHELL_COMMAND).is_empty()
+        });
+        rig.select("chat-b", cx);
+        rig.gate.notify_one();
+        rig.settle(cx, &runtime, |rig, cx| {
+            rig.tray(cx)
+                .runs
+                .first()
+                .is_some_and(|run| run.state != ShellRunState::Running)
+        });
+        assert!(matches!(
+            rig.tray(cx).runs[0].state,
+            ShellRunState::Done { .. }
+        ));
+        assert!(rig.tray_of("chat-b", cx).runs.is_empty());
+    }
+
+    #[gpui::test]
+    fn tray_hidden_without_runs(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        let shown = |cx: &mut TestAppContext| {
+            rig.handle
+                .update(cx, |composer, window, cx| {
+                    composer.render_shell_tray(window, cx).is_some()
+                })
+                .unwrap()
+        };
+        assert!(!shown(cx));
+        rig.type_text("!", cx);
+        assert!(!shown(cx));
+        rig.stage(vec![done("done")], cx);
+        assert!(shown(cx));
+    }
+
+    #[gpui::test]
+    fn failed_send_hands_the_runs_back(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::SendFails);
+        let running = run("running", ShellRunState::Running);
+        rig.stage(vec![done("done"), running.clone()], cx);
+        rig.type_text("why?", cx);
+        rig.press("enter", cx);
+        rig.settle(cx, &runtime, |rig, cx| {
+            rig.handle
+                .read_with(cx, |composer, _| composer.failure().is_some())
+                .unwrap()
+        });
+        assert_eq!(rig.tray(cx).runs, vec![done("done"), running]);
+        assert_eq!(rig.text(cx), "why?");
     }
 }

@@ -270,15 +270,16 @@ const TEXT_LINE: f32 = 17.0;
 const GLYPH_SLOT: f32 = 14.0;
 const ACTION_SIZE: f32 = 24.0;
 /// One step narrower than the queue tray, which is itself inset from the
-/// composer; stacked above a queue the todo tray steps in once more.
+/// composer; each tray stacked beneath the todo tray steps it in once more.
 const SIDE_INSET: f32 = 16.0;
 
 impl Composer {
     /// The checklist tray, or `None` when the chat has no todo (or the user
-    /// dismissed a finished one). `below_queue`: a queue tray follows.
+    /// dismissed a finished one). `trays_below`: how many trays (the queue,
+    /// staged shell runs) sit between it and the composer.
     pub(crate) fn render_todo_panel(
         &mut self,
-        below_queue: bool,
+        trays_below: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -353,16 +354,12 @@ impl Composer {
             surface
         };
 
-        let inset = if below_queue {
-            SIDE_INSET * 2.0
-        } else {
-            SIDE_INSET
-        };
+        let inset = SIDE_INSET * (1 + trays_below) as f32;
         Some(
             div()
                 .mx(px(inset))
                 // Cancel the column gap and tuck the tray behind what follows
-                // (the queue tray, or the composer itself).
+                // (another tray, or the composer itself).
                 .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
                 .child(crate::frost::frosted(
                     crate::queue::PANEL_RADIUS,
@@ -1062,7 +1059,7 @@ mod composer_tests {
     fn rendered(handle: &gpui::WindowHandle<Composer>, cx: &mut gpui::TestAppContext) -> bool {
         handle
             .update(cx, |composer, window, cx| {
-                composer.render_todo_panel(false, window, cx).is_some()
+                composer.render_todo_panel(0, window, cx).is_some()
             })
             .unwrap()
     }

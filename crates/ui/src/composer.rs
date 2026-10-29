@@ -6465,6 +6465,7 @@ pub struct Composer {
     /// Bash mode and staged shell runs per chat (in memory, like the drafts),
     /// keyed by [`Composer::shell_tray_key`].
     pub(crate) shell_trays: HashMap<String, crate::shell_tray::ShellTrayState>,
+    pub(crate) shell_tray_scroll: gpui::ScrollHandle,
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
@@ -6767,6 +6768,7 @@ impl Composer {
             todo_panels: HashMap::new(),
             todo_scroll: gpui::ScrollHandle::new(),
             shell_trays: HashMap::new(),
+            shell_tray_scroll: gpui::ScrollHandle::new(),
             queue_shortcut_revealed: false,
             annotation_marks: Vec::new(),
             expanded_mode: false,
@@ -9234,7 +9236,7 @@ impl Composer {
         let has_text = self.input.read(cx).dictation.phase.active()
             || composer_has_content(
                 self.input.read(cx).text(),
-                self.staged().len() + self.staged_appshots().len(),
+                self.staged().len() + self.staged_appshots().len() + self.shell_outputs_ready(cx),
                 self.staged_comments(cx).len(),
             );
         send_button_mode(self.run_live(cx), has_text)
@@ -9293,7 +9295,7 @@ impl Composer {
         }
         let no_content = !composer_has_content(
             &text,
-            self.staged().len() + self.staged_appshots().len(),
+            self.staged().len() + self.staged_appshots().len() + self.shell_outputs_ready(cx),
             self.staged_comments(cx).len(),
         );
         match self.button_mode(cx) {
@@ -9336,7 +9338,7 @@ impl Composer {
         }
         let has_content = composer_has_content(
             self.input.read(cx).text(),
-            self.staged().len() + self.staged_appshots().len(),
+            self.staged().len() + self.staged_appshots().len() + self.shell_outputs_ready(cx),
             self.staged_comments(cx).len(),
         );
         match modified_submit_target(has_content) {
@@ -9360,6 +9362,9 @@ impl Composer {
             cx.notify();
             return;
         };
+        // Staged shell runs live under the canvas key until the chat id below
+        // is minted, so read the key first.
+        let shell_key = self.shell_tray_key(cx);
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
         let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
@@ -9485,6 +9490,9 @@ impl Composer {
             .collect();
         let text = zeron_proto::attachment_mentions::demote_unattached_mentions(&text, &attached);
         let text = crate::comments::with_comments(&text, &comments);
+        // Finished shell runs lead the message; running ones stay staged.
+        let shell_runs = self.take_shell_outputs(&shell_key);
+        let text = crate::shell_blocks::format_prompt(&shell_runs, &text);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
@@ -10235,6 +10243,7 @@ impl Composer {
                         composer.attachments.insert(restore_key.clone(), merged);
                     }
                     composer.restore_failed_appshots(&staged_appshots, &err_chat_id, &restore_key);
+                    composer.restore_shell_outputs(&shell_key, shell_runs);
                 }
                 cx.notify();
             })
@@ -11642,14 +11651,17 @@ impl Render for Composer {
             && !self.pickers.read(cx).is_open()
             && !composer_has_content(
                 self.input.read(cx).text(),
-                self.staged().len() + self.staged_appshots().len(),
+                self.staged().len() + self.staged_appshots().len() + self.shell_outputs_ready(cx),
                 self.staged_comments(cx).len(),
             );
-        // The checklist tray stacks above the queue (or directly above the
-        // composer), one step narrower than what follows it.
+        // Trays stack checklist, queue, staged shell runs, then the
+        // composer; each steps one inset narrower than what follows it.
+        let shell_tray = self.render_shell_tray(window, cx);
+        let queue_inset = QUEUE_SIDE_INSET * if shell_tray.is_some() { 2.0 } else { 1.0 };
         let has_queue = !self.state.read(cx).queue.is_empty();
+        let trays_below = usize::from(has_queue) + usize::from(shell_tray.is_some());
         let container = container.when_some(
-            self.render_todo_panel(has_queue, window, cx),
+            self.render_todo_panel(trays_below, window, cx),
             |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
         );
         let container = container.when_some(
@@ -11658,7 +11670,7 @@ impl Render for Composer {
                 el.child(motion::fade_quick(
                     "composer-queue",
                     div()
-                        .mx(px(QUEUE_SIDE_INSET))
+                        .mx(px(queue_inset))
                         // Cancel the column gap, then tuck the tray one pixel
                         // behind the composer painted after it.
                         .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
@@ -11666,6 +11678,15 @@ impl Render for Composer {
                 ))
             },
         );
+        let container = container.when_some(shell_tray, |el, panel| {
+            el.child(motion::fade_quick(
+                "composer-shell-tray",
+                div()
+                    .mx(px(QUEUE_SIDE_INSET))
+                    .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
+                    .child(panel),
+            ))
+        });
         // Escape backs out of a queue-row edit (the row keeps its old text).
         // Bound here rather than in the input: the input's own Escape belongs
         // to the mention/slash popups, which outrank this while they're open.
