@@ -6468,6 +6468,9 @@ pub struct Composer {
     /// Bash mode and staged shell runs per chat (in memory, like the drafts),
     /// keyed by [`Composer::shell_tray_key`].
     pub(crate) shell_trays: HashMap<String, crate::shell_tray::ShellTrayState>,
+    /// Draft keys (`current_key`) in bash mode. The mode travels with the
+    /// draft, so a canvas project switch never hands it text typed outside it.
+    pub(crate) bash_drafts: HashSet<String>,
     pub(crate) shell_tray_scroll: gpui::ScrollHandle,
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
@@ -6703,6 +6706,7 @@ impl Composer {
             DictationInputEvent::Changed => cx.notify(),
             DictationInputEvent::Submit(generation) => {
                 if this.input.read(cx).dictation.generation == *generation
+                    && !this.bash_mode()
                     && composer_has_content(
                         this.input.read(cx).text(),
                         this.staged().len() + this.staged_appshots().len(),
@@ -6772,6 +6776,7 @@ impl Composer {
             todo_panels: HashMap::new(),
             todo_scroll: gpui::ScrollHandle::new(),
             shell_trays: HashMap::new(),
+            bash_drafts: HashSet::new(),
             shell_tray_scroll: gpui::ScrollHandle::new(),
             queue_shortcut_revealed: false,
             annotation_marks: Vec::new(),
@@ -8102,7 +8107,7 @@ impl Composer {
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
         self.reconcile_attachment_mentions(cx);
-        if self.wizard.is_some() || self.bash_mode(cx) {
+        if self.wizard.is_some() || self.bash_mode() {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
             }
@@ -9264,9 +9269,11 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        // A dictated command lands in the input and waits for its own Enter.
+        let send = !self.bash_mode();
         if self
             .input
-            .update(cx, |input, cx| input.finish_dictation(true, cx))
+            .update(cx, |input, cx| input.finish_dictation(send, cx))
         {
             return;
         }
@@ -9283,7 +9290,7 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().to_string();
-        if self.bash_mode(cx) {
+        if self.bash_mode() {
             self.run_shell_command(text, cx);
             return;
         }
@@ -9294,7 +9301,7 @@ impl Composer {
     /// where Enter does nothing.
     fn on_send_clicked(&mut self, cx: &mut Context<Self>) {
         let input = self.input.read(cx);
-        if self.bash_mode(cx)
+        if self.bash_mode()
             && !input.dictation.phase.active()
             && input.text().trim().is_empty()
             && self.shell_outputs_ready(cx) > 0
@@ -9346,16 +9353,17 @@ impl Composer {
     /// content. With a truly empty composer it instead activates the most
     /// recently queued row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
+        let send = !self.bash_mode();
         if self
             .input
-            .update(cx, |input, cx| input.finish_dictation(true, cx))
+            .update(cx, |input, cx| input.finish_dictation(send, cx))
         {
             return;
         }
         if self.commit_queue_edit(cx) {
             return;
         }
-        if self.bash_mode(cx) {
+        if self.bash_mode() {
             self.on_submit(cx);
             return;
         }
@@ -9513,8 +9521,13 @@ impl Composer {
             .collect();
         let text = zeron_proto::attachment_mentions::demote_unattached_mentions(&text, &attached);
         let text = crate::comments::with_comments(&text, &comments);
-        // Finished shell runs lead the message; running ones stay staged.
-        let shell_runs = self.take_shell_outputs(&shell_key);
+        // Finished shell runs lead the message; running ones stay staged. A
+        // native command must stay first, so it leaves them all staged.
+        let shell_runs = if crate::shell_blocks::leads_with_native_command(&text) {
+            Vec::new()
+        } else {
+            self.take_shell_outputs(&shell_key)
+        };
         let text = crate::shell_blocks::format_prompt(&shell_runs, &text);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -10238,13 +10251,13 @@ impl Composer {
                     // Bash mode entered while the send was in flight would
                     // run the restored prose on the next Enter.
                     if !restore_text.trim().is_empty() {
-                        composer.leave_bash_mode_for(&shell_key, cx);
+                        composer.leave_bash_mode_for(&restore_key, cx);
                     }
-                    if is_new && composer.current_key != restore_key {
-                        // A re-key swap to the canvas is pending (the
-                        // select_chat(None) above); it loads this draft into
-                        // the input on flush — setting the input directly
-                        // here would be clobbered by that same swap.
+                    if composer.current_key != restore_key {
+                        // Another draft is showing: the user moved to another
+                        // chat, or a re-key swap to the canvas is pending (the
+                        // select_chat(None) above). The text waits in its own
+                        // draft, which that swap or the user's return loads.
                         composer.drafts.insert(restore_key.clone(), restore_text.clone());
                     } else {
                         // Already keyed to the restore target (either an

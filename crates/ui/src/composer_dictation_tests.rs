@@ -1198,3 +1198,44 @@ fn dictation_shortcut_falls_through_while_dictation_is_off(cx: &mut TestAppConte
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn dictation_in_bash_mode_never_runs_the_transcript(cx: &mut TestAppContext) {
+    let (_dir, handle) = super::tests::composer_focus_window(cx);
+    let fake = handle
+        .update(cx, |composer, _, cx| {
+            composer.enter_bash_mode(cx);
+            assert!(composer.bash_mode());
+            let fake = composer.input.update(cx, |input, cx| {
+                let fake = start(input, cx);
+                deliver(
+                    input,
+                    &fake,
+                    [Event::Listening, Event::Partial("ls".into())],
+                    cx,
+                );
+                fake
+            });
+            composer.on_submit(cx);
+            composer.input.update(cx, |input, cx| {
+                deliver(input, &fake, [Event::Final("ls -la".into())], cx);
+            });
+            fake
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(fake.borrow().finishes, 1);
+    handle
+        .read_with(cx, |composer, cx| {
+            assert_eq!(composer.input.read(cx).text(), "ls -la");
+            assert_eq!(composer.input.read(cx).dictation.phase, Phase::Idle);
+            assert!(
+                composer
+                    .shell_trays
+                    .values()
+                    .all(|tray| tray.runs.is_empty()),
+                "the transcript waits for a second Enter"
+            );
+        })
+        .unwrap();
+}

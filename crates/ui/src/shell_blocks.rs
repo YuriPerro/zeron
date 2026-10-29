@@ -129,6 +129,15 @@ pub(crate) fn format_prompt(runs: &[ShellRun], text: &str) -> String {
     with_blocks(&groups.join("\n"), text)
 }
 
+/// Whether `text` opens with a native command such as `/compact`, which the
+/// host recognizes only at the very start of the prompt (the engine's own
+/// `leading_command` test).
+pub(crate) fn leads_with_native_command(text: &str) -> bool {
+    use zeron_proto::invocation::{invocation_prompt, leading_command, valid_skill_command_name};
+    leading_command(&invocation_prompt(text))
+        .is_some_and(|(name, _)| valid_skill_command_name(name))
+}
+
 /// Tag groups ahead of `text`, a blank line between them.
 pub(crate) fn with_blocks(blocks: &str, text: &str) -> String {
     if text.is_empty() {
@@ -378,6 +387,16 @@ mod tests {
             format_prompt(&[done("ls", "a\n", Some(0))], "why now?")
         );
         assert_eq!(split_raw_blocks("hello"), ("", "hello"));
+    }
+
+    #[test]
+    fn native_commands_lead_only_at_the_start() {
+        assert!(leads_with_native_command("/compact"));
+        assert!(leads_with_native_command("\n  /review focus on tests"));
+        assert!(!leads_with_native_command("why /compact"));
+        assert!(!leads_with_native_command("/usr/bin is missing"));
+        assert!(!leads_with_native_command("    /compact"));
+        assert!(!leads_with_native_command("plain"));
     }
 
     #[test]

@@ -1685,8 +1685,9 @@ impl Composer {
         )
     }
 
-    /// Save the composer into the existing row, including its attachments.
-    /// An entirely empty composer removes the row.
+    /// Save the composer into the existing row, including its attachments and
+    /// shell runs. An empty composer removes a row with no shell runs; a row
+    /// with them commits them alone.
     pub(crate) fn commit_queue_edit(&mut self, cx: &mut Context<Self>) -> bool {
         if self.editing_queued.is_none() {
             return false;

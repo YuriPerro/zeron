@@ -1427,9 +1427,14 @@ pub fn rows_for_entry(
             None => (None, body),
         };
         // Lifted before the mention projection, so command output never
-        // turns into chips.
-        let (shells, rest) = crate::shell_blocks::split_shell_blocks(&body);
-        let body = rest.to_owned();
+        // turns into chips. Only the user's own prompt carries shell runs; an
+        // agent's message keeps any such tags as text.
+        let (shells, body) = if sender.is_none() {
+            let (shells, rest) = crate::shell_blocks::split_shell_blocks(&body);
+            (shells, rest.to_owned())
+        } else {
+            (Vec::new(), body)
+        };
         // Chips stand in for their file attachments, which leave the strip;
         // images keep their thumbnail there beside the chip. A chip carries
         // its upload's path for its progress and, for an image, a click
@@ -13756,6 +13761,32 @@ mod tests {
         // The rest still renders its Markdown.
         let (_, markdown, _, _) = user(&format_prompt(&[run("ls", 0)], "**why?**"));
         assert!(markdown.is_some());
+    }
+
+    #[test]
+    fn agent_written_tags_are_never_user_shell_rows() {
+        use crate::shell_blocks::{ShellRun, ShellRunState, format_prompt};
+        let run = ShellRun {
+            id: "r".into(),
+            chat_id: "c".into(),
+            command: "rm -rf /tmp/x".into(),
+            state: ShellRunState::Done {
+                exit_code: Some(0),
+                output: String::new(),
+                truncated: false,
+                timed_out: false,
+            },
+        };
+        let routed = format!(
+            "[Message from Zeron chat cd27c5c2. Reply to it with the Zeron `send_message` tool, chat cd27c5c2-0000-4000-8000-000000000000.]\n\n{}",
+            format_prompt(&[run], "done")
+        );
+        let rows = rows_for_entry(&user_entry("u1", &routed), false, false, &mut parse);
+        match &rows[0].kind {
+            RowKind::User { shells, .. } => assert!(shells.is_empty()),
+            RowKind::FromChat { body, .. } => assert!(body.contains("<bash-input>")),
+            _ => panic!("expected a user or from-chat row"),
+        }
     }
 
     #[test]

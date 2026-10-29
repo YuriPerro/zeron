@@ -1,6 +1,10 @@
 //! Bash mode in the composer: a `!` typed into an empty draft turns Enter into
 //! "run this on the chat's host", and each run is staged per chat in a tray
 //! above the composer until the next message carries it.
+//!
+//! The mode belongs to the draft and is keyed like it (`current_key`). The
+//! runs belong to the host session and are keyed by [`Composer::shell_tray_key`],
+//! which tells a canvas's projects apart.
 
 use std::collections::HashSet;
 
@@ -29,19 +33,12 @@ const SPINNER_SIZE: f32 = 12.0;
 /// An open row previews the tail of its output; the message carries all of it.
 const OUTPUT_PREVIEW_LINES: usize = 20;
 
-/// One chat's bash mode and staged runs, keyed in `Composer::shell_trays` by
+/// One session's staged runs, keyed in `Composer::shell_trays` by
 /// [`Composer::shell_tray_key`]. `open` holds the ids of rows showing output.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ShellTrayState {
-    pub bash_mode: bool,
     pub runs: Vec<ShellRun>,
     pub open: HashSet<String>,
-}
-
-impl ShellTrayState {
-    fn idle(&self) -> bool {
-        !self.bash_mode && self.runs.is_empty()
-    }
 }
 
 fn ready(run: &ShellRun) -> bool {
@@ -73,37 +70,28 @@ impl Composer {
             .or_else(|| state.local_device_id.clone())
     }
 
-    pub(crate) fn bash_mode(&self, cx: &App) -> bool {
-        self.bash_allowed()
-            && self
-                .shell_trays
-                .get(&self.shell_tray_key(cx))
-                .is_some_and(|tray| tray.bash_mode)
+    pub(crate) fn bash_mode(&self) -> bool {
+        self.bash_allowed() && self.bash_drafts.contains(&self.current_key)
     }
 
     pub(crate) fn enter_bash_mode(&mut self, cx: &mut Context<Self>) {
         if !self.bash_allowed() {
             return;
         }
-        let key = self.shell_tray_key(cx);
-        self.shell_trays.entry(key).or_default().bash_mode = true;
+        self.bash_drafts.insert(self.current_key.clone());
         self.sync_bash_input(cx);
         cx.notify();
     }
 
     pub(crate) fn leave_bash_mode(&mut self, cx: &mut Context<Self>) {
-        let key = self.shell_tray_key(cx);
+        let key = self.current_key.clone();
         self.leave_bash_mode_for(&key, cx);
     }
 
-    /// Leave bash mode for `key`, which need not be the selected chat.
+    /// Leave bash mode for the draft under `key`, which need not be the one
+    /// showing.
     pub(crate) fn leave_bash_mode_for(&mut self, key: &str, cx: &mut Context<Self>) {
-        if let Some(tray) = self.shell_trays.get_mut(key) {
-            tray.bash_mode = false;
-            if tray.idle() {
-                self.shell_trays.remove(key);
-            }
-        }
+        self.bash_drafts.remove(key);
         self.sync_bash_input(cx);
         cx.notify();
     }
@@ -114,7 +102,7 @@ impl Composer {
     /// is left alone.
     pub(crate) fn sync_bash_input(&mut self, cx: &mut Context<Self>) {
         let allowed = self.bash_allowed();
-        let active = self.bash_mode(cx);
+        let active = self.bash_mode();
         self.input.update(cx, |input, cx| {
             input.bash_trigger = allowed && !active;
             if input.bash_mode == active {
@@ -154,6 +142,15 @@ impl Composer {
             self.finish_shell_run(&chat_id, &run_id, Err("Engine not connected".into()), cx);
             return;
         };
+        // A chat whose row hasn't arrived has no known host. Falling back to
+        // this device would run the command on the wrong machine.
+        let state = self.state.read(cx);
+        if !chat_id.starts_with(crate::state::CANVAS_PANEL_PREFIX)
+            && !state.chats.iter().any(|chat| chat.id == chat_id)
+        {
+            self.finish_shell_run(&chat_id, &run_id, Err("Chat not loaded yet".into()), cx);
+            return;
+        }
         let mut params = serde_json::json!({
             "runId": run_id,
             "chatId": chat_id,
@@ -215,7 +212,7 @@ impl Composer {
         };
         let run = tray.runs.remove(index);
         tray.open.remove(run_id);
-        if tray.idle() {
+        if tray.runs.is_empty() {
             self.shell_trays.remove(chat_id);
         }
         cx.notify();
@@ -257,7 +254,7 @@ impl Composer {
         tray.runs = kept;
         let ShellTrayState { runs, open, .. } = tray;
         open.retain(|id| runs.iter().any(|run| &run.id == id));
-        if tray.idle() {
+        if tray.runs.is_empty() {
             self.shell_trays.remove(key);
         }
         taken
@@ -502,9 +499,12 @@ mod tests {
                         (methods::RUN_SHELL_COMMAND, Host::Hangs) => {
                             futures::future::pending().await
                         }
-                        (methods::CANCEL_SHELL_COMMAND | methods::QUEUE_COMMAND, _) => {
-                            RpcReply::value(&serde_json::json!({}))
-                        }
+                        (
+                            methods::CANCEL_SHELL_COMMAND
+                            | methods::QUEUE_COMMAND
+                            | methods::MUTATE,
+                            _,
+                        ) => RpcReply::value(&serde_json::json!({})),
                         _ => Err(RpcError::UnknownMethod(method)),
                     }
                 }
@@ -602,6 +602,37 @@ mod tests {
             cx.run_until_parked();
         }
 
+        fn bash(&self, cx: &mut TestAppContext) -> bool {
+            self.handle
+                .read_with(cx, |composer, _| composer.bash_mode())
+                .unwrap()
+        }
+
+        /// The new-chat canvas of project `space`, `a` and `b` on `box`.
+        fn canvas(&self, space: &str, cx: &mut TestAppContext) {
+            let space = space.to_owned();
+            self.handle
+                .update(cx, |composer, _, cx| {
+                    composer.state.update(cx, |state, cx| {
+                        state.spaces = ["a", "b"]
+                            .into_iter()
+                            .map(|id| {
+                                serde_json::from_value(serde_json::json!({
+                                    "id": id, "deviceId": "box", "path": format!("/src/{id}"),
+                                    "createdAt": chrono::Utc::now(),
+                                }))
+                                .unwrap()
+                            })
+                            .collect();
+                        state.selected_chat = None;
+                        state.selected_space = Some(space);
+                        cx.notify();
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+
         fn settle_failure(&self, cx: &mut TestAppContext, runtime: &tokio::runtime::Runtime) {
             self.settle(cx, runtime, |rig, cx| {
                 rig.handle
@@ -661,7 +692,7 @@ mod tests {
         let _guard = runtime.enter();
         let rig = window(cx, Host::Replies);
         rig.type_text("!", cx);
-        assert!(rig.tray(cx).bash_mode);
+        assert!(rig.bash(cx));
         assert_eq!(rig.text(cx), "");
         assert_eq!(rig.placeholder(cx), "Run a command");
     }
@@ -672,7 +703,7 @@ mod tests {
         let _guard = runtime.enter();
         let rig = window(cx, Host::Replies);
         rig.type_text("a!", cx);
-        assert!(!rig.tray(cx).bash_mode);
+        assert!(!rig.bash(cx));
         assert_eq!(rig.text(cx), "a!");
     }
 
@@ -683,7 +714,7 @@ mod tests {
         let rig = window(cx, Host::Replies);
         cx.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("!ls".into())));
         cx.dispatch_action(rig.handle.into(), crate::composer::Paste);
-        assert!(!rig.tray(cx).bash_mode);
+        assert!(!rig.bash(cx));
         assert_eq!(rig.text(cx), "!ls");
     }
 
@@ -694,9 +725,9 @@ mod tests {
         let rig = window(cx, Host::Replies);
         for key in ["backspace", "escape"] {
             rig.type_text("!", cx);
-            assert!(rig.tray(cx).bash_mode, "{key}");
+            assert!(rig.bash(cx), "{key}");
             rig.press(key, cx);
-            assert!(!rig.tray(cx).bash_mode, "{key}");
+            assert!(!rig.bash(cx), "{key}");
             assert_eq!(rig.placeholder(cx), "Do anything…", "{key}");
         }
     }
@@ -718,8 +749,8 @@ mod tests {
         assert_eq!(params["command"], "ls");
         assert_eq!(params["targetDeviceId"], "box");
         assert_eq!(rig.text(cx), "");
+        assert!(rig.bash(cx));
         let tray = rig.tray(cx);
-        assert!(tray.bash_mode);
         let [run] = tray.runs.as_slice() else {
             panic!("expected one staged run, got {:?}", tray.runs);
         };
@@ -740,7 +771,7 @@ mod tests {
         cx.run_until_parked();
         assert!(rig.calls(methods::RUN_SHELL_COMMAND).is_empty());
         assert!(rig.tray(cx).runs.is_empty());
-        assert!(rig.tray(cx).bash_mode);
+        assert!(rig.bash(cx));
     }
 
     #[gpui::test]
@@ -827,7 +858,7 @@ mod tests {
             .update(cx, |composer, _, cx| composer.set_side_chat(cx))
             .unwrap();
         rig.type_text("!", cx);
-        assert!(!rig.tray(cx).bash_mode);
+        assert!(!rig.bash(cx));
         assert_eq!(rig.text(cx), "!");
     }
 
@@ -948,10 +979,10 @@ mod tests {
         rig.type_text("why?", cx);
         rig.press("enter", cx);
         rig.type_text("!", cx);
-        assert!(rig.tray(cx).bash_mode);
+        assert!(rig.bash(cx));
         rig.gate.notify_one();
         rig.settle_failure(cx, &runtime);
-        assert!(!rig.tray(cx).bash_mode);
+        assert!(!rig.bash(cx));
         assert_eq!(rig.text(cx), "why?");
         assert_eq!(rig.placeholder(cx), "Do anything…");
     }
@@ -981,7 +1012,7 @@ mod tests {
             crate::shell_blocks::format_prompt(&[done("done")], "")
         );
         assert!(rig.tray(cx).runs.is_empty());
-        assert!(rig.tray(cx).bash_mode);
+        assert!(rig.bash(cx));
     }
 
     #[gpui::test]
@@ -1020,5 +1051,110 @@ mod tests {
             finishes[0]["text"],
             crate::shell_blocks::format_prompt(&[done("q")], "why? now")
         );
+    }
+
+    #[gpui::test]
+    fn canvas_project_switch_keeps_bash_mode_with_its_draft(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.canvas("a", cx);
+        rig.type_text("!", cx);
+        assert!(rig.bash(cx));
+        rig.canvas("b", cx);
+        assert!(rig.bash(cx), "the draft kept its mode");
+        rig.press("escape", cx);
+        rig.type_text("hello", cx);
+        rig.canvas("a", cx);
+        assert!(!rig.bash(cx));
+        assert_eq!(rig.text(cx), "hello");
+        assert_eq!(rig.placeholder(cx), "Do anything…");
+    }
+
+    #[gpui::test]
+    fn failed_send_after_a_chat_switch_restores_into_its_own_chat(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::SendFails);
+        rig.type_text("why?", cx);
+        rig.press("enter", cx);
+        rig.select("chat-b", cx);
+        rig.type_text("!", cx);
+        assert!(rig.bash(cx));
+        rig.gate.notify_one();
+        rig.settle_failure(cx, &runtime);
+        assert!(rig.bash(cx), "chat-b keeps its bash input");
+        assert_eq!(rig.text(cx), "");
+        rig.select("chat-a", cx);
+        assert!(!rig.bash(cx));
+        assert_eq!(rig.text(cx), "why?");
+    }
+
+    #[gpui::test]
+    fn unknown_chat_fails_instead_of_running_locally(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.select("chat-unlisted", cx);
+        rig.run_ls(cx);
+        runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(20)));
+        cx.run_until_parked();
+        assert!(rig.calls(methods::RUN_SHELL_COMMAND).is_empty());
+        let runs = rig.tray_of("chat-unlisted", cx).runs;
+        let [run] = runs.as_slice() else {
+            panic!("expected one staged run, got {runs:?}");
+        };
+        let ShellRunState::Failed(err) = &run.state else {
+            panic!("expected a failed run, got {run:?}");
+        };
+        let toasts = cx.update(|cx| crate::toast::messages(cx));
+        assert!(
+            toasts
+                .iter()
+                .any(|toast| toast.as_ref() == format!("Couldn’t run the command: {err}")),
+            "{toasts:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn native_command_leaves_runs_staged(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.stage(vec![done("done")], cx);
+        rig.type_text("/compact", cx);
+        rig.press("enter", cx);
+        assert_eq!(rig.sent_prompt(cx, &runtime), "/compact");
+        assert_eq!(rig.tray(cx).runs, vec![done("done")]);
+    }
+
+    #[gpui::test]
+    fn canvas_runs_ride_the_first_message(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.canvas("a", cx);
+        rig.type_text("!", cx);
+        rig.type_text("pwd", cx);
+        rig.press("enter", cx);
+        rig.settle(cx, &runtime, |rig, cx| {
+            rig.tray_of("space-canvas:a", cx)
+                .runs
+                .first()
+                .is_some_and(|run| run.state != ShellRunState::Running)
+        });
+        let ran = rig.tray_of("space-canvas:a", cx).runs;
+        assert_eq!(
+            rig.calls(methods::RUN_SHELL_COMMAND)[0]["chatId"],
+            "space-canvas:a"
+        );
+        rig.press("escape", cx);
+        rig.type_text("why?", cx);
+        rig.press("enter", cx);
+        assert_eq!(
+            rig.sent_prompt(cx, &runtime),
+            crate::shell_blocks::format_prompt(&ran, "why?")
+        );
+        assert!(rig.tray_of("space-canvas:a", cx).runs.is_empty());
     }
 }
