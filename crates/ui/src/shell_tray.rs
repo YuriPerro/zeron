@@ -448,6 +448,8 @@ mod tests {
         Gated,
         /// Runs reply; sends fail once the rig opens the gate.
         SendFails,
+        /// Queue-edit commits come back as a conflict.
+        EditConflicts,
     }
 
     struct Rig {
@@ -500,6 +502,9 @@ mod tests {
                                 "baseTextHash": "hash", "attachments": [],
                                 "text": crate::shell_blocks::format_prompt(&[done("q")], "why?"),
                             }))
+                        }
+                        (methods::FINISH_QUEUED_MESSAGE_EDIT, Host::EditConflicts) => {
+                            RpcReply::value(&serde_json::json!({ "outcome": "conflict" }))
                         }
                         (methods::FINISH_QUEUED_MESSAGE_EDIT, _) => {
                             RpcReply::value(&serde_json::json!({ "outcome": "committed" }))
@@ -1289,5 +1294,30 @@ mod tests {
         rig.sent_prompt(cx, &runtime);
         rig.canvas("a", cx);
         assert!(!rig.bash(cx));
+    }
+
+    #[gpui::test]
+    fn conflicted_native_command_edit_keeps_its_blocks(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::EditConflicts);
+        rig.begin_edit(cx, &runtime);
+        rig.handle
+            .update(cx, |composer, _, cx| {
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("/compact", cx))
+            })
+            .unwrap();
+        rig.press("enter", cx);
+        rig.settle_failure(cx, &runtime);
+        assert!(rig.tray(cx).runs.is_empty(), "nothing restaged");
+        let blocks = crate::shell_blocks::format_prompt(&[done("q")], "");
+        rig.handle
+            .read_with(cx, |composer, _| {
+                assert!(composer.editing_queued.is_some());
+                assert_eq!(composer.queue_edit_shell_blocks, blocks);
+            })
+            .unwrap();
     }
 }

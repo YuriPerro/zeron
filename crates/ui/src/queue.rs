@@ -1707,21 +1707,22 @@ impl Composer {
             return true;
         }
         // A native command must open the row, so its shell runs go back to
-        // the tray to ride the next message instead.
-        let text = if self.sends_native_command(&text, cx) {
-            let blocks = std::mem::take(&mut self.queue_edit_shell_blocks);
-            if let Some(chat_id) = self.queue_edit_chat_id.clone() {
-                let runs = crate::shell_blocks::runs_from_blocks(&blocks, &chat_id);
-                self.restore_shell_outputs(&chat_id, runs);
-            }
-            text
+        // the tray to ride the next message instead, once the host takes it.
+        let (text, restage) = if self.sends_native_command(&text, cx) {
+            let chat_id = self.queue_edit_chat_id.clone().unwrap_or_default();
+            let runs =
+                crate::shell_blocks::runs_from_blocks(&self.queue_edit_shell_blocks, &chat_id);
+            (text, runs)
         } else {
-            crate::shell_blocks::with_blocks(&self.queue_edit_shell_blocks, &text)
+            (
+                crate::shell_blocks::with_blocks(&self.queue_edit_shell_blocks, &text),
+                Vec::new(),
+            )
         };
         if text.trim().is_empty() && self.staged().is_empty() && self.staged_appshots().is_empty() {
-            self.finish_queue_edit("discard", None, cx);
+            self.finish_queue_edit("discard", None, Vec::new(), cx);
         } else {
-            self.finish_queue_edit("commit", Some(text), cx);
+            self.finish_queue_edit("commit", Some(text), restage, cx);
         }
         true
     }
@@ -1732,7 +1733,7 @@ impl Composer {
             return false;
         }
         self.input.update(cx, |input, _| input.cancel_dictation());
-        self.finish_queue_edit("cancel", None, cx);
+        self.finish_queue_edit("cancel", None, Vec::new(), cx);
         true
     }
 
@@ -1768,10 +1769,13 @@ impl Composer {
         cx.notify();
     }
 
+    /// `restage`: the row's shell runs, back to the tray only once the host
+    /// has committed the edit; on any other outcome they stay with the edit.
     fn finish_queue_edit(
         &mut self,
         action: &'static str,
         text: Option<String>,
+        restage: Vec<crate::shell_blocks::ShellRun>,
         cx: &mut Context<Self>,
     ) {
         if self.queue_edit_finishing {
@@ -1789,6 +1793,7 @@ impl Composer {
             return;
         };
         let expected = self.queue_edit_base_text_hash.clone();
+        let restage_chat_id = chat_id.clone();
         let mut staged = self.staged().to_vec();
         let staged_appshots = self.staged_appshots().to_vec();
         staged.extend(staged_appshots.iter().map(|shot| shot.screenshot.clone()));
@@ -1839,7 +1844,10 @@ impl Composer {
                 composer.input.update(cx, |input, cx| { input.read_only = false; cx.notify(); });
                 match result {
                     Ok(reply) => match reply.get("outcome").and_then(|v| v.as_str()) {
-                        Some("committed" | "cancelled" | "discarded" | "released") => {
+                        Some(outcome @ ("committed" | "cancelled" | "discarded" | "released")) => {
+                            if outcome == "committed" {
+                                composer.restore_shell_outputs(&restage_chat_id, restage);
+                            }
                             composer.clear_queue_edit_local(cx);
                             return;
                         }
