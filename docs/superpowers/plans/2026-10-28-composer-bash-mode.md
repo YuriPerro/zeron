@@ -78,6 +78,7 @@
   - When the shell exits, read whatever the pipe holds for at most 100 ms more, then stop. A background child keeps the write end open, so never wait for EOF.
   - On timeout or cancel, `killpg(SIGTERM)`, wait `SHELL_KILL_GRACE`, then `killpg(SIGKILL)`.
   - Remove the map entry on every exit path.
+  - When the last `ShellRuns` clone drops (engine stop), `killpg(SIGKILL)` every live group. `kill_on_drop` alone only reaches the shell.
   - On Windows, cancelling and the group kill fall back to `child.kill()`. The tests are `#[cfg(unix)]`.
 
 - [ ] **Step 4: Run the tests.** Command: `cargo test -p zeron-engine --lib -- shell_runs`. Expected: 8 passed.
