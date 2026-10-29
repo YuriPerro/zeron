@@ -9,6 +9,17 @@ emit() { printf '%s\n' "$1"; }
 rid() { printf '%s' "$1" | sed 's/.*"id":\([0-9]*\).*/\1/'; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
+# Answer background-terminal lists with $terminals until another request
+# arrives, left in $line: the driver re-lists whenever it likes.
+next_request() {
+  while read -r line; do
+    has "$line" '"method":"thread/backgroundTerminals/list"' || return 0
+    has "$line" '"threadId":"th-1"' || exit 9
+    emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[$terminals],\"nextCursor\":null}}"
+  done
+  return 1
+}
+
 fail_turn() { # $1 = request id, $2 = message
   emit "{\"id\":$1,\"result\":{\"turn\":{\"id\":\"t-bad\"}}}"
   emit "{\"method\":\"turn/failed\",\"params\":{\"turn\":{\"id\":\"t-bad\",\"error\":{\"message\":\"$2\"}}}}"
@@ -417,26 +428,119 @@ case "$turnline" in
   # thread/backgroundTerminals/list can tell it still runs.
   emit '{"method":"item/started","params":{"threadId":"th-1","item":{"type":"commandExecution","id":"bg","command":"npm run dev","processId":"codex-pty-7","status":"inProgress"}}}'
   emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}'
-  read -r next || exit 1
-  emit "{\"id\":$(rid "$next"),\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
+  terminals='{"processId":"codex-pty-7","itemId":"bg","command":"npm run dev","cwd":"/tmp","osPid":null}'
+  next_request || exit 1
+  has "$line" '"method":"turn/start"' || exit 9
+  emit "{\"id\":$(rid "$line"),\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
   emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-2"}}}'
   emit '{"method":"item/started","params":{"threadId":"th-1","item":{"type":"commandExecution","id":"fg","command":"sleep 60","processId":"999999","status":"inProgress"}}}'
   emit '{"method":"item/agentMessage/delta","params":{"threadId":"th-1","itemId":"m2","delta":"running"}}'
-  read -r intline || exit 1
-  has "$intline" '"method":"turn/interrupt"' || exit 9
-  emit "{\"id\":$(rid "$intline"),\"result\":{}}"
+  next_request || exit 1
+  has "$line" '"method":"turn/interrupt"' || exit 9
+  emit "{\"id\":$(rid "$line"),\"result\":{}}"
   emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-2","status":"interrupted"}}}'
-  while read -r last; do
-    has "$last" '"method":"thread/backgroundTerminals/list"' || break
-    has "$last" '"threadId":"th-1"' || exit 9
-    emit "{\"id\":$(rid "$last"),\"result\":{\"data\":[{\"processId\":\"codex-pty-7\",\"itemId\":\"bg\",\"command\":\"npm run dev\",\"cwd\":\"/tmp\",\"osPid\":null}],\"nextCursor\":null}}"
-  done
-  has "$last" '"method":"turn/start"' || exit 9
-  emit "{\"id\":$(rid "$last"),\"result\":{\"turn\":{\"id\":\"t-3\"}}}"
+  next_request || exit 1
+  has "$line" '"method":"turn/start"' || exit 9
+  emit "{\"id\":$(rid "$line"),\"result\":{\"turn\":{\"id\":\"t-3\"}}}"
   emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-3"}}}'
   emit '{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"commandExecution","id":"bg","status":"completed"}}}'
   emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-3","status":"completed"}}}'
   cat >/dev/null
+  ;;
+
+*scenario:bg-outlives-turn*)
+  # A command still running after its turn is reported by the processId
+  # thread/backgroundTerminals/list names (not its OS pid).
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"type":"commandExecution","id":"bg","command":"npm run dev","processId":"codex-pty-7","status":"inProgress"}}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}'
+  while read -r line; do
+    has "$line" '"method":"thread/backgroundTerminals/list"' && has "$line" '"threadId":"th-1"' || exit 9
+    emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"processId\":\"codex-pty-7\",\"itemId\":\"bg\",\"command\":\"npm run dev\",\"cwd\":\"/tmp\",\"osPid\":4242}],\"nextCursor\":null}}"
+  done
+  ;;
+
+*scenario:bg-active-turn*)
+  # Codex lists the running turn's own command as a terminal too: it is
+  # foreground work until its turn ends.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"type":"commandExecution","id":"bg","command":"npm run dev","processId":"codex-pty-7","status":"inProgress"}}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}'
+  terminals='{"processId":"codex-pty-7","itemId":"bg","command":"npm run dev","cwd":"/tmp"}'
+  next_request || exit 1
+  has "$line" '"method":"turn/start"' || exit 9
+  emit "{\"id\":$(rid "$line"),\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
+  emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-2"}}}'
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"type":"commandExecution","id":"fg","command":"cargo watch","processId":"codex-pty-8","status":"inProgress"}}}'
+  terminals="$terminals,{\"processId\":\"codex-pty-8\",\"itemId\":\"fg\",\"command\":\"cargo watch\",\"cwd\":\"/tmp\"}"
+  # The periodic poll, mid-turn.
+  read -r line || exit 1
+  has "$line" '"method":"thread/backgroundTerminals/list"' || exit 9
+  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[$terminals],\"nextCursor\":null}}"
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-2","status":"completed"}}}'
+  while read -r line; do
+    has "$line" '"method":"thread/backgroundTerminals/list"' || exit 9
+    emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[$terminals],\"nextCursor\":null}}"
+  done
+  ;;
+
+*scenario:bg-stop*)
+  # Stopping a terminal terminates it by processId; Codex says whether it
+  # was still running. No item/completed follows: only a re-list shows it gone.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"type":"commandExecution","id":"bg","command":"npm run dev","processId":"codex-pty-7","status":"inProgress"}}}'
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"type":"commandExecution","id":"bg2","command":"tail -f log","processId":"codex-pty-9","status":"inProgress"}}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}'
+  seven='{"processId":"codex-pty-7","itemId":"bg","command":"npm run dev","cwd":"/tmp"},'
+  nine='{"processId":"codex-pty-9","itemId":"bg2","command":"tail -f log","cwd":"/tmp"}'
+  while read -r line; do
+    if has "$line" '"method":"thread/backgroundTerminals/list"'; then
+      emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[$seven$nine],\"nextCursor\":null}}"
+    elif has "$line" '"method":"thread/backgroundTerminals/terminate"' && has "$line" '"threadId":"th-1"'; then
+      if has "$line" '"processId":"codex-pty-7"'; then
+        seven=''
+        emit "{\"id\":$(rid "$line"),\"result\":{\"terminated\":true}}"
+      else
+        emit "{\"id\":$(rid "$line"),\"result\":{\"terminated\":false}}"
+      fi
+    else
+      exit 9
+    fi
+  done
+  ;;
+
+*scenario:bg-list-error*)
+  # An app-server without the experimental method: nothing to report, and
+  # the turns carry on.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"type":"commandExecution","id":"bg","command":"npm run dev","processId":"codex-pty-7","status":"inProgress"}}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}'
+  # The next turn ends only once the terminals were asked for, whichever
+  # reaches the wire first.
+  listed=''
+  waiting=''
+  while read -r line; do
+    if has "$line" '"method":"thread/backgroundTerminals/list"'; then
+      listed=1
+      emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32601,\"message\":\"method not found\"}}"
+      [ -n "$waiting" ] && emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-2","status":"completed"}}}'
+      waiting=''
+    elif has "$line" '"method":"turn/start"'; then
+      emit "{\"id\":$(rid "$line"),\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
+      emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-2"}}}'
+      if [ -n "$listed" ]; then
+        emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-2","status":"completed"}}}'
+      else
+        waiting=1
+      fi
+    else
+      exit 9
+    fi
+  done
   ;;
 
 *scenario:steer-race*)

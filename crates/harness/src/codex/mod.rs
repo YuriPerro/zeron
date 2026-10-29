@@ -75,15 +75,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AccessMode, AgentEvent, CompactionPhase, DoneStatus, HarnessId, Model, ModelOption,
-    ModelOptionChoice, ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AccessMode, AgentEvent, BackgroundTask, BackgroundTaskKind, CompactionPhase, DoneStatus,
+    HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel, RunRequest, SandboxLevel,
+    SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient, transport_lost};
@@ -1776,8 +1777,8 @@ async fn run_session(session: Session) {
     // questions waiting on a person), bounded.
     let request_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_SERVER_REQUESTS));
     // An interrupted turn's background-terminal query in flight: the turn
-    // and the process ids Codex still runs (`None`: it could not say).
-    let mut prune_query: Option<tokio::sync::oneshot::Receiver<(String, Option<HashSet<String>>)>> =
+    // and the terminals Codex still runs (`None`: it could not say).
+    let mut prune_query: Option<tokio::sync::oneshot::Receiver<(String, Option<Vec<Terminal>>)>> =
         None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
@@ -1803,6 +1804,15 @@ async fn run_session(session: Session) {
     // `item/completed`: once its process has had a moment to go, drop the
     // turn's commands whose process is gone (background ones live on).
     let mut prune_at: Option<(tokio::time::Instant, String)> = None;
+    // The parent's background terminals as last reported to the host
+    // (`AgentEvent::BackgroundTasks`), the next re-list while any command is
+    // open, and the re-list in flight (`None`: Codex could not say).
+    let mut reported: Vec<BackgroundTask> = Vec::new();
+    let mut terminal_poll_at: Option<tokio::time::Instant> = None;
+    let mut terminal_query: Option<tokio::sync::oneshot::Receiver<Option<Vec<Terminal>>>> = None;
+    // Background-terminal stops in flight (`TurnControl::stop_task`), each
+    // answering its host itself. They never touch the turn.
+    let mut task_stops: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -1910,6 +1920,12 @@ async fn run_session(session: Session) {
                             };
                             if changed {
                                 turn.set_background(open_commands.len());
+                                if let Some(event) = open_commands_changed(
+                                    open_commands.len(), &mut terminal_poll_at, &mut reported,
+                                ) && !send(&event_tx, event).await
+                                {
+                                    break 'main;
+                                }
                             }
                         }
                         if matches!(item_type(item), "userMessage" | "user_message")
@@ -2077,6 +2093,12 @@ async fn run_session(session: Session) {
                         };
                         if status == DoneStatus::Interrupted {
                             prune_at = Some((tokio::time::Instant::now() + COMMAND_EXIT_GRACE, id.clone()));
+                        } else if !open_commands.is_empty() {
+                            // The turn's commands still running are background
+                            // work now: list them at once. An interrupted
+                            // turn's are listed by its prune instead, once
+                            // its killed ones are gone.
+                            terminal_poll_at = Some(tokio::time::Instant::now());
                         }
                         if let Some(message) = notice.filter(|_| status == DoneStatus::Completed)
                             && !send(&event_tx, AgentEvent::Error { message }).await
@@ -2369,9 +2391,30 @@ async fn run_session(session: Session) {
                 }
             },
 
+            // Stop one background terminal by its `processId`, from a task:
+            // Codex's verdict goes straight to the host.
+            stop = turn.task_stop_requested(), if !interrupted => {
+                let client = client.clone();
+                let thread = thread_id.clone();
+                task_stops.spawn(async move {
+                    let verdict = terminate_terminal(&client, &thread, &stop.task_id).await;
+                    let _ = stop.reply.send(verdict);
+                });
+            },
+
+            // A stop settled: re-list now so a stopped row leaves at once.
+            Some(_) = task_stops.join_next(), if !task_stops.is_empty() => {
+                if !open_commands.is_empty() {
+                    terminal_poll_at = Some(tokio::time::Instant::now());
+                }
+            },
+
             _ = interrupt.cancelled(), if !interrupt_sent => {
                 interrupt_sent = true;
                 interrupted = true;
+                // The terminals go with the runtime: no verdict is coming.
+                task_stops.abort_all();
+                turn.drop_task_stops();
                 // The runtime is going: so is everything it started.
                 #[cfg(unix)]
                 if let Some(pid) = child.id() {
@@ -2429,20 +2472,62 @@ async fn run_session(session: Session) {
                     open_commands.retain(|item, (pid, started_in)| {
                         started_in.as_deref() != Some(stopped.as_str())
                             || match &live {
-                                Some(live) => {
-                                    live.contains(item.as_str())
-                                        || pid.as_deref().is_some_and(|pid| live.contains(pid))
-                                }
+                                Some(live) => live.iter().any(|t| t.runs(item, pid.as_deref())),
                                 None => pid.as_deref().is_some_and(process_alive),
                             }
                     });
                     turn.set_background(open_commands.len());
+                    // The prune's list is also the background set to report.
+                    let events = [
+                        open_commands_changed(open_commands.len(), &mut terminal_poll_at, &mut reported),
+                        live.and_then(|live| {
+                            let tasks = background_set(&live, &open_commands, router.active.as_deref());
+                            report_tasks(&mut reported, tasks)
+                        }),
+                    ];
+                    for event in events.into_iter().flatten() {
+                        if !send(&event_tx, event).await {
+                            break 'main;
+                        }
+                    }
+                }
+            },
+
+            _ = tokio::time::sleep_until(terminal_poll_at.unwrap_or_else(tokio::time::Instant::now)),
+                if terminal_poll_at.is_some() && !interrupted => {
+                terminal_poll_at = Some(tokio::time::Instant::now() + TERMINAL_POLL);
+                // A fresh list supersedes one still in flight: it may predate
+                // the stop or turn end that asked for this one.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let client = client.clone();
+                let thread = thread_id.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(background_terminals(&client, &thread).await);
+                });
+                terminal_query = Some(rx);
+            },
+
+            answer = async { terminal_query.as_mut().expect("guarded by if").await },
+                if terminal_query.is_some() => {
+                terminal_query = None;
+                if let Ok(Some(live)) = answer
+                    && let Some(event) = report_tasks(
+                        &mut reported,
+                        background_set(&live, &open_commands, router.active.as_deref()),
+                    )
+                    && !send(&event_tx, event).await
+                {
+                    break 'main;
                 }
             },
 
             _ = event_tx.closed() => break 'main,
         }
     }
+
+    // The app-server is gone or going: stops it never answered get no verdict.
+    drop(task_stops);
+    turn.drop_task_stops();
 
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
@@ -2494,13 +2579,116 @@ const COMMAND_EXIT_GRACE: Duration = Duration::from_secs(3);
 /// without bound.
 const MAX_PENDING_SERVER_REQUESTS: usize = 32;
 
-/// The `processId`s and item ids of the commands Codex still runs for
-/// `thread` (`thread/backgroundTerminals/list`, paged). The authority on a
-/// command item's `processId`, which names Codex's own exec session rather
-/// than promising an OS pid. `None` when the app-server can't answer (an
-/// older build without the method).
-async fn background_terminals(client: &RpcClient, thread: &str) -> Option<HashSet<String>> {
-    let mut live = HashSet::new();
+/// How often the parent thread's background terminals are re-listed while
+/// any of its commands is open.
+const TERMINAL_POLL: Duration = Duration::from_secs(5);
+
+/// How long a background-terminal stop waits on Codex's verdict.
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One command Codex still runs for a thread
+/// (`thread/backgroundTerminals/list`).
+struct Terminal {
+    /// Codex's own exec session id, not an OS pid: the id a stop names.
+    process_id: String,
+    item_id: String,
+    command: String,
+}
+
+impl Terminal {
+    /// Whether this terminal runs the command item `item` (process `pid`).
+    fn runs(&self, item: &str, pid: Option<&str>) -> bool {
+        let same = |id: &str, other: &str| !id.is_empty() && id == other;
+        same(&self.item_id, item) || pid.is_some_and(|pid| same(&self.process_id, pid))
+    }
+}
+
+/// The background set to report from Codex's `terminals`: those running a
+/// command the parent thread still has open, except the turn in flight's
+/// own (foreground work until its turn ends). Matching against the open
+/// commands also keeps a list answered before a command's `item/completed`
+/// from reviving it.
+fn background_set(
+    terminals: &[Terminal],
+    open: &HashMap<String, (Option<String>, Option<String>)>,
+    active: Option<&str>,
+) -> Vec<BackgroundTask> {
+    terminals
+        .iter()
+        .filter(|t| !t.process_id.is_empty())
+        .filter(|t| {
+            open.iter().any(|(item, (pid, started_in))| {
+                t.runs(item, pid.as_deref())
+                    && active.is_none_or(|active| started_in.as_deref() != Some(active))
+            })
+        })
+        .map(|t| BackgroundTask {
+            id: t.process_id.clone(),
+            kind: BackgroundTaskKind::Shell,
+            description: t.command.clone(),
+            started_at: DateTime::<Utc>::UNIX_EPOCH,
+        })
+        .collect()
+}
+
+/// `tasks` as the event to send, when they differ from the set last
+/// reported.
+fn report_tasks(
+    reported: &mut Vec<BackgroundTask>,
+    tasks: Vec<BackgroundTask>,
+) -> Option<AgentEvent> {
+    if *reported == tasks {
+        return None;
+    }
+    reported.clone_from(&tasks);
+    Some(AgentEvent::BackgroundTasks { tasks })
+}
+
+/// After the parent's open commands changed: the terminal poll runs while
+/// any is open; once none is, a non-empty reported set empties (the event
+/// to send).
+fn open_commands_changed(
+    open: usize,
+    poll_at: &mut Option<tokio::time::Instant>,
+    reported: &mut Vec<BackgroundTask>,
+) -> Option<AgentEvent> {
+    if open > 0 {
+        poll_at.get_or_insert_with(|| tokio::time::Instant::now() + TERMINAL_POLL);
+        return None;
+    }
+    *poll_at = None;
+    report_tasks(reported, Vec::new())
+}
+
+/// Terminate one of `thread`'s background terminals by its `processId`
+/// (`thread/backgroundTerminals/terminate`): `Ok` once Codex says it ended,
+/// the reason otherwise.
+async fn terminate_terminal(
+    client: &RpcClient,
+    thread: &str,
+    process_id: &str,
+) -> Result<(), String> {
+    let params = json!({ "threadId": thread, "processId": process_id });
+    match tokio::time::timeout(
+        TERMINATE_TIMEOUT,
+        client.request("thread/backgroundTerminals/terminate", params),
+    )
+    .await
+    {
+        Ok(Ok(reply)) if reply["terminated"].as_bool() == Some(true) => Ok(()),
+        Ok(Ok(_)) => Err("not running".into()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("Codex did not answer the stop in time".into()),
+    }
+}
+
+/// The commands Codex still runs for `thread`
+/// (`thread/backgroundTerminals/list`, paged). The authority on a command
+/// item's `processId`, which names Codex's own exec session rather than
+/// promising an OS pid. `None` when the app-server can't answer (an older
+/// build without the method).
+async fn background_terminals(client: &RpcClient, thread: &str) -> Option<Vec<Terminal>> {
+    let mut live = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..100 {
         let mut params = json!({ "threadId": thread });
@@ -2521,11 +2709,12 @@ async fn background_terminals(client: &RpcClient, thread: &str) -> Option<HashSe
             Err(_) => return None,
         };
         for terminal in page["data"].as_array().into_iter().flatten() {
-            for key in ["processId", "itemId"] {
-                if let Some(id) = terminal[key].as_str().filter(|id| !id.is_empty()) {
-                    live.insert(id.to_owned());
-                }
-            }
+            let field = |key: &str| terminal[key].as_str().unwrap_or_default().to_owned();
+            live.push(Terminal {
+                process_id: field("processId"),
+                item_id: field("itemId"),
+                command: field("command"),
+            });
         }
         match page["nextCursor"].as_str().filter(|next| !next.is_empty()) {
             Some(next) if cursor.as_deref() != Some(next) => cursor = Some(next.to_owned()),

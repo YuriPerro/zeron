@@ -14,8 +14,9 @@ use zeron_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AccessMode, AgentEvent, CompactionPhase, DoneStatus, HarnessId, ReasoningLevel, RunRequest,
-    SandboxLevel, TodoItem, TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
+    AccessMode, AgentEvent, BackgroundTask, BackgroundTaskKind, CompactionPhase, DoneStatus,
+    HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem, TodoStatus, ToolCall,
+    UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -544,6 +545,158 @@ async fn open_commands_report_background_work_and_killed_ones_do_not() {
         .unwrap();
     assert_eq!(until_done(&mut stream, |_| {}).await, DoneStatus::Completed);
     assert!(!turn.background_live(), "nothing left running");
+}
+
+type EventStream = futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>;
+
+fn shell(id: &str, description: &str) -> BackgroundTask {
+    BackgroundTask {
+        id: id.into(),
+        kind: BackgroundTaskKind::Shell,
+        description: description.into(),
+        started_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+    }
+}
+
+/// The next reported background set, skipping everything else.
+async fn next_background_tasks(stream: &mut EventStream, within: Duration) -> Vec<BackgroundTask> {
+    tokio::time::timeout(within, async {
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::BackgroundTasks { tasks } = event.expect("event") {
+                return tasks;
+            }
+        }
+        panic!("stream ended without a background set");
+    })
+    .await
+    .expect("background set in time")
+}
+
+/// Events up to and including the turn's Done.
+async fn until_turn_done(stream: &mut EventStream) -> Vec<AgentEvent> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.expect("event");
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                return events;
+            }
+        }
+        panic!("stream ended without Done");
+    })
+    .await
+    .expect("turn ends")
+}
+
+#[tokio::test]
+async fn a_terminal_that_outlives_its_turn_is_reported_by_process_id() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut stream = harness()
+        .run(request("scenario:bg-outlives-turn"), controls)
+        .await
+        .expect("run starts");
+    let tasks = next_background_tasks(&mut stream, Duration::from_secs(10)).await;
+    assert_eq!(tasks, [shell("codex-pty-7", "npm run dev")]);
+}
+
+#[tokio::test]
+async fn a_command_of_the_running_turn_is_not_background_work() {
+    let (controls, steer, _token) = controls("Yes");
+    let mut stream = harness()
+        .run(request("scenario:bg-active-turn"), controls)
+        .await
+        .expect("run starts");
+    let before = next_background_tasks(&mut stream, Duration::from_secs(10)).await;
+    assert_eq!(before, [shell("codex-pty-7", "npm run dev")]);
+    steer
+        .send(SteerMessage::text("watch the tests"))
+        .await
+        .unwrap();
+    let during = until_turn_done(&mut stream).await;
+    assert!(
+        !during
+            .iter()
+            .any(|e| matches!(e, AgentEvent::BackgroundTasks { .. })),
+        "the mid-turn poll reported the turn's own command: {during:?}"
+    );
+    let after = next_background_tasks(&mut stream, Duration::from_secs(10)).await;
+    assert_eq!(
+        after,
+        [
+            shell("codex-pty-7", "npm run dev"),
+            shell("codex-pty-8", "cargo watch")
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stopping_a_terminal_terminates_it_and_reports_codex_verdict() {
+    use zeron_harness::TurnControl;
+    let (mut controls, _steer, _token) = controls("Yes");
+    let turn = TurnControl::default();
+    controls.turn = turn.clone();
+    let mut stream = harness()
+        .run(request("scenario:bg-stop"), controls)
+        .await
+        .expect("run starts");
+    let tasks = next_background_tasks(&mut stream, Duration::from_secs(10)).await;
+    assert_eq!(
+        tasks,
+        [
+            shell("codex-pty-7", "npm run dev"),
+            shell("codex-pty-9", "tail -f log")
+        ]
+    );
+    let stopped =
+        tokio::time::timeout(Duration::from_secs(5), turn.stop_task("codex-pty-7".into()))
+            .await
+            .expect("verdict in time")
+            .expect("verdict");
+    assert_eq!(stopped, Ok(()));
+    // Re-listed at once, not at the next poll.
+    let left = next_background_tasks(&mut stream, Duration::from_secs(2)).await;
+    assert_eq!(left, [shell("codex-pty-9", "tail -f log")]);
+    let refused =
+        tokio::time::timeout(Duration::from_secs(5), turn.stop_task("codex-pty-9".into()))
+            .await
+            .expect("verdict in time")
+            .expect("verdict");
+    assert_eq!(refused, Err("not running".into()));
+}
+
+#[tokio::test]
+async fn an_app_server_that_cannot_list_terminals_reports_none() {
+    let (controls, steer, _token) = controls("Yes");
+    let mut stream = harness()
+        .run(request("scenario:bg-list-error"), controls)
+        .await
+        .expect("run starts");
+    let mut events = until_turn_done(&mut stream).await;
+    steer.send(SteerMessage::text("carry on")).await.unwrap();
+    events.extend(until_turn_done(&mut stream).await);
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(300), stream.next()).await
+    {
+        events.push(event.expect("event"));
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::BackgroundTasks { .. })),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
