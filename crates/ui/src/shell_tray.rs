@@ -12,6 +12,7 @@ use zeron_rpc::methods;
 
 use crate::composer::Composer;
 use crate::icons;
+use crate::output_lines::output_tail;
 use crate::shell_blocks::{ShellRun, ShellRunState};
 use crate::theme::Theme;
 
@@ -45,12 +46,6 @@ impl ShellTrayState {
 
 fn ready(run: &ShellRun) -> bool {
     run.state != ShellRunState::Running
-}
-
-/// The last `OUTPUT_PREVIEW_LINES` lines of `output`.
-fn output_tail(output: &str) -> Vec<&str> {
-    let lines: Vec<&str> = output.trim_end_matches('\n').lines().collect();
-    lines[lines.len().saturating_sub(OUTPUT_PREVIEW_LINES)..].to_vec()
 }
 
 #[derive(serde::Deserialize)]
@@ -98,10 +93,15 @@ impl Composer {
 
     pub(crate) fn leave_bash_mode(&mut self, cx: &mut Context<Self>) {
         let key = self.shell_tray_key(cx);
-        if let Some(tray) = self.shell_trays.get_mut(&key) {
+        self.leave_bash_mode_for(&key, cx);
+    }
+
+    /// Leave bash mode for `key`, which need not be the selected chat.
+    pub(crate) fn leave_bash_mode_for(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(tray) = self.shell_trays.get_mut(key) {
             tray.bash_mode = false;
-            if tray.runs.is_empty() {
-                self.shell_trays.remove(&key);
+            if tray.idle() {
+                self.shell_trays.remove(key);
             }
         }
         self.sync_bash_input(cx);
@@ -336,21 +336,11 @@ impl Composer {
                 .into_any_element(),
             ),
             ShellRunState::Done {
-                timed_out: true, ..
-            } => Some(status_label("timed out", theme.danger, theme)),
-            ShellRunState::Done {
-                exit_code: Some(code),
+                exit_code,
+                timed_out,
                 ..
-            } => Some(status_label(
-                format!("exit {code}"),
-                if *code == 0 {
-                    theme.text_faint
-                } else {
-                    theme.danger
-                },
-                theme,
-            )),
-            ShellRunState::Done { .. } | ShellRunState::Failed(_) => None,
+            } => crate::shell_blocks::status_label(*exit_code, *timed_out, theme),
+            ShellRunState::Failed(_) => None,
         };
         let (chat_id, run_id) = (run.chat_id.clone(), run.id.clone());
         let remove = self.queue_action(
@@ -404,12 +394,14 @@ impl Composer {
             ShellRunState::Running => None,
             ShellRunState::Done { output, .. } => Some((output.as_str(), theme.text_muted)),
             ShellRunState::Failed(error) => Some((error.as_str(), theme.danger)),
-        };
+        }
+        .filter(|_| open)
+        .map(|(output, color)| (output_tail(output, OUTPUT_PREVIEW_LINES).0, color));
         div()
             .flex()
             .flex_col()
             .child(header)
-            .when_some(output.filter(|_| open), |el, (output, color)| {
+            .when_some(output, |el, (lines, color)| {
                 el.child(
                     div()
                         .px(px(ROW_PAD_X))
@@ -418,29 +410,11 @@ impl Composer {
                         .text_size(px(OUTPUT_SIZE))
                         .line_height(px(OUTPUT_LINE))
                         .text_color(color)
-                        .children(
-                            output_tail(output)
-                                .into_iter()
-                                .map(|line| div().truncate().child(line.to_owned())),
-                        ),
+                        .children(lines.into_iter().map(|line| div().truncate().child(line))),
                 )
             })
             .into_any_element()
     }
-}
-
-pub(crate) fn status_label(
-    text: impl Into<SharedString>,
-    color: gpui::Hsla,
-    theme: &Theme,
-) -> AnyElement {
-    div()
-        .flex_none()
-        .font_family(theme.font_mono.clone())
-        .text_size(px(11.0))
-        .text_color(color)
-        .child(text.into())
-        .into_any_element()
 }
 
 #[cfg(test)]
@@ -460,7 +434,7 @@ mod tests {
         Hangs,
         /// Replies once the rig opens the gate.
         Gated,
-        /// Runs reply, sends fail.
+        /// Runs reply; sends fail once the rig opens the gate.
         SendFails,
     }
 
@@ -505,7 +479,18 @@ mod tests {
                             RpcReply::value(&reply)
                         }
                         (methods::QUEUE_COMMAND, Host::SendFails) => {
+                            gate.notified().await;
                             Err(RpcError::Failed("disk full".into()))
+                        }
+                        (methods::BEGIN_QUEUED_MESSAGE_EDIT, _) => {
+                            RpcReply::value(&serde_json::json!({
+                                "outcome": "acquired", "leaseId": "lease",
+                                "baseTextHash": "hash", "attachments": [],
+                                "text": crate::shell_blocks::format_prompt(&[done("q")], "why?"),
+                            }))
+                        }
+                        (methods::FINISH_QUEUED_MESSAGE_EDIT, _) => {
+                            RpcReply::value(&serde_json::json!({ "outcome": "committed" }))
                         }
                         (methods::RUN_SHELL_COMMAND, Host::Gated) => {
                             gate.notified().await;
@@ -538,6 +523,11 @@ mod tests {
                 })
                 .collect();
             state.selected_chat = Some("chat-a".into());
+            state.devices = serde_json::from_value(serde_json::json!([{
+                "id": "box", "name": "Box", "platform": "macos", "lastSeenAt": null,
+                "capabilities": zeron_proto::capabilities::CURRENT,
+            }]))
+            .unwrap();
         });
         let handle = cx.add_window(|_, cx| Composer::new(state, cx));
         cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
@@ -610,6 +600,14 @@ mod tests {
                 })
                 .unwrap();
             cx.run_until_parked();
+        }
+
+        fn settle_failure(&self, cx: &mut TestAppContext, runtime: &tokio::runtime::Runtime) {
+            self.settle(cx, runtime, |rig, cx| {
+                rig.handle
+                    .read_with(cx, |composer, _| composer.failure().is_some())
+                    .unwrap()
+            });
         }
 
         /// The prompt of the one message sent so far.
@@ -936,12 +934,91 @@ mod tests {
         rig.stage(vec![done("done"), running.clone()], cx);
         rig.type_text("why?", cx);
         rig.press("enter", cx);
-        rig.settle(cx, &runtime, |rig, cx| {
-            rig.handle
-                .read_with(cx, |composer, _| composer.failure().is_some())
-                .unwrap()
-        });
+        rig.gate.notify_one();
+        rig.settle_failure(cx, &runtime);
         assert_eq!(rig.tray(cx).runs, vec![done("done"), running]);
         assert_eq!(rig.text(cx), "why?");
+    }
+
+    #[gpui::test]
+    fn failed_send_restores_prose_outside_bash_mode(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::SendFails);
+        rig.type_text("why?", cx);
+        rig.press("enter", cx);
+        rig.type_text("!", cx);
+        assert!(rig.tray(cx).bash_mode);
+        rig.gate.notify_one();
+        rig.settle_failure(cx, &runtime);
+        assert!(!rig.tray(cx).bash_mode);
+        assert_eq!(rig.text(cx), "why?");
+        assert_eq!(rig.placeholder(cx), "Do anything…");
+    }
+
+    #[gpui::test]
+    fn send_button_sends_staged_outputs_in_bash_mode(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.stage(vec![done("done")], cx);
+        rig.type_text("!", cx);
+        rig.press("enter", cx);
+        runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(20)));
+        cx.run_until_parked();
+        assert!(
+            rig.calls(methods::QUEUE_COMMAND).is_empty(),
+            "Enter sends nothing"
+        );
+        assert!(rig.calls(methods::RUN_SHELL_COMMAND).is_empty());
+        cx.update_window(rig.handle.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(rig.handle.into(), cx);
+        let button = visual.debug_bounds("composer-send").unwrap();
+        visual.simulate_click(button.center(), gpui::Modifiers::default());
+        assert_eq!(
+            rig.sent_prompt(cx, &runtime),
+            crate::shell_blocks::format_prompt(&[done("done")], "")
+        );
+        assert!(rig.tray(cx).runs.is_empty());
+        assert!(rig.tray(cx).bash_mode);
+    }
+
+    #[gpui::test]
+    fn queued_edit_keeps_shell_blocks(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.queue = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "q1",
+                            "text": crate::shell_blocks::format_prompt(&[done("q")], "why?"),
+                            "issuedBy": "local", "issuedAt": 0,
+                        }))
+                        .unwrap(),
+                    ];
+                });
+                composer.begin_queue_edit("q1".into(), cx);
+            })
+            .unwrap();
+        rig.settle(cx, &runtime, |rig, cx| {
+            rig.handle
+                .read_with(cx, |composer, _| composer.editing_queued.is_some())
+                .unwrap()
+        });
+        assert_eq!(rig.text(cx), "why?");
+        rig.type_text(" now", cx);
+        rig.press("enter", cx);
+        rig.settle(cx, &runtime, |rig, _| {
+            !rig.calls(methods::FINISH_QUEUED_MESSAGE_EDIT).is_empty()
+        });
+        let finishes = rig.calls(methods::FINISH_QUEUED_MESSAGE_EDIT);
+        assert_eq!(
+            finishes[0]["text"],
+            crate::shell_blocks::format_prompt(&[done("q")], "why? now")
+        );
     }
 }

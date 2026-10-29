@@ -89,8 +89,8 @@ transcript ─▶ user_markdown splits the leading tag blocks into shell rows
     list:
     - each row shows `$ command`, then a spinner or `exit N`, then ✕
     - a row expands to show the last 20 output lines
-  - When the user sends, `Running` blocks stay staged. Only `Done` blocks go
-    out with the message.
+  - When the user sends, `Done` and `Failed` blocks go out with the message.
+    `Running` blocks stay staged.
   - A send with an empty text but with blocks is allowed.
 - Prompt format, one block per run:
   ```
@@ -115,7 +115,8 @@ transcript ─▶ user_markdown splits the leading tag blocks into shell rows
 
 - The RPC fails (host offline, no cwd): the block shows the error as its output
   with no exit code, and a toast shows "Couldn't run the command: {error}". The
-  block stays so the user can remove it.
+  block stays so the user can remove it. If it is still staged at the next
+  send, it goes out with the message, its error written as a `<bash-note>`.
 - The user switches chats while a command runs: the run keeps going, and its
   result lands in that chat's staged blocks.
 - The app quits while a command runs: the engine kills the group when the
@@ -133,5 +134,6 @@ transcript ─▶ user_markdown splits the leading tag blocks into shell rows
   - `!` on an empty draft enters bash mode. `!` mid-text does not.
   - Backspace on empty and Esc leave bash mode.
   - Enter dispatches `RunShellCommand` with the chat's `targetDeviceId`.
-  - Send builds the tagged prompt from the `Done` blocks only, and clears them.
+  - Send builds the tagged prompt from the `Done` and `Failed` blocks, clears
+    them, and leaves the `Running` blocks staged.
   - `user_markdown` splits tag groups and leaves malformed tags as text.

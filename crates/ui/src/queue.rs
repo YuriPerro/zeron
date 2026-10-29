@@ -216,8 +216,19 @@ fn one_line(text: &str) -> SharedString {
 /// New queue rows contain only editable user text. During a rolling upgrade,
 /// an older client may still have stored the attachment trailer in `text`.
 /// Hide it only when the parsed paths exactly match the row's attachment field.
+/// Shell tag groups ahead of the text are hidden too; a row of nothing else
+/// reads as its first command.
 fn queue_visible_text(text: &str, attachments: &[String]) -> String {
     let text = crate::appshots::strip_context_for_display(text);
+    let (shells, text) = crate::shell_blocks::split_shell_blocks(text);
+    let visible = queue_text_without_shells(text, attachments);
+    match shells.first() {
+        Some(shell) if visible.trim().is_empty() => format!("$ {}", shell.command),
+        _ => visible,
+    }
+}
+
+fn queue_text_without_shells(text: &str, attachments: &[String]) -> String {
     if text.trim().is_empty() && !attachments.is_empty() {
         return crate::attachments::attachment_only_text(attachments).to_string();
     }
@@ -1570,7 +1581,12 @@ impl Composer {
                             .unwrap_or_default()
                             .to_string();
                         let attachments: Vec<String> = serde_json::from_value(reply["attachments"].clone()).unwrap_or_default();
-                        let text = queue_visible_text(&raw_text, &attachments);
+                        // The shell groups stay out of the editor and go
+                        // back ahead of the text on commit.
+                        let (shell_blocks, raw_text) =
+                            crate::shell_blocks::split_raw_blocks(&raw_text);
+                        let shell_blocks = shell_blocks.to_owned();
+                        let text = queue_visible_text(raw_text, &attachments);
                         let text = if !attachments.is_empty() && crate::attachments::is_attachment_only_text(&text) {
                             String::new()
                         } else { text };
@@ -1599,6 +1615,7 @@ impl Composer {
                         composer.editing_queued = Some(id.clone());
                         composer.queue_edit_lease_id = Some(lease_id.to_string());
                         composer.queue_edit_base_text_hash = Some(base_text_hash.to_string());
+                        composer.queue_edit_shell_blocks = shell_blocks;
                         composer.queue_edit_chat_id = Some(chat_id.clone());
                         composer.queue_edit_host_device_id = Some(host_device_id.clone());
                         composer.swap_in_queued_draft(
@@ -1684,6 +1701,7 @@ impl Composer {
         if !self.check_reference_delivery(&text, cx) {
             return true;
         }
+        let text = crate::shell_blocks::with_blocks(&self.queue_edit_shell_blocks, &text);
         if text.trim().is_empty() && self.staged().is_empty() && self.staged_appshots().is_empty() {
             self.finish_queue_edit("discard", None, cx);
         } else {
@@ -1711,6 +1729,7 @@ impl Composer {
         self.editing_queued = None;
         self.queue_edit_lease_id = None;
         self.queue_edit_base_text_hash = None;
+        self.queue_edit_shell_blocks.clear();
         self.queue_edit_chat_id = None;
         self.queue_edit_host_device_id = None;
         self.queue_edit_pending_id = None;
@@ -2041,7 +2060,7 @@ mod tests {
         ROW_SLOT,
         available_queue_primary_action, latest_queued_message, one_line, queue_action_needs_host,
         queue_drag_offsets, queue_drop_index, queue_latest_shortcut_visible, queue_lifted_top,
-        queue_mutation_acknowledged, queue_visible_text, visible_queue_rows,
+        queue_mutation_acknowledged, queue_row_text, queue_visible_text, visible_queue_rows,
     };
 
     #[test]
@@ -2373,6 +2392,27 @@ mod tests {
             queue_visible_text("literal user text", &paths),
             "literal user text"
         );
+    }
+
+    #[test]
+    fn shell_blocks_are_hidden_from_queue_text() {
+        use crate::shell_blocks::{ShellRun, ShellRunState, format_prompt};
+        let run = |command: &str| ShellRun {
+            id: command.into(),
+            chat_id: "c".into(),
+            command: command.into(),
+            state: ShellRunState::Done {
+                exit_code: Some(0),
+                output: "<b>out</b>\n".into(),
+                truncated: false,
+                timed_out: false,
+            },
+        };
+        let both = format_prompt(&[run("ls"), run("pwd")], "why?");
+        assert_eq!(queue_visible_text(&both, &[]), "why?");
+        assert_eq!(queue_row_text(&both, &[]).0.as_ref(), "why?");
+        let blocks_only = format_prompt(&[run("git status"), run("pwd")], "");
+        assert_eq!(queue_visible_text(&blocks_only, &[]), "$ git status");
     }
 }
 

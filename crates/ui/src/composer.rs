@@ -6439,6 +6439,9 @@ pub struct Composer {
     /// delivery. The text buffer is kept until Finish receives an ACK.
     pub(crate) queue_edit_lease_id: Option<String>,
     pub(crate) queue_edit_base_text_hash: Option<String>,
+    /// The edited row's shell tag groups, kept out of the editor and put back
+    /// ahead of the text on commit.
+    pub(crate) queue_edit_shell_blocks: String,
     pub(crate) queue_edit_chat_id: Option<String>,
     pub(crate) queue_edit_host_device_id: Option<String>,
     pub(crate) queue_edit_instance_id: String,
@@ -6750,6 +6753,7 @@ impl Composer {
             editing_queued: None,
             queue_edit_lease_id: None,
             queue_edit_base_text_hash: None,
+            queue_edit_shell_blocks: String::new(),
             queue_edit_chat_id: None,
             queue_edit_host_device_id: None,
             queue_edit_instance_id: uuid::Uuid::new_v4().to_string(),
@@ -9283,6 +9287,25 @@ impl Composer {
             self.run_shell_command(text, cx);
             return;
         }
+        self.submit_message(text, cx);
+    }
+
+    /// The send button. In bash mode an empty input sends the staged runs,
+    /// where Enter does nothing.
+    fn on_send_clicked(&mut self, cx: &mut Context<Self>) {
+        let input = self.input.read(cx);
+        if self.bash_mode(cx)
+            && !input.dictation.phase.active()
+            && input.text().trim().is_empty()
+            && self.shell_outputs_ready(cx) > 0
+        {
+            self.submit_message(String::new(), cx);
+        } else {
+            self.on_submit(cx);
+        }
+    }
+
+    fn submit_message(&mut self, text: String, cx: &mut Context<Self>) {
         // Leading indentation distinguishes literal Markdown from native commands
         // and skill invocations. Only the empty-content check may trim the draft.
         if let Some(action) = self
@@ -10212,6 +10235,11 @@ impl Composer {
                         }
                         cx.notify();
                     });
+                    // Bash mode entered while the send was in flight would
+                    // run the restored prose on the next Enter.
+                    if !restore_text.trim().is_empty() {
+                        composer.leave_bash_mode_for(&shell_key, cx);
+                    }
                     if is_new && composer.current_key != restore_key {
                         // A re-key swap to the canvas is pending (the
                         // select_chat(None) above); it loads this draft into
@@ -11298,7 +11326,7 @@ impl Composer {
                 let explains = self.out_of_cloud_credits(cx);
                 send_circle("composer-send", blocked, theme)
                     .when(!blocked || explains, |el| {
-                        el.on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
+                        el.on_click(cx.listener(|this, _, _, cx| this.on_send_clicked(cx)))
                     })
                     .tooltip(crate::settings::widgets::text_tooltip(
                         if self.out_of_cloud_credits(cx) {

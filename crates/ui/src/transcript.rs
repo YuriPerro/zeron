@@ -54,6 +54,7 @@ use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _};
 use crate::notice::{NoticeChipIcon::Tile, notice_chip_with_action};
+use crate::output_lines::{output_line, output_tail};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
@@ -880,18 +881,6 @@ pub fn tool_detail(
         lines,
         truncated_by,
     })
-}
-
-/// Chars kept per output line. Lines clip rather than wrap, but each one is
-/// still shaped whole for selection — a minified megabyte must not be.
-const OUTPUT_LINE_MAX_CHARS: usize = 8 * 1024;
-
-/// One verbatim output line, cut to [`OUTPUT_LINE_MAX_CHARS`] with an ellipsis.
-fn output_line(line: &str) -> SharedString {
-    match line.char_indices().nth(OUTPUT_LINE_MAX_CHARS) {
-        Some((cut, _)) => SharedString::from(format!("{}…", &line[..cut])),
-        None => SharedString::from(line.to_owned()),
-    }
 }
 
 /// Columns at which an invocation line soft-wraps into continuation lines.
@@ -7034,20 +7023,13 @@ impl Transcript {
                 .tool_details
                 .get(&key)
                 .is_some_and(|fold| fold.open == Some(true));
-            let status = shell_block_status(block);
             // The status already says `timed out`.
             let notes: Vec<&String> = block
                 .notes
                 .iter()
                 .filter(|note| note.as_str() != crate::shell_blocks::TIMEOUT_NOTE)
                 .collect();
-            let lines: Vec<SharedString> = block
-                .output
-                .trim_end_matches('\n')
-                .lines()
-                .map(output_line)
-                .collect();
-            let expandable = !lines.is_empty();
+            let expandable = !block.output.trim().is_empty();
             let toggle_key = key.clone();
             let header = div()
                 .id(key.clone())
@@ -7085,17 +7067,11 @@ impl Transcript {
                         .text_color(theme.text_faint)
                         .child(note.clone())
                 }))
-                .children(status.map(|(label, failed)| {
-                    crate::shell_tray::status_label(
-                        label,
-                        if failed {
-                            theme.danger
-                        } else {
-                            theme.text_faint
-                        },
-                        theme,
-                    )
-                }));
+                .children(crate::shell_blocks::status_label(
+                    block.exit_code,
+                    block.timed_out(),
+                    theme,
+                ));
             div()
                 .w_full()
                 .flex()
@@ -7107,6 +7083,9 @@ impl Transcript {
                 .bg(crate::theme::ink(0.03))
                 .child(header)
                 .when(open && expandable, |card| {
+                    // The tail, like a live thought: a command's last lines
+                    // are where it ends up.
+                    let (lines, truncated_by) = output_tail(&block.output, OUTPUT_DETAIL_MAX_LINES);
                     card.child(
                         div()
                             .h(px(DETAIL_SEPARATOR))
@@ -7116,7 +7095,7 @@ impl Transcript {
                     .child(div().px(px(10.0)).child(detail_body(
                         &ToolDetail::Output {
                             lines,
-                            truncated_by: 0,
+                            truncated_by,
                         },
                         None,
                         &format!("{key}-out"),
@@ -9921,21 +9900,6 @@ pub(crate) fn user_markdown(text: &str) -> Option<UserMarkdown> {
             .map(Arc::new),
         full: Arc::new(tree),
     })
-}
-
-/// How a sent shell run ended: `exit N`, flagged failed when non-zero, or
-/// `timed out`. `None` for a run that never got an exit code.
-fn shell_block_status(block: &crate::shell_blocks::ShellBlock) -> Option<(SharedString, bool)> {
-    if block
-        .notes
-        .iter()
-        .any(|note| note == crate::shell_blocks::TIMEOUT_NOTE)
-    {
-        return Some(("timed out".into(), true));
-    }
-    block
-        .exit_code
-        .map(|code| (format!("exit {code}").into(), code != 0))
 }
 
 /// The render key of a user row's Markdown: its selection, element ids and
@@ -13792,27 +13756,6 @@ mod tests {
         // The rest still renders its Markdown.
         let (_, markdown, _, _) = user(&format_prompt(&[run("ls", 0)], "**why?**"));
         assert!(markdown.is_some());
-    }
-
-    #[test]
-    fn shell_block_status_reads_exit_and_timeout() {
-        use crate::shell_blocks::ShellBlock;
-        let block = |exit_code: Option<i32>, notes: &[&str]| ShellBlock {
-            command: "ls".into(),
-            output: String::new(),
-            exit_code,
-            notes: notes.iter().map(|note| note.to_string()).collect(),
-        };
-        let status = |block: &ShellBlock| {
-            shell_block_status(block).map(|(label, failed)| (label.to_string(), failed))
-        };
-        assert_eq!(status(&block(Some(0), &[])), Some(("exit 0".into(), false)));
-        assert_eq!(status(&block(Some(2), &[])), Some(("exit 2".into(), true)));
-        assert_eq!(
-            status(&block(None, &["timed out after 120s"])),
-            Some(("timed out".into(), true))
-        );
-        assert_eq!(status(&block(None, &["Couldn't reach the host"])), None);
     }
 
     #[test]
@@ -18096,7 +18039,10 @@ mod tests {
             let Some(ToolDetail::Output { lines, .. }) = detail else {
                 panic!("expected output detail");
             };
-            assert_eq!(lines[0].chars().count(), OUTPUT_LINE_MAX_CHARS + 1);
+            assert_eq!(
+                lines[0].chars().count(),
+                crate::output_lines::OUTPUT_LINE_MAX_CHARS + 1
+            );
             assert!(lines[0].ends_with("é…"));
             assert_eq!(lines[1].as_ref(), "short");
         }

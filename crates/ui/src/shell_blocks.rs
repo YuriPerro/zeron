@@ -1,5 +1,9 @@
 //! Staged shell runs written into the prompt as tag groups, and parsed back
-//! out of the sent message for the transcript.
+//! out of the sent message for the transcript and the queue.
+
+use gpui::{AnyElement, IntoElement, ParentElement as _, SharedString, Styled, div, px};
+
+use crate::theme::Theme;
 
 pub(crate) const TIMEOUT_NOTE: &str = "timed out after 120s";
 const TRUNCATION_NOTE: &str = "output truncated to the last 64 KB";
@@ -32,6 +36,43 @@ pub struct ShellBlock {
     pub output: String,
     pub exit_code: Option<i32>,
     pub notes: Vec<String>,
+}
+
+impl ShellBlock {
+    pub(crate) fn timed_out(&self) -> bool {
+        self.notes.iter().any(|note| note == TIMEOUT_NOTE)
+    }
+}
+
+/// How a run ended: `timed out`, or `exit N` flagged failed when non-zero.
+/// `None` for a run that got neither.
+pub(crate) fn status(exit_code: Option<i32>, timed_out: bool) -> Option<(SharedString, bool)> {
+    if timed_out {
+        return Some(("timed out".into(), true));
+    }
+    exit_code.map(|code| (format!("exit {code}").into(), code != 0))
+}
+
+/// [`status`] as a run row's trailing mono label, danger-tinted on failure.
+pub(crate) fn status_label(
+    exit_code: Option<i32>,
+    timed_out: bool,
+    theme: &Theme,
+) -> Option<AnyElement> {
+    let (label, failed) = status(exit_code, timed_out)?;
+    Some(
+        div()
+            .flex_none()
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.0))
+            .text_color(if failed {
+                theme.danger
+            } else {
+                theme.text_faint
+            })
+            .child(label)
+            .into_any_element(),
+    )
 }
 
 fn escape(text: &str) -> String {
@@ -85,9 +126,13 @@ pub(crate) fn format_prompt(runs: &[ShellRun], text: &str) -> String {
             }
         })
         .collect();
-    let blocks = groups.join("\n");
+    with_blocks(&groups.join("\n"), text)
+}
+
+/// Tag groups ahead of `text`, a blank line between them.
+pub(crate) fn with_blocks(blocks: &str, text: &str) -> String {
     if text.is_empty() {
-        blocks
+        blocks.to_string()
     } else if blocks.is_empty() {
         text.to_string()
     } else {
@@ -142,6 +187,13 @@ pub(crate) fn split_shell_blocks(text: &str) -> (Vec<ShellBlock>, &str) {
     } else {
         (blocks, rest.trim_start())
     }
+}
+
+/// The leading tag groups exactly as written, and the text after them, so an
+/// edit can change the text and put the groups back with [`with_blocks`].
+pub(crate) fn split_raw_blocks(text: &str) -> (&str, &str) {
+    let (_, rest) = split_shell_blocks(text);
+    (text[..text.len() - rest.len()].trim_end(), rest)
 }
 
 #[cfg(test)]
@@ -285,6 +337,47 @@ mod tests {
             split_shell_blocks("<bash-input>ls"),
             (vec![], "<bash-input>ls")
         );
+    }
+
+    #[test]
+    fn status_reads_exit_and_timeout() {
+        let status = |exit_code, timed_out| {
+            status(exit_code, timed_out).map(|(label, failed)| (label.to_string(), failed))
+        };
+        assert_eq!(status(Some(0), false), Some(("exit 0".into(), false)));
+        assert_eq!(status(Some(2), false), Some(("exit 2".into(), true)));
+        assert_eq!(status(None, true), Some(("timed out".into(), true)));
+        assert_eq!(status(Some(0), true), Some(("timed out".into(), true)));
+        assert_eq!(status(None, false), None);
+    }
+
+    #[test]
+    fn block_timed_out_reads_its_note() {
+        let run = ShellRun {
+            state: ShellRunState::Done {
+                exit_code: None,
+                output: String::new(),
+                truncated: false,
+                timed_out: true,
+            },
+            ..done("sleep 999", "", None)
+        };
+        let (blocks, _) = split_shell_blocks(&format_prompt(&[run], ""));
+        assert!(blocks[0].timed_out());
+        let (blocks, _) = split_shell_blocks(&format_prompt(&[done("ls", "", Some(0))], ""));
+        assert!(!blocks[0].timed_out());
+    }
+
+    #[test]
+    fn raw_blocks_round_trip_an_edit() {
+        let prompt = format_prompt(&[done("ls", "a\n", Some(0))], "why?");
+        let (raw, rest) = split_raw_blocks(&prompt);
+        assert_eq!(rest, "why?");
+        assert_eq!(
+            with_blocks(raw, "why now?"),
+            format_prompt(&[done("ls", "a\n", Some(0))], "why now?")
+        );
+        assert_eq!(split_raw_blocks("hello"), ("", "hello"));
     }
 
     #[test]

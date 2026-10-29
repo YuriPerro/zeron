@@ -55,6 +55,7 @@ mod orchestration;
 pub use zeron_notify as notify;
 pub mod onboarding;
 pub mod orb;
+mod output_lines;
 pub mod overscroll;
 pub mod pickers;
 pub mod popover;
