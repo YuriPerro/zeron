@@ -1084,6 +1084,9 @@ pub enum RowKind {
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
         /// Context the prompt folded in as text, lifted back out by `badges`.
         badges: Arc<Vec<crate::badges::MessageBadge>>,
+        /// Shell runs the composer staged ahead of the prompt, peeled off its
+        /// leading tag groups. Each draws as a collapsed `$ command` row.
+        shells: Arc<Vec<crate::shell_blocks::ShellBlock>>,
         /// The chat that sent this message through Zeron's `send_message`,
         /// lifted out of the routing header the receiving agent still reads.
         sender: Option<AgentSender>,
@@ -1434,6 +1437,10 @@ pub fn rows_for_entry(
             Some((sender, body)) => (Some(sender), body.to_owned()),
             None => (None, body),
         };
+        // Lifted before the mention projection, so command output never
+        // turns into chips.
+        let (shells, rest) = crate::shell_blocks::split_shell_blocks(&body);
+        let body = rest.to_owned();
         // Chips stand in for their file attachments, which leave the strip;
         // images keep their thumbnail there beside the chip. A chip carries
         // its upload's path for its progress and, for an image, a click
@@ -1479,6 +1486,7 @@ pub fn rows_for_entry(
                 markdown,
                 attachments: Arc::new(attachments),
                 badges: Arc::new(badges),
+                shells: Arc::new(shells),
                 sender,
                 pending,
             },
@@ -7010,6 +7018,123 @@ impl Transcript {
             .into_any_element()
     }
 
+    /// A prompt's shell runs above its bubble, one collapsed `$ command` row
+    /// each. A click toggles the run's full output; the open state rides
+    /// `tool_details` under `"{row_id}#sh{ix}"`.
+    fn render_user_shells(
+        &self,
+        row_id: &SharedString,
+        shells: &[crate::shell_blocks::ShellBlock],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let rows = shells.iter().enumerate().map(|(ix, block)| {
+            let key = SharedString::from(format!("{row_id}#sh{ix}"));
+            let open = self
+                .tool_details
+                .get(&key)
+                .is_some_and(|fold| fold.open == Some(true));
+            let status = shell_block_status(block);
+            // The status already says `timed out`.
+            let notes: Vec<&String> = block
+                .notes
+                .iter()
+                .filter(|note| note.as_str() != crate::shell_blocks::TIMEOUT_NOTE)
+                .collect();
+            let lines: Vec<SharedString> = block
+                .output
+                .trim_end_matches('\n')
+                .lines()
+                .map(output_line)
+                .collect();
+            let expandable = !lines.is_empty();
+            let toggle_key = key.clone();
+            let header = div()
+                .id(key.clone())
+                .h(px(CHIP_HEADER_HEIGHT))
+                .flex_none()
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .when(expandable, |el| {
+                    el.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            let entry = this.tool_details.entry(toggle_key.clone()).or_default();
+                            entry.open = Some(!entry.open.unwrap_or(false));
+                            cx.notify();
+                        }))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(TOOL_TEXT_SIZE))
+                        .text_color(theme.text_muted)
+                        .child(format!("$ {}", block.command)),
+                )
+                .children(notes.into_iter().map(|note| {
+                    div()
+                        .flex_none()
+                        .max_w(px(220.0))
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child(note.clone())
+                }))
+                .children(status.map(|(label, failed)| {
+                    crate::shell_tray::status_label(
+                        label,
+                        if failed {
+                            theme.danger
+                        } else {
+                            theme.text_faint
+                        },
+                        theme,
+                    )
+                }));
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .rounded(px(9.0))
+                .border_1()
+                .border_color(crate::theme::hairline(0.07))
+                .bg(crate::theme::ink(0.03))
+                .child(header)
+                .when(open && expandable, |card| {
+                    card.child(
+                        div()
+                            .h(px(DETAIL_SEPARATOR))
+                            .flex_none()
+                            .bg(crate::theme::hairline(0.06)),
+                    )
+                    .child(div().px(px(10.0)).child(detail_body(
+                        &ToolDetail::Output {
+                            lines,
+                            truncated_by: 0,
+                        },
+                        None,
+                        &format!("{key}-out"),
+                        theme,
+                    )))
+                })
+        });
+        div().w_full().flex().justify_end().pb(px(6.0)).child(
+            div()
+                .w_full()
+                .max_w(px(self.content_width * 0.8))
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .children(rows),
+        )
+    }
+
     /// `Message from [logo] Chat` over an agent-sent bubble, in the switch
     /// seam's caption style: the sending chat's provider mark and live title
     /// (the header's title for a chat this workspace doesn't list). A known
@@ -8144,11 +8269,13 @@ impl Transcript {
                 markdown,
                 attachments,
                 badges,
+                shells,
                 sender,
                 pending,
             } => {
                 let attachments = attachments.clone();
                 let badges = badges.clone();
+                let shells = shells.clone();
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let markdown = markdown.clone();
@@ -8186,6 +8313,12 @@ impl Transcript {
                                     &theme,
                                 )
                             })),
+                    );
+                }
+                if !shells.is_empty() {
+                    column = column.child(
+                        self.render_user_shells(&row.id, &shells, &theme, cx)
+                            .when(pending, |el| el.opacity(0.65)),
                     );
                 }
                 if !text.is_empty() {
@@ -9788,6 +9921,21 @@ pub(crate) fn user_markdown(text: &str) -> Option<UserMarkdown> {
             .map(Arc::new),
         full: Arc::new(tree),
     })
+}
+
+/// How a sent shell run ended: `exit N`, flagged failed when non-zero, or
+/// `timed out`. `None` for a run that never got an exit code.
+fn shell_block_status(block: &crate::shell_blocks::ShellBlock) -> Option<(SharedString, bool)> {
+    if block
+        .notes
+        .iter()
+        .any(|note| note == crate::shell_blocks::TIMEOUT_NOTE)
+    {
+        return Some(("timed out".into(), true));
+    }
+    block
+        .exit_code
+        .map(|code| (format!("exit {code}").into(), code != 0))
 }
 
 /// The render key of a user row's Markdown: its selection, element ids and
@@ -13595,6 +13743,86 @@ mod tests {
             panic!("expected a from-chat row");
         };
         assert!(markdown.is_some());
+    }
+
+    #[test]
+    fn user_message_with_shell_blocks_splits() {
+        use crate::shell_blocks::{ShellRun, ShellRunState, format_prompt};
+        let run = |command: &str, exit_code: i32| ShellRun {
+            id: command.into(),
+            chat_id: "c".into(),
+            command: command.into(),
+            state: ShellRunState::Done {
+                exit_code: Some(exit_code),
+                output: "out\n".into(),
+                truncated: false,
+                timed_out: false,
+            },
+        };
+        let user = |text: &str| {
+            let rows = rows_for_entry(&user_entry("u1", text), false, false, &mut parse);
+            let RowKind::User {
+                text,
+                markdown,
+                shells,
+                ..
+            } = &rows[0].kind
+            else {
+                panic!("expected a user row");
+            };
+            (
+                text.clone(),
+                markdown.clone(),
+                shells.clone(),
+                rows[0].copy_text.clone(),
+            )
+        };
+        let (text, markdown, shells, copy) =
+            user(&format_prompt(&[run("ls", 0), run("false", 1)], "why?"));
+        assert_eq!(shells.len(), 2);
+        assert_eq!(shells[0].command, "ls");
+        assert_eq!(shells[1].exit_code, Some(1));
+        assert_eq!(text.as_ref(), "why?");
+        assert!(markdown.is_none());
+        assert_eq!(copy.as_deref(), Some("why?"));
+        // Blocks alone leave no body to render.
+        let (text, markdown, shells, _) = user(&format_prompt(&[run("ls", 0)], ""));
+        assert_eq!(shells.len(), 1);
+        assert!(text.is_empty() && markdown.is_none());
+        // The rest still renders its Markdown.
+        let (_, markdown, _, _) = user(&format_prompt(&[run("ls", 0)], "**why?**"));
+        assert!(markdown.is_some());
+    }
+
+    #[test]
+    fn shell_block_status_reads_exit_and_timeout() {
+        use crate::shell_blocks::ShellBlock;
+        let block = |exit_code: Option<i32>, notes: &[&str]| ShellBlock {
+            command: "ls".into(),
+            output: String::new(),
+            exit_code,
+            notes: notes.iter().map(|note| note.to_string()).collect(),
+        };
+        let status = |block: &ShellBlock| {
+            shell_block_status(block).map(|(label, failed)| (label.to_string(), failed))
+        };
+        assert_eq!(status(&block(Some(0), &[])), Some(("exit 0".into(), false)));
+        assert_eq!(status(&block(Some(2), &[])), Some(("exit 2".into(), true)));
+        assert_eq!(
+            status(&block(None, &["timed out after 120s"])),
+            Some(("timed out".into(), true))
+        );
+        assert_eq!(status(&block(None, &["Couldn't reach the host"])), None);
+    }
+
+    #[test]
+    fn plain_user_message_unchanged() {
+        let rows = rows_for_entry(&user_entry("u1", "hello"), false, false, &mut parse);
+        let RowKind::User { text, shells, .. } = &rows[0].kind else {
+            panic!("expected a user row");
+        };
+        assert!(shells.is_empty());
+        assert_eq!(text.as_ref(), "hello");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Staged shell runs written into the prompt as tag groups, and parsed back
 //! out of the sent message for the transcript.
 
-const TIMEOUT_NOTE: &str = "timed out after 120s";
+pub(crate) const TIMEOUT_NOTE: &str = "timed out after 120s";
 const TRUNCATION_NOTE: &str = "output truncated to the last 64 KB";
 const CLOSING_PREFIX: &str = "</bash-";
 const ESCAPED_CLOSING_PREFIX: &str = "<\\/bash-";
@@ -27,7 +27,7 @@ pub(crate) enum ShellRunState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ShellBlock {
+pub struct ShellBlock {
     pub command: String,
     pub output: String,
     pub exit_code: Option<i32>,

@@ -429,7 +429,11 @@ impl Composer {
     }
 }
 
-fn status_label(text: impl Into<SharedString>, color: gpui::Hsla, theme: &Theme) -> AnyElement {
+pub(crate) fn status_label(
+    text: impl Into<SharedString>,
+    color: gpui::Hsla,
+    theme: &Theme,
+) -> AnyElement {
     div()
         .flex_none()
         .font_family(theme.font_mono.clone())
