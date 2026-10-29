@@ -642,7 +642,9 @@ impl FilesSurface {
             | ComposerInputEvent::OpenAttachment(_)
             | ComposerInputEvent::AnnotationHovered(_)
             | ComposerInputEvent::CursorMoved
-            | ComposerInputEvent::ViewportChanged => {}
+            | ComposerInputEvent::ViewportChanged
+            | ComposerInputEvent::EnterBashMode
+            | ComposerInputEvent::LeaveBashMode => {}
         });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| {
             if this.sync_target(cx) {

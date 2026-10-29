@@ -74,6 +74,7 @@ pub mod running_pill;
 pub mod settings;
 pub mod shell;
 mod shell_blocks;
+mod shell_tray;
 pub mod smooth_scroll;
 pub mod sound;
 pub mod state;

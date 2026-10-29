@@ -1927,6 +1927,10 @@ pub enum ComposerInputEvent {
     OpenAttachment(u32),
     /// The pointer moved onto (or off) an annotation chip.
     AnnotationHovered(Option<u32>),
+    /// `!` was typed into an empty draft and consumed.
+    EnterBashMode,
+    /// Backspace on an empty bash input, or Escape in bash mode.
+    LeaveBashMode,
 }
 
 #[derive(Clone)]
@@ -2131,6 +2135,12 @@ pub struct ComposerInput {
     mentions_enabled: bool,
     /// Secret entry (API keys): shown as bullets and never copied or cut.
     masked: bool,
+    /// Set by the composer (`Composer::sync_bash_input`): a typed `!` on an
+    /// empty draft asks for bash mode (a paste never reaches key handling, so
+    /// a pasted `!ls` stays text). In bash mode the text is monospace,
+    /// Shift+Enter adds nothing, and Backspace on empty or Escape asks out.
+    pub(crate) bash_trigger: bool,
+    pub(crate) bash_mode: bool,
     /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
@@ -2244,6 +2254,8 @@ impl ComposerInput {
             ghost: None,
             mentions_enabled: false,
             masked: false,
+            bash_trigger: false,
+            bash_mode: false,
             layout_epoch: 0,
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
@@ -2722,6 +2734,18 @@ impl ComposerInput {
     ) {
         self.placeholder = placeholder.into();
         cx.notify();
+    }
+
+    pub(crate) fn placeholder(&self) -> &str {
+        &self.placeholder
+    }
+
+    pub(crate) fn set_bash_mode(&mut self, bash_mode: bool, cx: &mut Context<Self>) {
+        if self.bash_mode != bash_mode {
+            self.bash_mode = bash_mode;
+            self.needs_measure = true;
+            cx.notify();
+        }
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -3398,6 +3422,10 @@ impl ComposerInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bash_mode && self.content.is_empty() {
+            cx.emit(ComposerInputEvent::LeaveBashMode);
+            return;
+        }
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if self.cursor_offset() == prev {
@@ -3783,6 +3811,9 @@ impl ComposerInput {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bash_mode {
+            return;
+        }
         if self.mentions_enabled && self.selected_range.is_empty() && self.marked_range.is_none() {
             if let Some((range, inserted)) =
                 composer_markdown::newline_edit(&self.content, self.cursor_offset())
@@ -3924,6 +3955,23 @@ impl ComposerInput {
         }
         if escape_dismisses_completion(&event.keystroke.key, self.mention_open) {
             cx.emit(ComposerInputEvent::MentionDismiss);
+            cx.stop_propagation();
+            return;
+        }
+        if self.bash_mode && event.keystroke.key == "escape" {
+            cx.emit(ComposerInputEvent::LeaveBashMode);
+            cx.stop_propagation();
+            return;
+        }
+        if self.bash_trigger
+            && self.content.is_empty()
+            && self.marked_range.is_none()
+            && !self.read_only
+            && !event.keystroke.modifiers.platform
+            && !event.keystroke.modifiers.control
+            && event.keystroke.key_char.as_deref() == Some("!")
+        {
+            cx.emit(ComposerInputEvent::EnterBashMode);
             cx.stop_propagation();
         }
     }
@@ -4481,7 +4529,7 @@ impl ComposerInput {
             }),
             strikethrough: None,
         };
-        let raw_faces = if self.mentions_enabled && !is_placeholder {
+        let raw_faces = if self.mentions_enabled && !is_placeholder && !self.bash_mode {
             composer_markdown::faces(&self.content)
         } else {
             Vec::new()
@@ -5643,7 +5691,11 @@ impl Render for ComposerInput {
             .text_size(crate::typography::ui_rems(self.text_size))
             .line_height(crate::typography::ui_rems(self.configured_line_height))
             .text_color(text_color)
-            .font_family(theme.font_sans.clone())
+            .font_family(if self.bash_mode {
+                theme.font_mono.clone()
+            } else {
+                theme.font_sans.clone()
+            })
             .child({
                 let input = cx.entity();
                 let ascent = self.max_ascent;
@@ -6410,6 +6462,9 @@ pub struct Composer {
     pub(crate) todo_cache: crate::todo_panel::TodoCache,
     pub(crate) todo_panels: HashMap<String, crate::todo_panel::TodoPanelState>,
     pub(crate) todo_scroll: gpui::ScrollHandle,
+    /// Bash mode and staged shell runs per chat (in memory, like the drafts),
+    /// keyed by [`Composer::shell_tray_key`].
+    pub(crate) shell_trays: HashMap<String, crate::shell_tray::ShellTrayState>,
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
@@ -6628,6 +6683,8 @@ impl Composer {
             ComposerInputEvent::PastedText { range, revision } => {
                 this.resolve_pasted_references(range.clone(), *revision, cx);
             }
+            ComposerInputEvent::EnterBashMode => this.enter_bash_mode(cx),
+            ComposerInputEvent::LeaveBashMode => this.leave_bash_mode(cx),
         });
         cx.observe_global::<crate::settings::SettingsStore>(|this, cx| {
             if !crate::settings::current(cx).dictation_enabled {
@@ -6709,6 +6766,7 @@ impl Composer {
             todo_cache: Default::default(),
             todo_panels: HashMap::new(),
             todo_scroll: gpui::ScrollHandle::new(),
+            shell_trays: HashMap::new(),
             queue_shortcut_revealed: false,
             annotation_marks: Vec::new(),
             expanded_mode: false,
@@ -6775,6 +6833,7 @@ impl Composer {
                 composer.adopt_staged_attachments(key, staged, cx);
             }
         }
+        composer.sync_bash_input(cx);
         composer
     }
 
@@ -6934,7 +6993,14 @@ impl Composer {
     /// the context ring (no checkout/ref footer, no plan usage).
     pub(crate) fn set_side_chat(&mut self, cx: &mut Context<Self>) {
         self.side_chat = true;
+        self.sync_bash_input(cx);
         cx.notify();
+    }
+
+    /// Bash mode belongs to a plain chat draft: never a side chat's composer,
+    /// an open question, or a queued message being edited.
+    pub(crate) fn bash_allowed(&self) -> bool {
+        !self.side_chat && self.wizard.is_none() && self.editing_queued.is_none()
     }
 
     /// Composer honesty: how the chat's path stands — and, when there is
@@ -8030,7 +8096,7 @@ impl Composer {
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
         self.reconcile_attachment_mentions(cx);
-        if self.wizard.is_some() {
+        if self.wizard.is_some() || self.bash_mode(cx) {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
             }
@@ -8412,8 +8478,37 @@ impl Composer {
         ))
     }
 
-    fn render_input_with_completion(&self) -> gpui::Div {
-        div().relative().child(self.input.clone())
+    /// In bash mode the input shares its row with an accent `bash` chip,
+    /// aligned to the first line.
+    fn render_input_with_completion(&self, bash_mode: bool, theme: &Theme) -> gpui::Div {
+        if !bash_mode {
+            return div().relative().child(self.input.clone());
+        }
+        const CHIP_HEIGHT: f32 = 18.0;
+        div()
+            .relative()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(Theme::SPACE_SM))
+            .child(div().flex_1().min_w_0().child(self.input.clone()))
+            .child(
+                div()
+                    .flex_none()
+                    .mt(px((INPUT_LINE_HEIGHT - CHIP_HEIGHT) / 2.0))
+                    .h(px(CHIP_HEIGHT))
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.accent.opacity(0.55))
+                    .bg(theme.accent_wash)
+                    .text_color(theme.accent)
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .font_family(theme.font_mono.clone())
+                    .child("bash"),
+            )
     }
 
     // ---- slash commands ---------------------------------------------------
@@ -8978,6 +9073,7 @@ impl Composer {
 
         // A pending agent question must not take over an active queue edit.
         if self.editing_queued.is_some() {
+            self.sync_bash_input(cx);
             self.on_input_edited(cx);
             cx.notify();
             return;
@@ -9046,6 +9142,7 @@ impl Composer {
         let input_context = message_input_context(self.wizard.is_some());
         self.input
             .update(cx, |input, cx| input.set_key_context(input_context, cx));
+        self.sync_bash_input(cx);
         self.on_input_edited(cx);
         cx.notify();
     }
@@ -9179,9 +9276,13 @@ impl Composer {
             self.wizard_advance(cx);
             return;
         }
+        let text = self.input.read(cx).text().to_string();
+        if self.bash_mode(cx) {
+            self.run_shell_command(text, cx);
+            return;
+        }
         // Leading indentation distinguishes literal Markdown from native commands
         // and skill invocations. Only the empty-content check may trim the draft.
-        let text = self.input.read(cx).text().to_string();
         if let Some(action) = self
             .slash_cache
             .get(&self.slash.context)
@@ -9227,6 +9328,10 @@ impl Composer {
             return;
         }
         if self.commit_queue_edit(cx) {
+            return;
+        }
+        if self.bash_mode(cx) {
+            self.on_submit(cx);
             return;
         }
         let has_content = composer_has_content(
@@ -11300,6 +11405,8 @@ impl Render for Composer {
             let focus = self.input.focus_handle(cx);
             window.focus(&focus, cx);
         }
+        self.sync_bash_input(cx);
+        let bash_mode = self.input.read(cx).bash_mode;
         let theme = Theme::of(cx).clone();
         let wizard_active = self.wizard.is_some();
         if self.mention.token.is_some()
@@ -11318,7 +11425,11 @@ impl Render for Composer {
         self.input.update(cx, |input, cx| {
             if input.needs_measure && input.last_width > 0.0 {
                 let mut style = window.text_style();
-                style.font_family = theme.font_sans.clone();
+                style.font_family = if input.bash_mode {
+                    theme.font_mono.clone()
+                } else {
+                    theme.font_sans.clone()
+                };
                 style.font_size = crate::typography::ui_rems(INPUT_TEXT_SIZE).into();
                 style.color = if input.content.is_empty() {
                     theme.text_faint
@@ -11860,7 +11971,11 @@ impl Render for Composer {
         let appshot_strip = self.render_appshot_strip(&theme, window, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
-        let pill_border = theme.composer_surface_border();
+        let pill_border = if bash_mode {
+            theme.accent.opacity(0.35)
+        } else {
+            theme.composer_surface_border()
+        };
         // Compensate for the transcript canvas beneath the frosted surface.
         // Keep the opaque fallback when frost is disabled or unsupported.
         let pill = div()
@@ -11970,7 +12085,7 @@ impl Render for Composer {
                         .px(px(16.0))
                         .pt(px(text_pt))
                         .pb(px(4.0))
-                        .child(self.render_input_with_completion()),
+                        .child(self.render_input_with_completion(bash_mode, &theme)),
                 )
                 .child(
                     div()
@@ -12061,7 +12176,7 @@ impl Render for Composer {
                                 // The draft waits under the voice track and
                                 // fades back as the transcript lands in it.
                                 .opacity(beneath_voice)
-                                .child(self.render_input_with_completion()),
+                                .child(self.render_input_with_completion(bash_mode, &theme)),
                         )
                         .child(
                             div()

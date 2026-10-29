@@ -1133,7 +1133,9 @@ impl Pickers {
             | ComposerInputEvent::ViewportChanged
             | ComposerInputEvent::MentionNavigate(_)
             | ComposerInputEvent::MentionAccept
-            | ComposerInputEvent::MentionDismiss => {}
+            | ComposerInputEvent::MentionDismiss
+            | ComposerInputEvent::EnterBashMode
+            | ComposerInputEvent::LeaveBashMode => {}
         });
         // Chat selection / config changes must re-render the chips (child views
         // only re-render on their own notify). A selection change also drops
