@@ -915,6 +915,12 @@ impl EngineRpc {
         self
     }
 
+    /// Share the engine-wide shell runs, so engine stop reaches every one.
+    pub(crate) fn with_shell_runs(mut self, shell_runs: crate::shell_runs::ShellRuns) -> Self {
+        self.shell_runs = shell_runs;
+        self
+    }
+
     /// Attach the auth service (AuthStatus + AuthRpc mutations).
     pub fn with_auth(mut self, auth: Auth) -> Self {
         self.auth = Some(auth);
@@ -2145,6 +2151,13 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // queueing, verification, and the relayed response itself.
         methods::APPLY_HARNESS_UPDATE => Duration::from_secs(20 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // Outlast the host's own timeout and kill grace: an expired forward
+        // drops the device link, and with it the running command.
+        methods::RUN_SHELL_COMMAND => {
+            crate::shell_runs::SHELL_RUN_TIMEOUT
+                + crate::shell_runs::SHELL_KILL_GRACE
+                + Duration::from_secs(15)
+        }
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
@@ -5548,6 +5561,10 @@ mod tests {
         assert_eq!(
             forward_deadline(methods::CREATE_WORKTREE),
             Duration::from_secs(120)
+        );
+        assert_eq!(
+            forward_deadline(methods::RUN_SHELL_COMMAND),
+            Duration::from_secs(137)
         );
         assert_eq!(
             forward_deadline(methods::CLONE_REPO),

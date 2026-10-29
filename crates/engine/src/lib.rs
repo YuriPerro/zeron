@@ -155,6 +155,8 @@ pub struct EngineCore {
     pub terminals: Terminals,
     /// I/O routing for terminals on other devices (direct link or relay).
     pub remote_terminals: remote_terminals::RemoteTerminals,
+    /// Composer bash-mode commands, shared by every RPC surface.
+    pub(crate) shell_runs: shell_runs::ShellRuns,
     pub project_actions: ProjectActionsStore,
     pub previews: zeron_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
@@ -374,6 +376,7 @@ impl EngineCore {
             workspace_files,
             terminals,
             remote_terminals: Default::default(),
+            shell_runs: Default::default(),
             project_actions,
             previews,
             change_requests,
@@ -525,6 +528,7 @@ impl EngineCore {
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
         .with_remote_terminals(self.remote_terminals.clone())
+        .with_shell_runs(self.shell_runs.clone())
         .with_harness_updates(self.harness_updates.clone())
         .with_viewport_focus(self.viewport_focus.clone());
         if let Some(links) = self.links() {
@@ -608,6 +612,7 @@ impl EngineCore {
         }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
+        self.shell_runs.shutdown();
         self.sessions.stop_activity_projection().await;
         self.agent_accounts.shutdown();
         self.change_requests.shutdown();

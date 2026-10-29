@@ -6,6 +6,7 @@
 //! timeout fires or [`ShellRuns::cancel`] is called. The run never waits for
 //! EOF, because a backgrounded child (`sleep 300 &`) keeps the pipe open.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
@@ -40,6 +41,20 @@ struct RunHandle {
     /// Tells this run apart from a later one that reuses its ID.
     token: u64,
     cancel: oneshot::Sender<()>,
+    /// The shell's process group while it may still be signalled.
+    #[cfg(unix)]
+    group: Option<libc::pid_t>,
+}
+
+impl ShellRunResult {
+    fn failed(output: String) -> Self {
+        Self {
+            exit_code: None,
+            output,
+            truncated: false,
+            timed_out: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -80,13 +95,25 @@ impl ShellRuns {
     }
 
     /// Runs `command` in `cwd` and returns once it exits, times out or is
-    /// cancelled. A command that can't start reports why as its output, with
-    /// no exit code.
+    /// cancelled. A command that can't start, or whose `run_id` is already
+    /// running, reports why as its output, with no exit code.
     pub(crate) async fn run(&self, run_id: String, cwd: &Path, command: &str) -> ShellRunResult {
         static TOKENS: AtomicU64 = AtomicU64::new(0);
         let token = TOKENS.fetch_add(1, Ordering::Relaxed);
         let (cancel, mut cancelled) = oneshot::channel();
-        lock(&self.runs).insert(run_id.clone(), RunHandle { token, cancel });
+        match lock(&self.runs).entry(run_id.clone()) {
+            Entry::Occupied(_) => {
+                return ShellRunResult::failed(format!("run {run_id} is already running"));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(RunHandle {
+                    token,
+                    cancel,
+                    #[cfg(unix)]
+                    group: None,
+                });
+            }
+        }
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut guard = RunGuard {
             runs: &self.runs,
@@ -99,22 +126,15 @@ impl ShellRuns {
         let shell = crate::terminals::selected_shell();
         let (reader, mut child) = match spawn(&shell, cwd, command) {
             Ok(spawned) => spawned,
-            Err(error) => {
-                return ShellRunResult {
-                    exit_code: None,
-                    output: format!("could not run {shell}: {error}"),
-                    truncated: false,
-                    timed_out: false,
-                };
-            }
+            Err(error) => return ShellRunResult::failed(format!("could not run {shell}: {error}")),
         };
         #[cfg(unix)]
-        {
-            guard.group = child
+        guard.set_group(
+            child
                 .id()
                 .map(|pid| pid as libc::pid_t)
-                .filter(|pid| *pid > 0);
-        }
+                .filter(|pid| *pid > 0),
+        );
         let mut reader = Some(reader);
         let mut tail = Tail::new(self.cap);
 
@@ -133,13 +153,25 @@ impl ShellRuns {
                 #[cfg(unix)]
                 if let Some(group) = guard.group {
                     signal_group(group, libc::SIGTERM);
-                    let _ = pump(
+                    // Reap the shell while polling: a live group keeps its ID,
+                    // so the SIGKILL can't reach a reused PID.
+                    let emptied = pump(
                         &mut reader,
                         &mut tail,
-                        tokio::time::timeout(SHELL_KILL_GRACE, child.wait()),
+                        tokio::time::timeout(SHELL_KILL_GRACE, async {
+                            loop {
+                                let _ = child.try_wait();
+                                if !group_alive(group) {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                        }),
                     )
                     .await;
-                    signal_group(group, libc::SIGKILL);
+                    if emptied.is_err() {
+                        signal_group(group, libc::SIGKILL);
+                    }
                 }
                 let _ = child.start_kill();
                 let _ = pump(&mut reader, &mut tail, child.wait()).await;
@@ -149,9 +181,7 @@ impl ShellRuns {
         // The shell is gone: what it left in the group either was killed above
         // or was backgrounded on purpose and outlives the run.
         #[cfg(unix)]
-        {
-            guard.group = None;
-        }
+        guard.set_group(None);
         let _ = pump(&mut reader, &mut tail, tokio::time::sleep(SHELL_DRAIN)).await;
         drop(guard);
 
@@ -170,6 +200,18 @@ impl ShellRuns {
             let _ = handle.cancel.send(());
         }
     }
+
+    /// Engine stop: SIGKILLs every running group and ends its run.
+    pub(crate) fn shutdown(&self) {
+        let runs: Vec<_> = lock(&self.runs).drain().map(|(_, run)| run).collect();
+        for run in runs {
+            #[cfg(unix)]
+            if let Some(group) = run.group {
+                signal_group(group, libc::SIGKILL);
+            }
+            let _ = run.cancel.send(());
+        }
+    }
 }
 
 /// Removes the run's map entry on every exit path. A run dropped mid-flight
@@ -181,6 +223,20 @@ struct RunGuard<'a> {
     token: u64,
     #[cfg(unix)]
     group: Option<libc::pid_t>,
+}
+
+impl RunGuard<'_> {
+    /// Mirrors the group into the map entry so [`ShellRuns::shutdown`] sees it.
+    #[cfg(unix)]
+    fn set_group(&mut self, group: Option<libc::pid_t>) {
+        self.group = group;
+        if let Some(run) = lock(self.runs)
+            .get_mut(&self.run_id)
+            .filter(|run| run.token == self.token)
+        {
+            run.group = group;
+        }
+    }
 }
 
 impl Drop for RunGuard<'_> {
@@ -205,6 +261,13 @@ fn signal_group(group: libc::pid_t, signal: libc::c_int) {
     // SAFETY: the shell spawned with `process_group(0)`, so its PID names its
     // own group, and `group > 0` keeps this off our own group.
     unsafe { libc::killpg(group, signal) };
+}
+
+#[cfg(unix)]
+fn group_alive(group: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only probes whether the group still has members.
+    let probed = unsafe { libc::killpg(group, 0) };
+    probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn spawn(
@@ -402,7 +465,7 @@ mod tests {
         let dir = tmp();
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            ShellRuns::default().run("f".into(), dir.path(), "sleep 300 & echo hi"),
+            ShellRuns::default().run("f".into(), dir.path(), "sleep 5 & echo hi"),
         )
         .await
         .expect("run resolves while the background child lives");
@@ -415,36 +478,103 @@ mod tests {
         ShellRuns::default().cancel("nope");
     }
 
-    #[tokio::test]
-    async fn dropping_a_run_kills_its_group() {
-        let dir = tmp();
-        let pid_file = dir.path().join("pid");
-        let runs = ShellRuns::default();
-        let running = tokio::spawn({
-            let runs = runs.clone();
-            let cwd = dir.path().to_path_buf();
-            async move {
-                runs.run("g".into(), &cwd, "sleep 30 & echo $! > pid; wait")
-                    .await
-            }
-        });
-        let pid = loop {
-            if let Some(pid) = std::fs::read_to_string(&pid_file)
+    /// Starts `command` as run `id` on its own task.
+    fn start(
+        runs: &ShellRuns,
+        id: &str,
+        dir: &Path,
+        command: &'static str,
+    ) -> tokio::task::JoinHandle<ShellRunResult> {
+        let (runs, id, cwd) = (runs.clone(), id.to_string(), dir.to_path_buf());
+        tokio::spawn(async move { runs.run(id, &cwd, command).await })
+    }
+
+    /// The PID a command wrote to `pid` in `dir`.
+    async fn written_pid(dir: &Path) -> libc::pid_t {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(dir.join("pid"))
                 .ok()
-                .and_then(|s| s.trim().parse::<libc::pid_t>().ok())
+                .and_then(|s| s.trim().parse().ok())
             {
-                break pid;
+                return pid;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        running.abort();
-        let _ = running.await;
+        }
+    }
+
+    async fn assert_gone(pid: libc::pid_t) {
         let deadline = Instant::now() + Duration::from_secs(2);
         // SAFETY: signal 0 only probes whether the PID still exists.
         while unsafe { libc::kill(pid, 0) } == 0 {
-            assert!(Instant::now() < deadline, "background sleep survived");
+            assert!(Instant::now() < deadline, "process {pid} survived");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_run_kills_its_group() {
+        let dir = tmp();
+        let runs = ShellRuns::default();
+        let running = start(&runs, "g", dir.path(), "sleep 30 & echo $! > pid; wait");
+        let pid = written_pid(dir.path()).await;
+        running.abort();
+        let _ = running.await;
+        assert_gone(pid).await;
         assert!(lock(&runs.runs).is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_kills_a_running_command() {
+        let dir = tmp();
+        let runs = ShellRuns::default();
+        let running = start(&runs, "h", dir.path(), "sleep 30 & echo $! > pid; wait");
+        let pid = written_pid(dir.path()).await;
+        runs.shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(3), running)
+            .await
+            .expect("run resolves after shutdown")
+            .unwrap();
+        assert_eq!(result.exit_code, None);
+        assert_gone(pid).await;
+        assert!(lock(&runs.runs).is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_run_id_is_refused() {
+        let dir = tmp();
+        let runs = ShellRuns::default();
+        let first = start(&runs, "dup", dir.path(), "sleep 30");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let second = runs.run("dup".into(), dir.path(), "echo second").await;
+        assert_eq!(second.exit_code, None);
+        assert_eq!(second.output, "run dup is already running");
+        runs.cancel("dup");
+        let first = tokio::time::timeout(Duration::from_secs(3), first)
+            .await
+            .expect("the first run stays cancellable")
+            .unwrap();
+        assert_eq!(first.exit_code, None);
+        assert!(lock(&runs.runs).is_empty());
+    }
+
+    #[tokio::test]
+    async fn sigkill_waits_the_grace_for_a_group_ignoring_sigterm() {
+        let dir = tmp();
+        let started = Instant::now();
+        let result = ShellRuns::with_limits(Duration::from_millis(300), SHELL_OUTPUT_CAP)
+            .run(
+                "i".into(),
+                dir.path(),
+                "(trap '' TERM; sleep 30) & echo $! > pid; wait",
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(result.timed_out);
+        assert!(elapsed >= SHELL_KILL_GRACE, "{elapsed:?}");
+        assert!(
+            elapsed < SHELL_KILL_GRACE + Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        assert_gone(written_pid(dir.path()).await).await;
     }
 }
