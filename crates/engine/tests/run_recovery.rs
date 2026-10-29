@@ -41,7 +41,6 @@ type Script =
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
-        instructions: None,
         mcp: None,
         prompt: prompt.into(),
         harness: None,

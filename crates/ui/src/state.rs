@@ -1602,13 +1602,6 @@ impl AppState {
     /// the chips update on click; the next chats watch frame carries the same
     /// value once the engine applies the LWW write.
     pub fn apply_chat_config(&mut self, chat_id: &str, config: zeron_proto::ChatConfig) {
-        let merged = |current: Option<&zeron_proto::ChatConfig>| {
-            let mut next = config.clone();
-            if let Some(current) = current {
-                next.keep_orchestration_from(current);
-            }
-            next
-        };
         // The pending side chat's copy is what `apply_chats` re-inserts and
         // what an unsaved one is minted from.
         if let Some(chat) = self
@@ -1616,10 +1609,10 @@ impl AppState {
             .as_mut()
             .filter(|chat| chat.id == chat_id)
         {
-            chat.config = Some(merged(chat.config.as_ref()));
+            chat.config = Some(config.clone());
         }
         if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
-            chat.config = Some(merged(chat.config.as_ref()));
+            chat.config = Some(config);
         }
     }
 
@@ -7516,32 +7509,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_chat_config_keeps_role_and_orchestrator() {
-        let mut state = AppState::new();
-        state.apply_chats(vec![chat("a", 0, None)]);
-        let mut config = zeron_proto::ChatConfig {
-            harness: HarnessId::ClaudeCode,
-            model: Some("m1".into()),
-            reasoning: None,
-            model_options: serde_json::Map::new(),
-            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
-            role: Some("executor".into()),
-            orchestrator: Some("o1".into()),
-            access: Default::default(),
-            plan: false,
-        };
-        state.apply_chat_config("a", config.clone());
-        config.model = Some("m2".into());
-        config.role = None;
-        config.orchestrator = None;
-        state.apply_chat_config("a", config);
-        let stored = state.chats[0].config.as_ref().unwrap();
-        assert_eq!(stored.model.as_deref(), Some("m2"));
-        assert_eq!(stored.role.as_deref(), Some("executor"));
-        assert_eq!(stored.orchestrator.as_deref(), Some("o1"));
-    }
-
-    #[test]
     fn apply_chat_config_stamps_the_row() {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
@@ -7551,8 +7518,6 @@ mod tests {
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
-            role: None,
-            orchestrator: None,
             access: Default::default(),
             plan: false,
         };
@@ -7579,8 +7544,6 @@ mod tests {
                 reasoning: None,
                 model_options: serde_json::Map::new(),
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
-                role: None,
-                orchestrator: None,
                 access: Default::default(),
                 plan: false,
             },

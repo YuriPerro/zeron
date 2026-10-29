@@ -99,7 +99,6 @@ fn run(
     cwd: &str,
 ) -> RunRequest {
     RunRequest {
-        instructions: None,
         mcp: None,
         env: Default::default(),
         prompt: prompt.into(),
@@ -157,8 +156,6 @@ async fn agent_process_survives_sends_and_cancel() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::DangerFullAccess,
-                role: None,
-                orchestrator: None,
                 access: Default::default(),
                 plan: false,
             },

@@ -113,7 +113,6 @@ impl Suite {
 
     fn request(&self, prompt: &str) -> RunRequest {
         RunRequest {
-            instructions: None,
             env: Default::default(),
             mcp: None,
             prompt: prompt.into(),
@@ -196,8 +195,6 @@ impl Suite {
                     reasoning: None,
                     model_options: Default::default(),
                     sandbox: SandboxLevel::DangerFullAccess,
-                    role: None,
-                    orchestrator: None,
                     access: Default::default(),
                     plan: false,
                 },
@@ -1185,7 +1182,6 @@ fn send_to(core: &EngineCore, request: RunRequest) {
 
 fn restart_request(name: &str, cwd: &str, prompt: &str) -> RunRequest {
     RunRequest {
-        instructions: None,
         env: Default::default(),
         mcp: None,
         prompt: prompt.into(),
@@ -1290,8 +1286,6 @@ async fn restart_durability() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::DangerFullAccess,
-                role: None,
-                orchestrator: None,
                 access: Default::default(),
                 plan: false,
             },

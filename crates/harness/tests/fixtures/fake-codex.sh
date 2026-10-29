@@ -210,12 +210,6 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}'
   ;;
 
-*scenario:instructions*)
-  has "$thread_line" '"developerInstructions":"ORCH-RULES"' || { fail_turn "$tid" "developer instructions missing"; exit 0; }
-  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
-  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}'
-  ;;
-
 *scenario:view-image*)
   # `view_image` (live 0.164.0 shape): started and completed arrive together.
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
@@ -226,7 +220,6 @@ case "$turnline" in
   ;;
 
 *scenario:title*)
-  has "$thread_line" 'ORCH-RULES' && { fail_turn "$tid" "chat instructions leaked into title run"; exit 0; }
   for want in '"sandbox":"read-only"' '"ephemeral":true' '"baseInstructions":"You generate session titles.' '"features.shell_tool":false' '"mcp_servers.test.enabled":false' '"features.multi_agent":false' '"features.multi_agent_v2":false' '"agents.enabled":false'; do
     has "$thread_line" "$want" || { fail_turn "$tid" "title restriction missing"; exit 0; }
   done

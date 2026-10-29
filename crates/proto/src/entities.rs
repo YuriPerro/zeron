@@ -171,31 +171,12 @@ pub struct ChatConfig {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
-    /// Role this chat runs as; resolved against the roles folder at run start.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    /// Id of the orchestrator this chat embodies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orchestrator: Option<String>,
     /// The chat's access mode; absent on chats created before modes, which
     /// ran with full access.
     #[serde(default, skip_serializing_if = "AccessMode::is_full_access")]
     pub access: AccessMode,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan: bool,
-}
-
-impl ChatConfig {
-    /// Fills `role` and `orchestrator` from `stored` where this config has none,
-    /// so a write from a client that does not know them never clears them.
-    pub fn keep_orchestration_from(&mut self, stored: &ChatConfig) {
-        if self.role.is_none() {
-            self.role = stored.role.clone();
-        }
-        if self.orchestrator.is_none() {
-            self.orchestrator = stored.orchestrator.clone();
-        }
-    }
 }
 
 /// Immutable-at-run-start repository context owned by one conversation.
@@ -1683,37 +1664,6 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-
-    fn config(role: Option<&str>, orchestrator: Option<&str>) -> ChatConfig {
-        ChatConfig {
-            harness: HarnessId::Mock,
-            model: None,
-            reasoning: None,
-            model_options: Default::default(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            role: role.map(str::to_owned),
-            orchestrator: orchestrator.map(str::to_owned),
-            access: Default::default(),
-            plan: false,
-        }
-    }
-
-    #[test]
-    fn keep_orchestration_from_fills_only_missing_fields() {
-        let stored = config(Some("executor"), Some("o1"));
-
-        let mut bare = config(None, None);
-        bare.keep_orchestration_from(&stored);
-        assert_eq!(bare, stored);
-
-        let mut explicit = config(Some("revisor"), Some("o2"));
-        explicit.keep_orchestration_from(&stored);
-        assert_eq!(explicit, config(Some("revisor"), Some("o2")));
-
-        let mut partial = config(Some("revisor"), None);
-        partial.keep_orchestration_from(&stored);
-        assert_eq!(partial, config(Some("revisor"), Some("o1")));
-    }
 
     #[test]
     fn outside_workspace_reads_round_trip_without_breaking_older_reasons() {

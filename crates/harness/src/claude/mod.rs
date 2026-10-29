@@ -429,9 +429,6 @@ impl ClaudeHarness {
             args.push("--settings".into());
             args.push(Value::Object(settings).to_string());
         }
-        if let Some(instructions) = &request.instructions {
-            args.extend(["--append-system-prompt".into(), instructions.clone()]);
-        }
         args
     }
 
@@ -903,7 +900,6 @@ impl Harness for ClaudeHarness {
         request.worktree = None;
         request.attachments.clear();
         request.mcp = None;
-        request.instructions = None;
         request.model_options.clear();
         request.auto_approve = false;
         // Its tools are off and denied: the chat's modes do not apply.
@@ -2178,7 +2174,6 @@ mod tests {
     #[test]
     fn runs_ask_the_cli_to_forward_subagent_text() {
         let request = RunRequest {
-            instructions: None,
             mcp: None,
             prompt: "hi".into(),
             harness: None,
@@ -2212,7 +2207,6 @@ mod access_tests {
 
     fn request(access: AccessMode, auto_approve: bool, plan: bool) -> RunRequest {
         RunRequest {
-            instructions: None,
             mcp: None,
             prompt: "hi".into(),
             harness: None,

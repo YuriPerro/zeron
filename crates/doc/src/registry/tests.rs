@@ -266,8 +266,6 @@ fn chat(id: &str, device_id: &str) -> Chat {
             reasoning: None,
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
-            role: None,
-            orchestrator: None,
             access: Default::default(),
             plan: false,
         }),

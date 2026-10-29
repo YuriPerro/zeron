@@ -167,8 +167,6 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
-            role: None,
-            orchestrator: None,
             access: self.access,
             plan: self.plan,
         })

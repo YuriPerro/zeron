@@ -1235,18 +1235,7 @@ impl DocHost {
                 host.drain_queue(&handle).await;
             });
         }
-        self.spawn_orchestrator_wake_watcher(statuses.clone());
         self.spawn_queue_flush_watcher(statuses);
-    }
-
-    fn spawn_orchestrator_wake_watcher(
-        &self,
-        statuses: watch::Receiver<Vec<zeron_proto::Session>>,
-    ) {
-        self.spawn_worker(crate::orchestration::wake::watch_children(
-            self.clone(),
-            statuses,
-        ));
     }
 
     /// The turn-end hook for held messages. Doc changes drive `drain_queue` for
@@ -5640,8 +5629,6 @@ impl DocHost {
                         reasoning: request.reasoning,
                         model_options: request.model_options.clone(),
                         sandbox: request.sandbox,
-                        role: None,
-                        orchestrator: None,
                         access: request.access,
                         plan: request.plan,
                     };
@@ -6121,7 +6108,6 @@ impl DocHost {
         };
         let config = chat.config;
         Some(zeron_proto::RunRequest {
-            instructions: None,
             mcp: None,
             prompt: prompt.to_string(),
             harness: config.as_ref().map(|c| c.harness),

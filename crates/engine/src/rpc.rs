@@ -53,7 +53,6 @@
 //! handlers stay transport-agnostic. This includes the workspace file surface,
 //! whose checkout always lives on the routed target device.
 
-mod orchestration;
 mod voice_chat;
 mod voice_remote;
 use async_trait::async_trait;
@@ -2138,14 +2137,6 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_NATIVE_SUBAGENTS
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
-            | methods::GET_ORCHESTRATOR
-            | methods::ORCH_CREATE_DEMAND
-            | methods::ORCH_WRITE_SPEC
-            | methods::ORCH_WRITE_PLAN
-            | methods::ORCH_READ_DEMAND
-            | methods::ORCH_SUBMIT_REPORT
-            | methods::ORCH_CLOSE_DEMAND
-            | methods::ORCH_REMEMBER
             | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
@@ -2696,11 +2687,6 @@ impl RpcService for EngineRpc {
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
-            }
-            methods::RESOLVE_ROLE_MODEL => self.resolve_role_model(params).await,
-            methods::CREATE_ORCHESTRATOR => self.create_orchestrator(params),
-            method if crate::orchestration::rpc::handles(method) => {
-                crate::orchestration::rpc::dispatch(self.repos.data_dir(), method, params)
             }
             methods::LIST_SKILLS => {
                 #[derive(Deserialize)]
@@ -5339,13 +5325,6 @@ mod tests {
         assert!(!forwardable(methods::FOCUS_CHAT));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
-        assert!(!forwardable(methods::RESOLVE_ROLE_MODEL));
-        assert!(!forwardable(methods::LIST_ROLES));
-        assert!(!forwardable(methods::CREATE_ORCHESTRATOR));
-        assert!(!forwardable(methods::LIST_ORCHESTRATORS));
-        assert!(forwardable(methods::GET_ORCHESTRATOR));
-        assert!(forwardable(methods::ORCH_READ_DEMAND));
-        assert!(forwardable(methods::ORCH_SUBMIT_REPORT));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::SEARCH_GIT_HISTORY));

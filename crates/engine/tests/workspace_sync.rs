@@ -145,7 +145,6 @@ where
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
-        instructions: None,
         mcp: None,
         prompt: prompt.into(),
         harness: None,
@@ -572,8 +571,6 @@ async fn chat_config_selects_the_run_harness() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
-                role: None,
-                orchestrator: None,
                 access: Default::default(),
                 plan: false,
             }),

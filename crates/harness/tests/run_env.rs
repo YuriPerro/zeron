@@ -29,7 +29,6 @@ fn env_dumper(dir: &Path) -> PathBuf {
 
 fn request(cwd: &Path) -> RunRequest {
     RunRequest {
-        instructions: None,
         prompt: "hello".into(),
         harness: None,
         model: None,

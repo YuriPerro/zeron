@@ -450,8 +450,6 @@ pub(crate) fn seed(
                 reasoning: Some(demo.reasoning),
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
-                role: None,
-                orchestrator: None,
                 access: Default::default(),
                 plan: false,
             }),

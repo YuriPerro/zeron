@@ -104,8 +104,6 @@ impl Rig {
                     reasoning: None,
                     model_options: Default::default(),
                     sandbox: SandboxLevel::DangerFullAccess,
-                    role: None,
-                    orchestrator: None,
                     access: Default::default(),
                     plan: false,
                 },
@@ -123,7 +121,6 @@ impl Rig {
 
     fn request(&self, prompt: String) -> RunRequest {
         RunRequest {
-            instructions: None,
             mcp: None,
             prompt,
             harness: Some(self.id),

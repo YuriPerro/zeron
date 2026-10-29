@@ -36,7 +36,6 @@ async fn main() {
         turn: Default::default(),
     };
     let request = RunRequest {
-        instructions: None,
         mcp: None,
         prompt: "Use spawn_subagent to launch ONE subagent of type general with description \
                  'Viz probe' and prompt: 'Run the terminal command: echo viz-probe-ok && sleep 3. \

@@ -843,8 +843,6 @@ impl TryFrom<ChatConfig> for zc::ChatConfig {
                 SandboxLevel::WorkspaceWrite => zeron_proto::SandboxLevel::WorkspaceWrite,
                 SandboxLevel::DangerFullAccess => zeron_proto::SandboxLevel::DangerFullAccess,
             },
-            role: None,
-            orchestrator: None,
             access: Default::default(),
             plan: false,
         })

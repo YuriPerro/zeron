@@ -157,7 +157,6 @@ fn rig_with(gated: Option<HarnessId>, codex_failures: usize) -> Rig {
 
 fn run_request(harness: HarnessId, prompt: &str) -> RunRequest {
     RunRequest {
-        instructions: None,
         mcp: None,
         prompt: prompt.into(),
         harness: Some(harness),
@@ -623,8 +622,6 @@ async fn provider_cannot_change_while_a_turn_is_running() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
-                role: None,
-                orchestrator: None,
                 access: Default::default(),
                 plan: false,
             },
@@ -659,8 +656,6 @@ async fn provider_cannot_change_while_a_turn_is_running() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
-                role: None,
-                orchestrator: None,
                 access: Default::default(),
                 plan: false,
             },

@@ -901,8 +901,6 @@ mod tests {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
-                role: None,
-                orchestrator: None,
                 access: Default::default(),
                 plan: false,
             }),
@@ -976,8 +974,6 @@ mod tests {
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: options,
             sandbox: SandboxLevel::WorkspaceWrite,
-            role: None,
-            orchestrator: None,
             access: Default::default(),
             plan: false,
         };
