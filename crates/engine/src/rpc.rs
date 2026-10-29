@@ -372,6 +372,20 @@ struct OpenTerminalParams {
     cwd: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunShellCommandParams {
+    run_id: String,
+    chat_id: String,
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelShellCommandParams {
+    run_id: String,
+}
+
 /// Matches the UI canvas panel key (`AppState::panel_session_key`).
 const CANVAS_TERMINAL_PREFIX: &str = "space-canvas:";
 
@@ -784,6 +798,7 @@ pub struct EngineRpc {
     workspace_files: crate::WorkspaceFiles,
     terminals: Terminals,
     remote_terminals: crate::remote_terminals::RemoteTerminals,
+    shell_runs: crate::shell_runs::ShellRuns,
     project_actions: ProjectActionsStore,
     previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
@@ -804,6 +819,28 @@ pub struct EngineRpc {
 }
 
 impl EngineRpc {
+    /// The working directory for a chat's terminal or shell command. An
+    /// explicit real path wins (the new-chat canvas has no row yet), then the
+    /// chat row's cwd, then the space named by a `space-canvas:{spaceId}` chat
+    /// id so a missing/tilde cwd still lands in that folder.
+    fn chat_cwd_for(&self, chat_id: &str, explicit: Option<String>) -> Result<String, RpcError> {
+        let chat_cwd = self
+            .workspace
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .and_then(|chat| chat.cwd);
+        let space_cwd = canvas_space_id(chat_id).and_then(|space_id| {
+            self.workspace
+                .space(space_id)
+                .ok()
+                .flatten()
+                .map(|space| space.path)
+        });
+        resolve_open_terminal_cwd(explicit, chat_cwd, space_cwd, &self.repos.scratch_root())
+            .map_err(|error| RpcError::Failed(error.to_string()))
+    }
+
     #[allow(clippy::too_many_arguments)] // engine assembly seam, not a public API
     pub fn new(
         sessions: SessionsEngine,
@@ -845,6 +882,7 @@ impl EngineRpc {
             workspace_files,
             terminals,
             remote_terminals: Default::default(),
+            shell_runs: Default::default(),
             project_actions,
             previews: None,
             change_requests,
@@ -2220,6 +2258,9 @@ fn forwardable(method: &str) -> bool {
             | methods::WRITE_TERMINAL
             | methods::RESIZE_TERMINAL
             | methods::CLOSE_TERMINAL
+            // Composer shell commands run in the chat's cwd on its host device.
+            | methods::RUN_SHELL_COMMAND
+            | methods::CANCEL_SHELL_COMMAND
             // Agent accounts are per-device CLI logins (the device switcher
             // retargets which device's logins are shown).
             | methods::LIST_AGENT_ACCOUNTS
@@ -4493,29 +4534,7 @@ impl RpcService for EngineRpc {
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
-                // Prefer an explicit real path (new-chat canvas has no row
-                // yet). `space-canvas:{spaceId}` names the selected project
-                // so a missing/tilde cwd still lands in that folder.
-                let chat_cwd = self
-                    .workspace
-                    .chat(&p.chat_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|chat| chat.cwd);
-                let space_cwd = canvas_space_id(&p.chat_id).and_then(|space_id| {
-                    self.workspace
-                        .space(space_id)
-                        .ok()
-                        .flatten()
-                        .map(|space| space.path)
-                });
-                let cwd = resolve_open_terminal_cwd(
-                    p.cwd,
-                    chat_cwd,
-                    space_cwd,
-                    &self.repos.scratch_root(),
-                )
-                .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let cwd = self.chat_cwd_for(&p.chat_id, p.cwd)?;
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -4526,6 +4545,20 @@ impl RpcService for EngineRpc {
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                 }
                 RpcReply::value(&session)
+            }
+            methods::RUN_SHELL_COMMAND => {
+                let p: RunShellCommandParams = parse_params(params)?;
+                let cwd = self.chat_cwd_for(&p.chat_id, None)?;
+                let result = self
+                    .shell_runs
+                    .run(p.run_id, std::path::Path::new(&cwd), &p.command)
+                    .await;
+                RpcReply::value(&result)
+            }
+            methods::CANCEL_SHELL_COMMAND => {
+                let p: CancelShellCommandParams = parse_params(params)?;
+                self.shell_runs.cancel(&p.run_id);
+                RpcReply::value(&serde_json::json!({}))
             }
             methods::SUBSCRIBE_TERMINAL => {
                 let p: SubscribeTerminalParams = parse_params(params)?;
@@ -4925,6 +4958,114 @@ mod tests {
         assert_eq!(chat.config.unwrap().harness, HarnessId::Grok);
         drop(owner);
         core.sessions.shutdown().await;
+    }
+
+    async fn shell_core() -> (tempfile::TempDir, crate::EngineCore) {
+        let temp = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            std::sync::Arc::new(HarnessRegistry::new()),
+            HarnessId::Codex,
+            None,
+        )
+        .unwrap();
+        (temp, core)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_command_runs_in_the_chat_cwd() {
+        let (_temp, core) = shell_core().await;
+        let rpc = core.rpc_service();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        core.workspace
+            .create_chat(
+                "chat-1",
+                None,
+                Some(&core.device_id),
+                None,
+                Some(canonical.to_string_lossy().into_owned()),
+            )
+            .unwrap();
+        let reply = rpc
+            .handle(
+                methods::RUN_SHELL_COMMAND,
+                serde_json::json!({"runId":"r1","chatId":"chat-1","command":"pwd"}),
+            )
+            .await
+            .unwrap();
+        let RpcReply::Value(value) = reply else {
+            panic!("expected a value reply")
+        };
+        assert_eq!(value["exitCode"], 0);
+        assert!(
+            value["output"]
+                .as_str()
+                .unwrap()
+                .contains(canonical.to_str().unwrap()),
+            "{value}"
+        );
+        core.sessions.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_command_on_a_canvas_uses_the_space_path() {
+        let (_temp, core) = shell_core().await;
+        let rpc = core.rpc_service();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        rpc.handle(
+            methods::MUTATE,
+            serde_json::json!({"op":"createSpace", "spaceId":"s1",
+                "deviceId":core.device_id, "path":canonical}),
+        )
+        .await
+        .unwrap();
+        let reply = rpc
+            .handle(
+                methods::RUN_SHELL_COMMAND,
+                serde_json::json!({"runId":"r1","chatId":"space-canvas:s1","command":"pwd"}),
+            )
+            .await
+            .unwrap();
+        let RpcReply::Value(value) = reply else {
+            panic!("expected a value reply")
+        };
+        assert_eq!(value["exitCode"], 0);
+        assert!(
+            value["output"]
+                .as_str()
+                .unwrap()
+                .contains(canonical.to_str().unwrap()),
+            "{value}"
+        );
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_shell_command_unknown_run_is_ok() {
+        let (_temp, core) = shell_core().await;
+        let rpc = core.rpc_service();
+        let reply = rpc
+            .handle(
+                methods::CANCEL_SHELL_COMMAND,
+                serde_json::json!({"runId":"missing"}),
+            )
+            .await
+            .unwrap();
+        let RpcReply::Value(value) = reply else {
+            panic!("expected a value reply")
+        };
+        assert_eq!(value, serde_json::json!({}));
+        core.sessions.shutdown().await;
+    }
+
+    #[test]
+    fn shell_methods_are_forwardable() {
+        assert!(forwardable(methods::RUN_SHELL_COMMAND));
+        assert!(forwardable(methods::CANCEL_SHELL_COMMAND));
     }
 
     // Each subprocess has private HOME/PATH/overrides, avoiding process-global test races.
