@@ -86,6 +86,15 @@ impl SubagentRowsCache {
     }
 }
 
+/// The word after a pill's count.
+fn pill_noun(tray: RunningTray, count: usize) -> &'static str {
+    match tray {
+        RunningTray::Subagents if count == 1 => "subagent",
+        RunningTray::Subagents => "subagents",
+        RunningTray::Background => "background",
+    }
+}
+
 /// The pills that render, left to right: one per non-empty list.
 fn pills(subagents: &[SubagentRow], tasks: &[BackgroundTask]) -> Vec<RunningTray> {
     [
@@ -255,10 +264,11 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let view = cx.entity_id();
-        let (key, noun) = match tray {
-            RunningTray::Subagents => ("running-pill-subagents", "subagents"),
-            RunningTray::Background => ("running-pill-background", "background"),
+        let key = match tray {
+            RunningTray::Subagents => "running-pill-subagents",
+            RunningTray::Background => "running-pill-background",
         };
+        let noun = pill_noun(tray, count);
         let loader = match tray {
             RunningTray::Subagents => {
                 crate::loaders::echo_loader(format!("{key}-{view}"), LOADER_DOT, theme.busy)
@@ -611,6 +621,14 @@ mod tests {
         handle
             .update(cx, |composer, _, cx| composer.toggle_running_tray(tray, cx))
             .unwrap();
+    }
+
+    #[test]
+    fn pill_noun_agrees_with_its_count() {
+        assert_eq!(pill_noun(RunningTray::Subagents, 1), "subagent");
+        assert_eq!(pill_noun(RunningTray::Subagents, 2), "subagents");
+        assert_eq!(pill_noun(RunningTray::Background, 1), "background");
+        assert_eq!(pill_noun(RunningTray::Background, 3), "background");
     }
 
     #[test]
