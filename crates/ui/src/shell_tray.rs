@@ -238,6 +238,21 @@ impl Composer {
         .detach();
     }
 
+    /// Whether `text` leads with a native command for the harness it goes to.
+    /// The host routes one only when it opens the prompt
+    /// ([`zeron_proto::invocation::native_command`], the engine's own test),
+    /// so staged runs never go in front of it. With no harness resolved yet,
+    /// any harness's command counts.
+    pub(crate) fn sends_native_command(&self, text: &str, cx: &App) -> bool {
+        use zeron_proto::{HarnessId, invocation::native_command};
+        match self.pickers().read(cx).resolved(cx).harness {
+            Some(harness) => native_command(text, harness),
+            None => HarnessId::ALL
+                .iter()
+                .any(|harness| native_command(text, *harness)),
+        }
+    }
+
     /// How many staged runs the next message would carry.
     pub(crate) fn shell_outputs_ready(&self, cx: &App) -> usize {
         self.shell_trays
@@ -633,6 +648,58 @@ mod tests {
             cx.run_until_parked();
         }
 
+        fn click_send(&self, cx: &mut TestAppContext) {
+            cx.update_window(self.handle.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            let mut visual = gpui::VisualTestContext::from_window(self.handle.into(), cx);
+            let button = visual.debug_bounds("composer-send").unwrap();
+            visual.simulate_click(button.center(), gpui::Modifiers::default());
+        }
+
+        /// Queue `q1` (a `q` run ahead of "why?") and open it for editing.
+        fn begin_edit(&self, cx: &mut TestAppContext, runtime: &tokio::runtime::Runtime) {
+            self.handle
+                .update(cx, |composer, _, cx| {
+                    composer.state.update(cx, |state, _| {
+                        state.queue = vec![
+                            serde_json::from_value(serde_json::json!({
+                                "id": "q1",
+                                "text": crate::shell_blocks::format_prompt(&[done("q")], "why?"),
+                                "issuedBy": "local", "issuedAt": 0,
+                            }))
+                            .unwrap(),
+                        ];
+                    });
+                    composer.begin_queue_edit("q1".into(), cx);
+                })
+                .unwrap();
+            self.settle(cx, runtime, |rig, cx| {
+                rig.handle
+                    .read_with(cx, |composer, _| composer.editing_queued.is_some())
+                    .unwrap()
+            });
+        }
+
+        /// A leading skill chip that carries the chat's harness's command.
+        fn skill_command(&self, cx: &mut TestAppContext) -> String {
+            let harness = self
+                .handle
+                .read_with(cx, |composer, cx| {
+                    composer.pickers().read(cx).resolved(cx).harness
+                })
+                .unwrap()
+                .unwrap_or(zeron_proto::HarnessId::ClaudeCode);
+            zeron_proto::invocation::Invocation::Skill {
+                name: "review".into(),
+                path: "/skills/review/SKILL.md".into(),
+                command: Some(zeron_proto::invocation::SkillCommand {
+                    name: "review".into(),
+                    harness,
+                }),
+            }
+            .link()
+        }
+
         fn settle_failure(&self, cx: &mut TestAppContext, runtime: &tokio::runtime::Runtime) {
             self.settle(cx, runtime, |rig, cx| {
                 rig.handle
@@ -1002,11 +1069,7 @@ mod tests {
             "Enter sends nothing"
         );
         assert!(rig.calls(methods::RUN_SHELL_COMMAND).is_empty());
-        cx.update_window(rig.handle.into(), |_, window, cx| window.draw(cx).clear())
-            .unwrap();
-        let mut visual = gpui::VisualTestContext::from_window(rig.handle.into(), cx);
-        let button = visual.debug_bounds("composer-send").unwrap();
-        visual.simulate_click(button.center(), gpui::Modifiers::default());
+        rig.click_send(cx);
         assert_eq!(
             rig.sent_prompt(cx, &runtime),
             crate::shell_blocks::format_prompt(&[done("done")], "")
@@ -1020,26 +1083,7 @@ mod tests {
         let runtime = fixture::runtime();
         let _guard = runtime.enter();
         let rig = window(cx, Host::Replies);
-        rig.handle
-            .update(cx, |composer, _, cx| {
-                composer.state.update(cx, |state, _| {
-                    state.queue = vec![
-                        serde_json::from_value(serde_json::json!({
-                            "id": "q1",
-                            "text": crate::shell_blocks::format_prompt(&[done("q")], "why?"),
-                            "issuedBy": "local", "issuedAt": 0,
-                        }))
-                        .unwrap(),
-                    ];
-                });
-                composer.begin_queue_edit("q1".into(), cx);
-            })
-            .unwrap();
-        rig.settle(cx, &runtime, |rig, cx| {
-            rig.handle
-                .read_with(cx, |composer, _| composer.editing_queued.is_some())
-                .unwrap()
-        });
+        rig.begin_edit(cx, &runtime);
         assert_eq!(rig.text(cx), "why?");
         rig.type_text(" now", cx);
         rig.press("enter", cx);
@@ -1156,5 +1200,94 @@ mod tests {
             crate::shell_blocks::format_prompt(&ran, "why?")
         );
         assert!(rig.tray_of("space-canvas:a", cx).runs.is_empty());
+    }
+
+    #[gpui::test]
+    fn queue_edit_recovery_never_returns_to_bash_mode(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.type_text("!", cx);
+        assert!(rig.bash(cx));
+        rig.begin_edit(cx, &runtime);
+        rig.handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, cx| {
+                    state.queue.clear();
+                    cx.notify();
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            rig.handle
+                .read_with(cx, |composer, _| composer.editing_queued.is_none())
+                .unwrap()
+        );
+        assert!(!rig.bash(cx));
+        assert_eq!(rig.text(cx), "why?");
+    }
+
+    #[gpui::test]
+    fn skill_command_leaves_runs_staged(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.stage(vec![done("done")], cx);
+        let command = rig.skill_command(cx);
+        rig.type_text(&command, cx);
+        rig.press("enter", cx);
+        assert_eq!(rig.sent_prompt(cx, &runtime), command);
+        assert_eq!(rig.tray(cx).runs, vec![done("done")]);
+    }
+
+    #[gpui::test]
+    fn queued_edit_to_a_native_command_stages_its_blocks(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.begin_edit(cx, &runtime);
+        rig.handle
+            .update(cx, |composer, _, cx| {
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("/compact", cx))
+            })
+            .unwrap();
+        rig.press("enter", cx);
+        rig.settle(cx, &runtime, |rig, _| {
+            !rig.calls(methods::FINISH_QUEUED_MESSAGE_EDIT).is_empty()
+        });
+        let finishes = rig.calls(methods::FINISH_QUEUED_MESSAGE_EDIT);
+        assert_eq!(finishes[0]["text"], "/compact");
+        let runs = rig.tray(cx).runs;
+        let [run] = runs.as_slice() else {
+            panic!("expected the row's run back in the tray, got {runs:?}");
+        };
+        assert_eq!(
+            (&run.command, &run.state),
+            (&done("q").command, &done("q").state)
+        );
+    }
+
+    #[gpui::test]
+    fn canvas_send_leaves_the_next_canvas_out_of_bash_mode(cx: &mut TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let rig = window(cx, Host::Replies);
+        rig.canvas("a", cx);
+        rig.type_text("!", cx);
+        rig.type_text("pwd", cx);
+        rig.press("enter", cx);
+        rig.settle(cx, &runtime, |rig, cx| {
+            rig.tray_of("space-canvas:a", cx)
+                .runs
+                .first()
+                .is_some_and(|run| run.state != ShellRunState::Running)
+        });
+        rig.click_send(cx);
+        rig.sent_prompt(cx, &runtime);
+        rig.canvas("a", cx);
+        assert!(!rig.bash(cx));
     }
 }

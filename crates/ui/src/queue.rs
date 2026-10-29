@@ -1667,6 +1667,10 @@ impl Composer {
             self.appshots.remove(&self.current_key).unwrap_or_default(),
         ));
         self.displace_attachment_draft();
+        // However the edit ends, the draft comes back as text: bash mode
+        // returning over it would run that text on the next Enter.
+        let key = self.current_key.clone();
+        self.leave_bash_mode_for(&key, cx);
         crate::attachments::pair_with_chips(&text, &mut attachments);
         self.attachments
             .insert(self.current_key.clone(), attachments);
@@ -1702,7 +1706,18 @@ impl Composer {
         if !self.check_reference_delivery(&text, cx) {
             return true;
         }
-        let text = crate::shell_blocks::with_blocks(&self.queue_edit_shell_blocks, &text);
+        // A native command must open the row, so its shell runs go back to
+        // the tray to ride the next message instead.
+        let text = if self.sends_native_command(&text, cx) {
+            let blocks = std::mem::take(&mut self.queue_edit_shell_blocks);
+            if let Some(chat_id) = self.queue_edit_chat_id.clone() {
+                let runs = crate::shell_blocks::runs_from_blocks(&blocks, &chat_id);
+                self.restore_shell_outputs(&chat_id, runs);
+            }
+            text
+        } else {
+            crate::shell_blocks::with_blocks(&self.queue_edit_shell_blocks, &text)
+        };
         if text.trim().is_empty() && self.staged().is_empty() && self.staged_appshots().is_empty() {
             self.finish_queue_edit("discard", None, cx);
         } else {

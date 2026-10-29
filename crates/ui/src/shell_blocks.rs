@@ -129,15 +129,6 @@ pub(crate) fn format_prompt(runs: &[ShellRun], text: &str) -> String {
     with_blocks(&groups.join("\n"), text)
 }
 
-/// Whether `text` opens with a native command such as `/compact`, which the
-/// host recognizes only at the very start of the prompt (the engine's own
-/// `leading_command` test).
-pub(crate) fn leads_with_native_command(text: &str) -> bool {
-    use zeron_proto::invocation::{invocation_prompt, leading_command, valid_skill_command_name};
-    leading_command(&invocation_prompt(text))
-        .is_some_and(|(name, _)| valid_skill_command_name(name))
-}
-
 /// Tag groups ahead of `text`, a blank line between them.
 pub(crate) fn with_blocks(blocks: &str, text: &str) -> String {
     if text.is_empty() {
@@ -196,6 +187,35 @@ pub(crate) fn split_shell_blocks(text: &str) -> (Vec<ShellBlock>, &str) {
     } else {
         (blocks, rest.trim_start())
     }
+}
+
+/// The leading tag groups of `text` as staged runs of `chat_id` again: the
+/// inverse of [`format_prompt`].
+pub(crate) fn runs_from_blocks(text: &str, chat_id: &str) -> Vec<ShellRun> {
+    let (blocks, _) = split_shell_blocks(text);
+    blocks
+        .into_iter()
+        .map(|block| {
+            let known = |note: &String| note == TIMEOUT_NOTE || note == TRUNCATION_NOTE;
+            let state = match block.notes.as_slice() {
+                [error] if !known(error) && block.exit_code.is_none() => {
+                    ShellRunState::Failed(error.clone())
+                }
+                notes => ShellRunState::Done {
+                    exit_code: block.exit_code,
+                    output: block.output,
+                    truncated: notes.iter().any(|note| note == TRUNCATION_NOTE),
+                    timed_out: notes.iter().any(|note| note == TIMEOUT_NOTE),
+                },
+            };
+            ShellRun {
+                id: uuid::Uuid::new_v4().to_string(),
+                chat_id: chat_id.to_owned(),
+                command: block.command,
+                state,
+            }
+        })
+        .collect()
 }
 
 /// The leading tag groups exactly as written, and the text after them, so an
@@ -390,13 +410,28 @@ mod tests {
     }
 
     #[test]
-    fn native_commands_lead_only_at_the_start() {
-        assert!(leads_with_native_command("/compact"));
-        assert!(leads_with_native_command("\n  /review focus on tests"));
-        assert!(!leads_with_native_command("why /compact"));
-        assert!(!leads_with_native_command("/usr/bin is missing"));
-        assert!(!leads_with_native_command("    /compact"));
-        assert!(!leads_with_native_command("plain"));
+    fn blocks_turn_back_into_the_runs_they_came_from() {
+        let runs = [
+            done("ls", "a\n", Some(0)),
+            ShellRun {
+                state: ShellRunState::Done {
+                    exit_code: None,
+                    output: "x".into(),
+                    truncated: true,
+                    timed_out: true,
+                },
+                ..done("sleep 999", "", None)
+            },
+            ShellRun {
+                state: ShellRunState::Failed("host offline".into()),
+                ..done("pwd", "", None)
+            },
+        ];
+        let prompt = format_prompt(&runs, "");
+        let back = runs_from_blocks(&prompt, "c");
+        assert_eq!(format_prompt(&back, ""), prompt);
+        assert_eq!(back[2].state, ShellRunState::Failed("host offline".into()));
+        assert!(back.iter().all(|run| run.chat_id == "c"));
     }
 
     #[test]

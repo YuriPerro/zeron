@@ -9523,7 +9523,7 @@ impl Composer {
         let text = crate::comments::with_comments(&text, &comments);
         // Finished shell runs lead the message; running ones stay staged. A
         // native command must stay first, so it leaves them all staged.
-        let shell_runs = if crate::shell_blocks::leads_with_native_command(&text) {
+        let shell_runs = if self.sends_native_command(&text, cx) {
             Vec::new()
         } else {
             self.take_shell_outputs(&shell_key)
@@ -9708,6 +9708,11 @@ impl Composer {
 
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
+        // The canvas draft became the minted chat's first message; the next
+        // canvas starts as a plain draft.
+        if is_new {
+            self.bash_drafts.remove(&self.current_key);
+        }
         self.failure = None;
         self.sending = true;
         // A queued row is represented by the queue panel, not the transcript.
