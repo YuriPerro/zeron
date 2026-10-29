@@ -48,6 +48,7 @@ pub mod rpc;
 pub mod run_journal;
 pub mod runner;
 pub mod sessions;
+mod shell_runs;
 pub mod source_control;
 pub mod spaces;
 pub mod terminals;

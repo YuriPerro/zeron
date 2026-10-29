@@ -222,7 +222,7 @@ fn clamp_size(cols: u16, rows: u16) -> PtySize {
 }
 
 /// The user's interactive shell: `$SHELL`, else the platform default.
-fn selected_shell() -> String {
+pub(crate) fn selected_shell() -> String {
     if cfg!(windows) {
         return std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".into());
     }
